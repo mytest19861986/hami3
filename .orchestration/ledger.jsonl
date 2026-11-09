@@ -1,1 +1,2 @@
 {"run_id": "RUN-HAMICARD-001", "task_id": "T-01-ARCH-AND-OPEN-DECISIONS", "worker": "Antigravity-Gemini", "state": "queued", "attempt": 0, "recorded_at_utc": "2026-11-09T16:17:17.836966+00:00"}
+{"run_id": "RUN-HAMICARD-001", "task_id": "T-01-ARCH-AND-OPEN-DECISIONS", "worker": "Antigravity-Gemini", "state": "running", "attempt": 1, "recorded_at_utc": "2026-11-09T21:04:23.031386+00:00", "note": "Phase 1: Project foundation, docker-compose.dev.yml, full SQL schema for 21 entities and OPEN-01..18"}
