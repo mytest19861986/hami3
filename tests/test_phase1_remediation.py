@@ -274,10 +274,11 @@ async def test_audit_logs_recording():
     print("\n[REMEDIATION TEST 6/6] Testing Audit Log Recording & Immutability...")
     conn = await asyncpg.connect(PG_DSN)
     try:
+        test_mobile = f"0912{uuid.uuid4().int % 10000000:07d}"
         actor_id = await conn.fetchval("""
             INSERT INTO users (mobile, status, roles)
-            VALUES ('09129990011', 'ACTIVE', '{"SUPER_ADMIN"}') RETURNING id;
-        """)
+            VALUES ($1, 'ACTIVE', '{"SUPER_ADMIN"}') RETURNING id;
+        """, test_mobile)
 
         # Record audit log
         log_id = await conn.fetchval("""

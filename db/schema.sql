@@ -151,7 +151,9 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    family_id UUID NOT NULL DEFAULT gen_random_uuid(),
     token_hash VARCHAR(255) UNIQUE NOT NULL,
+    successor_id UUID NULL REFERENCES refresh_tokens(id) ON DELETE SET NULL,
     device_info TEXT NULL,
     ip_address VARCHAR(50) NULL,
     expires_at TIMESTAMPTZ NOT NULL,
@@ -163,6 +165,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_lookup ON refresh_tokens(token_hash, status);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
 
 CREATE TABLE IF NOT EXISTS login_attempts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
