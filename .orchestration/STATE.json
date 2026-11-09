@@ -1,0 +1,71 @@
+{
+  "project": "HamiCard (حامی‌کارت)",
+  "mission_id": "M-HAMICARD-ZERO-TO-PROD",
+  "baseline_id": "BL-HAMICARD-PRD-V1",
+  "goal": "بازنویسی کامل سامانه حامی‌کارت از روی PRD نسخه ۱.۰، توسعه در محیط لوکال، نسخه‌بندی در GitHub و استقرار نهایی روی سرور Ubuntu 24.04 (4 CPU, 8GB RAM) با معماری چندعاملی تحت فرماندهی ChatGPT.",
+  "type": "Greenfield Full-Stack Web Application (Healthcare Discount, Sales Network, Wallet & Settlement)",
+  "phase": "Phase 0 — Governance, Orchestration Setup & Business Decisions (OPEN-01..18)",
+  "status": "READY_FOR_COMMANDER_BOOT",
+  "execution_topology": {
+    "human_manager": "تصمیم‌گیر نهایی تجاری (OPEN-01..18)، تأییدکننده Gateهای High-Risk و تحویل نهایی",
+    "commander": "ChatGPT (Web/Browser) — مجهز به پروتکل MASTER_COMMANDER_v4.3_FULL",
+    "coordinator_and_executor": "Antigravity IDE (Gemini) — ارکستریتور حلقه (loop-orchestrator) + مجری اصلی کدنویسی، تست، گیت و ترمینال (Codex Role)",
+    "browser_specialists": [
+      {
+        "agent": "Qwen (via Browser / ai-site-runner)",
+        "dynamic_roles": ["Backend & Concurrency Reviewer", "SQL/Transaction & Financial Invariant Auditor", "Test Case Generator"]
+      },
+      {
+        "agent": "GLM (via Browser / ai-site-runner)",
+        "dynamic_roles": ["Security & RBAC Auditor", "PRD Compliance & Edge-Case Verifier", "Persian RTL UX & Accessibility Reviewer"]
+      }
+    ]
+  },
+  "infrastructure_target": {
+    "local_dev": "Windows Workspace (d:\\project\\hami3) + Git + Docker Desktop / Node.js + PostgreSQL + Redis",
+    "vcs": "GitHub Repository (Protected main, develop, feature/* branches + GitHub Actions CI)",
+    "production_server": "Linux Ubuntu 24.04 LTS | 4 vCPU | 8 GB RAM | Docker Compose + Caddy/Nginx + PostgreSQL 16 + Redis 7 + Encrypted Off-site Backup (rclone/Google Drive)"
+  },
+  "completed": [
+    "T-00.1: بارگذاری و قفل پروتکل MASTER_COMMANDER_v4.3_FULL",
+    "T-00.2: ممیزی کامل سند PRD حامی‌کارت (۲۹ بخش، قوانین BR-01..30، سناریوهای AC-01..18 و تصمیم‌های OPEN-01..18)",
+    "T-00.3: ایجاد ساختار پوشه‌های پروژه و ثبت PRODUCT_BASELINE_MANIFEST.md",
+    "T-00.4: آماده‌سازی دفترکل ارکستریشن (ledger.jsonl) و پرامپت‌های عملیاتی فرمانده ChatGPT"
+  ],
+  "in_progress": [],
+  "blocked": [],
+  "decisions": [
+    {
+      "id": "DEC-INIT-01",
+      "text": "ثبت PRD نسخه ۱.۰ به‌عنوان PRODUCT_SPEC_BASELINE (BL-HAMICARD-PRD-V1)",
+      "reason": "طبق بند ۵.۱ پروتکل، پیش از هر کدنویسی مرجع محصول و معیارهای پذیرش P0/P1 تثبیت شد."
+    },
+    {
+      "id": "DEC-INIT-02",
+      "text": "پیکربندی توپولوژی ۴ لایه: مدیر انسانی ← فرمانده ChatGPT ← ارکستریتور و مجری Antigravity Gemini ← بازبین‌های مرورگر Qwen و GLM",
+      "reason": "منطبق با درخواست صریح مدیر و مهارت‌های نصب‌شده (loop-orchestrator, commander-bridge, ai-site-runner, result-synthesizer)."
+    }
+  ],
+  "assumptions": [
+    {
+      "text": "تا زمان تعیین تکلیف OPEN-01 تا OPEN-18 توسط مدیر، قوانین مالی و تجاری مربوط به آن‌ها به‌صورت Configurable (پارامتریک در دیتابیس/تنظیمات) طراحی می‌شوند.",
+      "confidence": "HIGH",
+      "impact_if_wrong": "نیاز به تغییر جزئی در لایه سرویس قوانین تجاری در فازهای میانی."
+    },
+    {
+      "text": "اتصال درگاه پرداخت و پیامک واقعی در محیط لوکال با Adapter استاندارد و وضعیت صریح «در انتظار اتصال / تأیید دستی ممیزی‌شده» (طبق PAY-010 و NOTICE-003) پیاده‌سازی می‌شود تا زمان تحویل کلیدهای واقعی.",
+      "confidence": "HIGH",
+      "impact_if_wrong": "هیچ؛ چون دقیقاً منطبق با بند ۲.۳ PRD است."
+    }
+  ],
+  "risks": [
+    "RISK-01: ۱۸ تصمیم تجاری باز (OPEN-01 تا OPEN-18) در بخش ۲۸ PRD باید قبل از نهایی‌سازی فازهای مالی و تسویه توسط مدیر تعیین تکلیف شوند.",
+    "RISK-02: محدودیت رم ۸ گیگابایت روی سرور اوبنتو ۲۴ نیازمند محدودسازی حافظه کانتینرها (Memory Limits) و تنظیم دقیق PostgreSQL و پروسه‌های Node/SSR است."
+  ],
+  "open_questions": [
+    "OPEN-01..18 در سند PRD (پیشنهادهای پیش‌فرض مهندسی برای تأیید سریع مدیر آماده شده است)",
+    "آدرس ریپازیتوری GitHub مقصد برای تنظیم git remote origin چیست؟"
+  ],
+  "next_best_action": "ارسال پرامپت Boot Sequence به فرمانده ChatGPT (از فایل prompts/01_CHATGPT_COMMANDER_SYSTEM_PROMPT.md و 02_FIRST_MISSION_BOOT_PROMPT.md) یا صدور دستور شروع مستقیم فاز ۱ به Antigravity."
+}
+
