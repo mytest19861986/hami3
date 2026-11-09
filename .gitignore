@@ -40,3 +40,18 @@ Thumbs.db
 *.swp
 *.swo
 
+# Python & Testing
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Automation screenshots and temporary scratch files
+scripts/*.png
+scripts/*.txt
+scripts/__pycache__/
+
+
