@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_cities_province_id ON cities(province_id);
 CREATE TABLE IF NOT EXISTS system_settings (
     key VARCHAR(100) PRIMARY KEY,
     value_json JSONB NOT NULL,
+    data_type VARCHAR(20) NOT NULL DEFAULT 'json'
+        CHECK (data_type IN ('string', 'integer', 'boolean', 'json', 'decimal')),
+    is_mandatory BOOLEAN NOT NULL DEFAULT TRUE,
     description TEXT NOT NULL,
     is_secret BOOLEAN NOT NULL DEFAULT FALSE,
     updated_by UUID NULL,
@@ -54,8 +57,30 @@ CREATE TABLE IF NOT EXISTS system_settings (
 );
 
 -- ============================================================================
--- 3. CORE IDENTITY & AUTH: USERS (AUTH-001..017, RBAC-001..009)
+-- 3. CORE IDENTITY & AUTH: USERS & RBAC (AUTH-001..017, RBAC-001..009)
+-- 6 Distinct PRD Roles: SUPER_ADMIN, ADMIN, SUPPORT, DOCTOR, AGENT, USER
 -- ============================================================================
+
+CREATE TABLE IF NOT EXISTS roles (
+    id VARCHAR(50) PRIMARY KEY,
+    name_fa VARCHAR(100) NOT NULL,
+    description TEXT NULL,
+    is_system BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS permissions (
+    id VARCHAR(100) PRIMARY KEY,
+    module VARCHAR(50) NOT NULL,
+    description TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id VARCHAR(50) NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id VARCHAR(100) NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,6 +97,17 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_mobile ON users(mobile);
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id VARCHAR(50) NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    assigned_by UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id);
 
 CREATE TRIGGER trg_users_updated_at
 BEFORE UPDATE ON users
@@ -330,6 +366,7 @@ CREATE TABLE IF NOT EXISTS memberships (
     end_date TIMESTAMPTZ NOT NULL,
     max_visits INT NULL CHECK (max_visits IS NULL OR max_visits > 0),
     used_visits INT NOT NULL DEFAULT 0,
+    remaining_visits INT NULL CHECK (remaining_visits IS NULL OR remaining_visits >= 0),
     status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
         CHECK (status IN ('ACTIVE', 'EXPIRED', 'EXHAUSTED', 'CANCELLED', 'SUSPENDED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -547,20 +584,24 @@ CREATE TABLE IF NOT EXISTS settlements (
     bank_sheba_number VARCHAR(26) NOT NULL,
     bank_account_holder_name VARCHAR(150) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING', 'APPROVED', 'PAID', 'REJECTED', 'CANCELLED')),
+        CHECK (status IN ('PENDING', 'PROCESSING', 'APPROVED', 'PAID', 'REJECTED', 'CANCELLED')),
     rejection_reason TEXT NULL,
     external_payment_ref VARCHAR(100) NULL,
     external_payment_date TIMESTAMPTZ NULL,
+    processing_started_at TIMESTAMPTZ NULL,
+    lease_expires_at TIMESTAMPTZ NULL,
+    locked_by_worker VARCHAR(100) NULL,
     paid_by UUID NULL REFERENCES users(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ NULL
 );
 
 -- CRITICAL MATHEMATICAL INVARIANT (AC-12, BR-21):
--- Exactly AT MOST ONE open (PENDING or APPROVED) settlement request per user at any time!
+-- Exactly AT MOST ONE open (PENDING or PROCESSING or APPROVED) settlement request per user at any time!
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_settlement_per_user 
 ON settlements (user_id) 
-WHERE status IN ('PENDING', 'APPROVED');
+WHERE status IN ('PENDING', 'PROCESSING', 'APPROVED') AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_settlements_user ON settlements(user_id);
 CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements(status);
@@ -628,12 +669,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_name, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action, created_at);
+
 -- ============================================================================
 -- HamiCard (حامی‌کارت) Database Seed Data
 -- 1. Provinces and Cities of Iran (PROFILE-004)
 -- 2. Parametric System Settings for OPEN-01..18 (PRD Section 28)
 -- 3. Default Discount Plans (PLAN-001)
 -- 4. Default Content Pages (CONTENT-001..005)
+-- 5. 6 Distinct PRD Roles & Granular Permissions (BR-01..30, AUTH-001..017)
 -- ============================================================================
 
 -- ============================================================================
@@ -712,27 +755,29 @@ ON CONFLICT (province_id, name) DO NOTHING;
 -- 3. SYSTEM SETTINGS: PARAMETRIC POLICY FOR OPEN-01 TO OPEN-18
 -- ============================================================================
 
-INSERT INTO system_settings (key, value_json, description, is_secret) VALUES
-('OPEN_01_REFERRER_VS_AGENT_BOUNDARY', '{"allow_referrer_sales_cases": false, "referrer_requires_agent_approval": true}', 'مرز همکار معرفی و نماینده فروش: معرف فقط لینک/کد معرفی دارد و حق ثبت پرونده فروش حضوری ندارد مگر نقش نماینده او تأیید شود.', false),
-('OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE', '{"precedence": "CUSTOM_FIRST", "description": "در صورت وجود تخفیف اختصاصی پزشک، آن اعمال میشود؛ در غیر این صورت درصد طرح"}', 'تقدم درصد تخفیف پزشک بر طرح: CUSTOM_FIRST یا PLAN_FIRST', false),
-('OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER', '{"trigger": "PAYMENT_RECORDED_AND_CASE_APPROVED", "auto_activate_membership": true}', 'زمان قطعی شدن فروش نمایندگی و فعالسازی عضویت و پورسانت', false),
-('OPEN_04_FINANCIAL_PERMISSIONS_MATRIX', '{"record_sale_payment": ["ADMIN", "SUPER_ADMIN"], "mark_settlement_paid": ["SUPER_ADMIN"], "edit_financial_settings": ["SUPER_ADMIN"]}', 'مجوز ثبت پرداخت فروش دستی و پرداخت تسویه خارج سامانه', false),
-('OPEN_05_COMBINED_COMMISSION_POLICY', '{"allow_combined": false, "max_total_percent": 30.0}', 'جمع پورسانت فروش و معرفی و سقف مجاز', false),
-('OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN', '{"min_amount_toman": 100000, "lock_on_request": true}', 'حداقل مبلغ تسویه و قاعده مسدودی موجودی در کیف پول', false),
-('OPEN_07_VISIT_CANCELLATION_REFUND_POLICY', '{"restore_quota": true, "refund_requires_reason": true}', 'بازگشت اعتبار سهمیه و اصلاح پورسانت در لغو یا مرجوعی', false),
-('OPEN_08_MULTI_ACTIVE_PLANS_PER_HOLDER', '{"allow_multiple_active_plans": false, "extension_adds_to_end_date": true}', 'سیاست چند طرح فعال همزمان برای یک دارنده (کد ملی)', false),
-('OPEN_09_NATIONAL_CODE_PHONE_CONFLICT', '{"national_code_unique": true, "phone_change_requires_admin": true}', 'سیاست تناقض یا تغییر کد ملی و شماره موبایل', false),
-('OPEN_10_RBAC_ADMIN_SUPPORT_MATRIX', '{"support_can_view_sheba": false, "support_can_approve_financials": false}', 'ماتریس دقیق اختیارات SUPPORT و ADMIN و SUPER_ADMIN', false),
-('OPEN_11_EXTERNAL_ADAPTERS_CONFIG', '{"sms_provider": "mock", "payment_gateway": "mock", "is_production_ready": false}', 'پیکربندی سرویس پیامک و درگاه پرداخت (Sandbox / Manual)', false),
-('OPEN_12_DATA_RETENTION_AND_SOFT_DELETE', '{"soft_delete_only": true, "retain_financial_records_days": -1}', 'سیاست نگهداری اسناد و حذف کاربر (حذف منطقی بدون پاکسازی فیزیکی مالی)', false),
-('OPEN_13_BACKUP_RETENTION_POLICY', '{"daily_backups_kept": 7, "weekly_backups_kept": 4, "monthly_backups_kept": 6, "encrypt_with_age": true}', 'دوره نگهداری بکاپهای رمزنگاریشده روی سرور و Google Drive', false),
-('OPEN_14_SLA_AND_RATE_LIMITS', '{"max_concurrent_users": 500, "api_p95_ms": 200, "otp_rate_limit_per_hour": 5}', 'معیارهای عددی بار، سرعت و محدودیت ارسال کد تایید', false),
-('OPEN_15_THEME_AND_FONTS', '{"font_family": "Vazirmatn", "primary_color_hex": "#0d9488", "secondary_color_hex": "#059669"}', 'تنظیمات رنگ سازمانی (سبز زمردی/فیروزهای) و فونت فارسی وزیرمتن', false),
-('OPEN_16_VISIT_MEDICAL_RECORD_LIMIT', '{"store_diagnosis": false, "store_full_emr": false, "allow_private_notes": true}', 'حد ثبت اطلاعات پزشکی در ویزیت جهت حفظ حریم خصوصی بیمار', false),
-('OPEN_17_ADMIN_GRANT_PLAN_POLICY', '{"roles_allowed": ["ADMIN", "SUPER_ADMIN"], "mandatory_reason": true}', 'قاعده اعطای طرح بدون پرداخت توسط مدیر', false),
-('OPEN_18_CURRENCY_AND_ROUNDING', '{"currency_stored": "TOMAN", "currency_display": "TOMAN", "rounding_mode": "FLOOR"}', 'واحد مبالغ (تومان صحیح BIGINT) و گرد کردن پورسانت به سمت پایین (Floor)', false)
+INSERT INTO system_settings (key, value_json, data_type, is_mandatory, description, is_secret) VALUES
+('OPEN_01_REFERRER_VS_AGENT_BOUNDARY', '{"allow_referrer_sales_cases": false, "referrer_requires_agent_approval": true}', 'json', true, 'مرز همکار معرفی و نماینده فروش: معرف فقط لینک/کد معرفی دارد و حق ثبت پرونده فروش حضوری ندارد مگر نقش نماینده او تأیید شود.', false),
+('OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE', '{"precedence": "CUSTOM_FIRST", "description": "در صورت وجود تخفیف اختصاصی پزشک، آن اعمال میشود؛ در غیر این صورت درصد طرح"}', 'json', true, 'تقدم درصد تخفیف پزشک بر طرح: CUSTOM_FIRST یا PLAN_FIRST', false),
+('OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER', '{"trigger": "PAYMENT_RECORDED_AND_CASE_APPROVED", "auto_activate_membership": true}', 'json', true, 'زمان قطعی شدن فروش نمایندگی و فعالسازی عضویت و پورسانت', false),
+('OPEN_04_FINANCIAL_PERMISSIONS_MATRIX', '{"record_sale_payment": ["ADMIN", "SUPER_ADMIN"], "mark_settlement_paid": ["SUPER_ADMIN"], "edit_financial_settings": ["SUPER_ADMIN"]}', 'json', true, 'مجوز ثبت پرداخت فروش دستی و پرداخت تسویه خارج سامانه', false),
+('OPEN_05_COMBINED_COMMISSION_POLICY', '{"allow_combined": false, "max_total_percent": 30.0}', 'json', true, 'جمع پورسانت فروش و معرفی و سقف مجاز', false),
+('OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN', '{"min_amount_toman": 100000, "lock_on_request": true}', 'json', true, 'حداقل مبلغ تسویه و قاعده مسدودی موجودی در کیف پول', false),
+('OPEN_07_VISIT_CANCELLATION_REFUND_POLICY', '{"restore_quota": true, "refund_requires_reason": true}', 'json', true, 'بازگشت اعتبار سهمیه و اصلاح پورسانت در لغو یا مرجوعی', false),
+('OPEN_08_MULTI_ACTIVE_PLANS_PER_HOLDER', '{"allow_multiple_active_plans": false, "extension_adds_to_end_date": true}', 'json', true, 'سیاست چند طرح فعال همزمان برای یک دارنده (کد ملی)', false),
+('OPEN_09_NATIONAL_CODE_PHONE_CONFLICT', '{"national_code_unique": true, "phone_change_requires_admin": true}', 'json', true, 'سیاست تناقض یا تغییر کد ملی و شماره موبایل', false),
+('OPEN_10_RBAC_ADMIN_SUPPORT_MATRIX', '{"support_can_view_sheba": false, "support_can_approve_financials": false}', 'json', true, 'ماتریس دقیق اختیارات SUPPORT و ADMIN و SUPER_ADMIN', false),
+('OPEN_11_EXTERNAL_ADAPTERS_CONFIG', '{"sms_provider": "mock", "payment_gateway": "mock", "is_production_ready": false}', 'json', true, 'پیکربندی سرویس پیامک و درگاه پرداخت (Sandbox / Manual)', false),
+('OPEN_12_DATA_RETENTION_AND_SOFT_DELETE', '{"soft_delete_only": true, "retain_financial_records_days": -1}', 'json', true, 'سیاست نگهداری اسناد و حذف کاربر (حذف منطقی بدون پاکسازی فیزیکی مالی)', false),
+('OPEN_13_BACKUP_RETENTION_POLICY', '{"daily_backups_kept": 7, "weekly_backups_kept": 4, "monthly_backups_kept": 6, "encrypt_with_age": true}', 'json', true, 'دوره نگهداری بکاپهای رمزنگاریشده روی سرور و Google Drive', false),
+('OPEN_14_SLA_AND_RATE_LIMITS', '{"max_concurrent_users": 500, "api_p95_ms": 200, "otp_rate_limit_per_hour": 5}', 'json', true, 'معیارهای عددی بار، سرعت و محدودیت ارسال کد تایید', false),
+('OPEN_15_THEME_AND_FONTS', '{"font_family": "Vazirmatn", "primary_color_hex": "#0d9488", "secondary_color_hex": "#059669"}', 'json', true, 'تنظیمات رنگ سازمانی (سبز زمردی/فیروزهای) و فونت فارسی وزیرمتن', false),
+('OPEN_16_VISIT_MEDICAL_RECORD_LIMIT', '{"store_diagnosis": false, "store_full_emr": false, "allow_private_notes": true}', 'json', true, 'حد ثبت اطلاعات پزشکی در ویزیت جهت حفظ حریم خصوصی بیمار', false),
+('OPEN_17_ADMIN_GRANT_PLAN_POLICY', '{"roles_allowed": ["ADMIN", "SUPER_ADMIN"], "mandatory_reason": true}', 'json', true, 'قاعده اعطای طرح بدون پرداخت توسط مدیر', false),
+('OPEN_18_CURRENCY_AND_ROUNDING', '{"currency_stored": "TOMAN", "currency_display": "TOMAN", "rounding_mode": "FLOOR"}', 'json', true, 'واحد مبالغ (تومان صحیح BIGINT) و گرد کردن پورسانت به سمت پایین (Floor)', false)
 ON CONFLICT (key) DO UPDATE SET 
     value_json = EXCLUDED.value_json,
+    data_type = EXCLUDED.data_type,
+    is_mandatory = EXCLUDED.is_mandatory,
     description = EXCLUDED.description,
     updated_at = NOW();
 
@@ -761,3 +806,92 @@ ON CONFLICT (slug) DO UPDATE SET
     body_html = EXCLUDED.body_html,
     is_published = EXCLUDED.is_published,
     updated_at = NOW();
+
+-- ============================================================================
+-- 6. 6 DISTINCT PRD ROLES & GRANULAR PERMISSIONS (BR-01..30, AUTH-001..017)
+-- ============================================================================
+
+INSERT INTO roles (id, name_fa, description, is_system) VALUES
+('SUPER_ADMIN', 'مدیر ارشد سامانه', 'دسترسی نامحدود به تمامی زیرسیستم‌ها، تنظیمات مالی و انتساب نقش‌ها', true),
+('ADMIN', 'مدیر عملیاتی', 'مدیریت کاربران، پزشکان، نمایندگان، تأیید اسناد و گزارش‌گیری', true),
+('SUPPORT', 'کارشناس پشتیبانی', 'پاسخ‌گویی به تیکت‌ها، مشاهده سوابق محدود، بدون دسترسی مالی', true),
+('DOCTOR', 'پزشک / مرکز درمانی', 'ثبت ویزیت، استعلام سهمیه بیمار، مشاهده تسویه‌ها و قرارداد', true),
+('AGENT', 'نماینده فروش', 'ثبت پرونده فروش، پیگیری ارسال کارت، مشاهده پورسانت و تسویه', true),
+('USER', 'کاربر / بیمار', 'خرید طرح تخفیف درمانی، مشاهده وضعیت کارت و سابقه ویزیت‌ها', true)
+ON CONFLICT (id) DO UPDATE SET
+    name_fa = EXCLUDED.name_fa,
+    description = EXCLUDED.description;
+
+INSERT INTO permissions (id, module, description) VALUES
+-- Identity & Users
+('users:read', 'users', 'مشاهده لیست و جزئیات کاربران'),
+('users:write', 'users', 'ویرایش مشخصات کاربران'),
+('users:manage_roles', 'users', 'تغییر یا انتساب نقش به کاربران (مخصوص سوپرادمین)'),
+('users:suspend', 'users', 'تعلیق یا مسدودسازی حساب کاربری'),
+-- Doctors
+('doctors:read', 'doctors', 'مشاهده شبکه پزشکان و اطلاعات تماس'),
+('doctors:verify', 'doctors', 'بررسی مدارک و تایید صلاحیت پزشک'),
+('doctors:write_contract', 'doctors', 'ثبت و تایید قرارداد رسمی پزشک'),
+-- Agents
+('agents:read', 'agents', 'مشاهده لیست و پرونده نمایندگان فروش'),
+('agents:verify', 'agents', 'بررسی مدارک و تایید نماینده فروش'),
+-- Discount Plans
+('plans:read', 'plans', 'مشاهده لیست طرح‌های تخفیف فعال'),
+('plans:write', 'plans', 'تعریف و ویرایش قیمت و مشخصات طرح تخفیف'),
+('plans:admin_grant', 'plans', 'اعطای طرح درمانی به کاربر بدون پرداخت وجه (ADMIN/SUPER_ADMIN)'),
+-- Memberships & Visits
+('memberships:read', 'memberships', 'استعلام وضعیت کارت و سهمیه باقیمانده ویزیت'),
+('visits:record', 'visits', 'ثبت ویزیت بیمار و کسر اتمیک سهمیه'),
+('visits:cancel', 'visits', 'لغو ویزیت ثبت‌شده و استرداد سهمیه و اصلاح پورسانت'),
+-- Referrals & Marketing
+('referral:generate_code', 'referral', 'ایجاد لینک و کد معرف بازاریابی'),
+('referral:view_stats', 'referral', 'مشاهده تعداد معرفی‌شدگان و گردش حاصله'),
+('referral:view_commission', 'referral', 'مشاهده کارمزد و پورسانت‌های معرفی'),
+-- Financials & Settlements
+('wallets:read', 'wallets', 'مشاهده موجودی و دفترکل کیف پول'),
+('commissions:approve', 'commissions', 'تایید کمیسیون‌های فروش و معرفی'),
+('settlements:request', 'settlements', 'ثبت درخواست تسویه حساب بانکی'),
+('settlements:process', 'settlements', 'دریافت و پردازش درخواست‌های تسویه توسط ورکر مالی'),
+('settlements:pay', 'settlements', 'ثبت حواله پایا و قطعی‌سازی تسویه (SUPER_ADMIN)'),
+-- Settings & Audit
+('settings:read', 'settings', 'مشاهده تنظیمات ۱۸ گانه سامانه'),
+('settings:write', 'settings', 'تغییر تنظیمات پارامتریک سیستمی (SUPER_ADMIN)'),
+('audit:read', 'audit', 'مشاهده لاگ‌های امنیتی و ممیزی سیستم')
+ON CONFLICT (id) DO UPDATE SET
+    module = EXCLUDED.module,
+    description = EXCLUDED.description;
+
+-- Mapping: SUPER_ADMIN has ALL permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'SUPER_ADMIN', id FROM permissions
+ON CONFLICT DO NOTHING;
+
+-- Mapping: ADMIN permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'ADMIN', id FROM permissions 
+WHERE id NOT IN ('users:manage_roles', 'settlements:pay', 'settings:write')
+ON CONFLICT DO NOTHING;
+
+-- Mapping: SUPPORT permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'SUPPORT', id FROM permissions 
+WHERE id IN ('users:read', 'doctors:read', 'agents:read', 'plans:read', 'memberships:read', 'settings:read')
+ON CONFLICT DO NOTHING;
+
+-- Mapping: DOCTOR permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'DOCTOR', id FROM permissions 
+WHERE id IN ('memberships:read', 'visits:record', 'wallets:read', 'settlements:request')
+ON CONFLICT DO NOTHING;
+
+-- Mapping: AGENT permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'AGENT', id FROM permissions 
+WHERE id IN ('plans:read', 'referral:generate_code', 'referral:view_stats', 'referral:view_commission', 'wallets:read', 'settlements:request')
+ON CONFLICT DO NOTHING;
+
+-- Mapping: USER permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT 'USER', id FROM permissions 
+WHERE id IN ('plans:read', 'memberships:read', 'referral:generate_code', 'referral:view_stats', 'referral:view_commission')
+ON CONFLICT DO NOTHING;

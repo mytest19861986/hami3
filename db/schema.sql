@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_cities_province_id ON cities(province_id);
 CREATE TABLE IF NOT EXISTS system_settings (
     key VARCHAR(100) PRIMARY KEY,
     value_json JSONB NOT NULL,
+    data_type VARCHAR(20) NOT NULL DEFAULT 'json'
+        CHECK (data_type IN ('string', 'integer', 'boolean', 'json', 'decimal')),
+    is_mandatory BOOLEAN NOT NULL DEFAULT TRUE,
     description TEXT NOT NULL,
     is_secret BOOLEAN NOT NULL DEFAULT FALSE,
     updated_by UUID NULL,
@@ -54,8 +57,30 @@ CREATE TABLE IF NOT EXISTS system_settings (
 );
 
 -- ============================================================================
--- 3. CORE IDENTITY & AUTH: USERS (AUTH-001..017, RBAC-001..009)
+-- 3. CORE IDENTITY & AUTH: USERS & RBAC (AUTH-001..017, RBAC-001..009)
+-- 6 Distinct PRD Roles: SUPER_ADMIN, ADMIN, SUPPORT, DOCTOR, AGENT, USER
 -- ============================================================================
+
+CREATE TABLE IF NOT EXISTS roles (
+    id VARCHAR(50) PRIMARY KEY,
+    name_fa VARCHAR(100) NOT NULL,
+    description TEXT NULL,
+    is_system BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS permissions (
+    id VARCHAR(100) PRIMARY KEY,
+    module VARCHAR(50) NOT NULL,
+    description TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id VARCHAR(50) NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id VARCHAR(100) NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,6 +97,17 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_mobile ON users(mobile);
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id VARCHAR(50) NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    assigned_by UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id);
 
 CREATE TRIGGER trg_users_updated_at
 BEFORE UPDATE ON users
@@ -330,6 +366,7 @@ CREATE TABLE IF NOT EXISTS memberships (
     end_date TIMESTAMPTZ NOT NULL,
     max_visits INT NULL CHECK (max_visits IS NULL OR max_visits > 0),
     used_visits INT NOT NULL DEFAULT 0,
+    remaining_visits INT NULL CHECK (remaining_visits IS NULL OR remaining_visits >= 0),
     status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
         CHECK (status IN ('ACTIVE', 'EXPIRED', 'EXHAUSTED', 'CANCELLED', 'SUSPENDED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -547,20 +584,24 @@ CREATE TABLE IF NOT EXISTS settlements (
     bank_sheba_number VARCHAR(26) NOT NULL,
     bank_account_holder_name VARCHAR(150) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING', 'APPROVED', 'PAID', 'REJECTED', 'CANCELLED')),
+        CHECK (status IN ('PENDING', 'PROCESSING', 'APPROVED', 'PAID', 'REJECTED', 'CANCELLED')),
     rejection_reason TEXT NULL,
     external_payment_ref VARCHAR(100) NULL,
     external_payment_date TIMESTAMPTZ NULL,
+    processing_started_at TIMESTAMPTZ NULL,
+    lease_expires_at TIMESTAMPTZ NULL,
+    locked_by_worker VARCHAR(100) NULL,
     paid_by UUID NULL REFERENCES users(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ NULL
 );
 
 -- CRITICAL MATHEMATICAL INVARIANT (AC-12, BR-21):
--- Exactly AT MOST ONE open (PENDING or APPROVED) settlement request per user at any time!
+-- Exactly AT MOST ONE open (PENDING or PROCESSING or APPROVED) settlement request per user at any time!
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_settlement_per_user 
 ON settlements (user_id) 
-WHERE status IN ('PENDING', 'APPROVED');
+WHERE status IN ('PENDING', 'PROCESSING', 'APPROVED') AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_settlements_user ON settlements(user_id);
 CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements(status);
