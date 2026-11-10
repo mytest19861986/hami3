@@ -603,13 +603,23 @@ async def test_t14_approved_commission_floor_rounding_and_policy_record(db_pool:
             f"T14-FLR-{uuid.uuid4().hex}",
         )
 
+    from src.adapters.payment import get_runtime_payment_gateway
+
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        r_init = await client.post(
+            f"/api/v1/payments/orders/{order_id}/initiate",
+            json={"callback_url": "https://hamicard.local/payments/callback"},
+            headers=user_headers,
+        )
+        assert r_init.status_code == 200, r_init.text
+        authority = r_init.json()["authority"]
+        get_runtime_payment_gateway().confirm_payment(authority)
+
         r_ok = await client.post(
             f"/api/v1/payments/orders/{order_id}/verify",
             json={
-                "gateway_transaction_id": "TX-FLR",
-                "gateway_tracking_code": "TRK-FLR",
+                "authority": authority,
                 "referral_code": ref_code,
             },
             headers=user_headers,
