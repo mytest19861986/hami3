@@ -354,10 +354,15 @@
           </div>
           <div class="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center font-bold text-sm">ح</div>
         </div>
-        <div class="font-mono text-sm tracking-wider mb-6 text-slate-300" id="card-holder-name">
-          کاربر گرامی حامی‌کارت
+        <div class="flex justify-between items-center mb-4">
+          <div class="font-mono text-sm tracking-wider text-slate-300" id="card-holder-name">
+            کاربر گرامی حامی‌کارت
+          </div>
+          <div class="font-mono text-xs px-2.5 py-1 bg-white/10 rounded-lg text-brand-300 font-semibold border border-white/10" id="card-number-disp">
+            HAMI-1405-88492019
+          </div>
         </div>
-        <div class="flex justify-between items-end text-xs">
+        <div class="flex justify-between items-end text-xs mb-4">
           <div>
             <div class="text-[10px] text-slate-400">سهمیه باقیمانده</div>
             <div class="text-base font-bold text-emerald-400" id="card-remaining-visits">فعال / نامحدود</div>
@@ -366,6 +371,13 @@
             <div class="text-[10px] text-slate-400">وضعیت کارت</div>
             <div class="font-bold text-emerald-400">معتبر (ACTIVE)</div>
           </div>
+        </div>
+        <div class="bg-black/30 backdrop-blur-md rounded-xl p-3 border border-white/10 flex items-center justify-between text-xs">
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span class="text-slate-300 text-[11px]">کد امنیتی QR پذیرش درمانگاه:</span>
+          </div>
+          <span class="font-mono text-[11px] text-brand-300 font-bold" id="card-qr-signature">HAMICARD:v1:ACTIVE:VERIFIED</span>
         </div>
       </div>
 
