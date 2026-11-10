@@ -3,9 +3,12 @@ HamiCard (حامی‌کارت) FastAPI Application Core
 Baseline: BL-HAMICARD-PRD-V1
 """
 
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from src.api.deps import init_pool, close_pool, init_redis, close_redis
 from src.api.health import router as health_router
@@ -66,11 +69,27 @@ app.include_router(payments_router, prefix=API_V1_PREFIX)
 app.include_router(reviews_router, prefix=API_V1_PREFIX)
 app.include_router(notifications_router, prefix=API_V1_PREFIX)
 
+# Mount static files and web portal
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-@app.get("/")
+
+@app.get("/", include_in_schema=False)
 def root():
+    index_file = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_file):
+        return FileResponse(index_file)
     return {
         "message": "به سامانه خدمات رفاهی و درمانی حامی‌کارت خوش آمدید.",
         "docs": "/docs",
         "health": "/api/v1/health"
     }
+
+
+@app.get("/manifest.json", include_in_schema=False)
+def manifest():
+    manifest_file = os.path.join(STATIC_DIR, "manifest.json")
+    if os.path.exists(manifest_file):
+        return FileResponse(manifest_file, media_type="application/manifest+json")
+    return {}

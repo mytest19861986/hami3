@@ -130,18 +130,29 @@ async def test_api_suite():
         print(f"  ✓ Doctor Reviews PASS: total={rev_data['total_reviews']}, avg={rev_data['average_rating']}.")
 
         # 10. Authenticated Notifications
-        print("\n[HTTP TEST 10/10] Testing GET /api/v1/notifications/unread-count...")
+        print("\n[HTTP TEST 10/11] Testing GET /api/v1/notifications/unread-count...")
         r_notif = await client.get("/api/v1/notifications/unread-count", headers=auth_headers)
         assert r_notif.status_code == 200
         notif_data = r_notif.json()
         assert "unread_count" in notif_data
         print(f"  ✓ Notifications PASS: unread_count={notif_data['unread_count']}.")
 
+        # 11. Root Web Portal & PWA Manifest
+        print("\n[HTTP TEST 11/11] Testing GET / and /manifest.json...")
+        r_root = await client.get("/")
+        assert r_root.status_code == 200
+        assert "حامی‌کارت" in r_root.text
+        r_manifest = await client.get("/manifest.json")
+        assert r_manifest.status_code == 200
+        man_data = r_manifest.json()
+        assert man_data["short_name"] == "حامی‌کارت"
+        print(f"  ✓ Web Portal & PWA Manifest PASS: served successfully.")
+
     await close_pool()
     close_redis()
 
     print("\n" + "=" * 70)
-    print("ALL 10 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
+    print("ALL 11 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
     print("=" * 70)
 
 
