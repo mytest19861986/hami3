@@ -1,7 +1,11 @@
 """
 Visits API Endpoints (VISIT-001..013, AC-07, AC-08)
-Allows authenticated doctors to record visits with atomic quota decrements,
-and supports visit cancellation with automatic quota restoration.
+REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5)
+
+Guarantees:
+- Derives/validates doctor identity from authenticated actor (`doctor_id` spoofing -> 403).
+- Visit cancellation requires explicit `visits:cancel` RBAC permission at API & service boundaries.
+- Detail & doctor listing endpoints enforce strict ownership / privacy filtering and PII masking.
 """
 
 import uuid
@@ -16,8 +20,10 @@ from src.core.policy import PolicyNotApprovedError
 from src.visits.service import (
     MembershipInactiveError,
     QuotaExhaustedError,
+    VisitAuthorizationError,
     VisitCancellationError,
     VisitError,
+    VisitNotFoundError,
     VisitService,
 )
 
@@ -25,7 +31,7 @@ router = APIRouter(prefix="/visits", tags=["Visits & Quota Consumption"])
 
 
 class RecordVisitSchema(BaseModel):
-    doctor_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
+    doctor_id: uuid.UUID | None = Field(None, example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     holder_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     membership_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     service_title: str = Field(..., min_length=2, max_length=255, example="ویزیت تخصصی قلب و عروق")
@@ -42,30 +48,35 @@ class CancelVisitSchema(BaseModel):
 async def record_visit(
     payload: RecordVisitSchema,
     current_user: Dict[str, Any] = Depends(require_permission("visits:record")),
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    pool: asyncpg.Pool = Depends(get_db_pool),
 ):
     """
-    Records a medical visit and atomically decrements remaining membership visits (AC-07).
-    Guarantees zero negative visits or overselling under race conditions.
+    Records a medical visit for the authenticated APPROVED doctor (or authorized ADMIN override)
+    and atomically decrements remaining membership visits (AC-07).
     """
     visit_svc = VisitService(pool)
     try:
         result = await visit_svc.record_visit(
-            doctor_id=payload.doctor_id,
             holder_id=payload.holder_id,
             membership_id=payload.membership_id,
             service_title=payload.service_title,
             total_amount_toman=payload.total_amount_toman,
             discount_percent=payload.discount_percent,
-            private_notes=payload.private_notes
+            actor_user_id=current_user["id"],
+            doctor_id=payload.doctor_id,
+            private_notes=payload.private_notes,
         )
         return {"success": True, "visit": result}
     except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitAuthorizationError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except QuotaExhaustedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except MembershipInactiveError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except VisitNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except VisitError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -74,40 +85,52 @@ async def record_visit(
 async def cancel_visit(
     visit_id: uuid.UUID,
     payload: CancelVisitSchema,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    current_user: Dict[str, Any] = Depends(require_permission("visits:cancel")),
+    pool: asyncpg.Pool = Depends(get_db_pool),
 ):
     """
-    Cancels a visit, atomically rolls back quota consumption, and logs an audit trail.
+    Cancels a visit (strictly `visits:cancel` authorized ADMIN/SUPER_ADMIN),
+    atomically rolls back quota at most once, and records actual actor in audit logs.
     """
     visit_svc = VisitService(pool)
     try:
         cancelled = await visit_svc.cancel_visit(
             visit_id=visit_id,
             canceller_user_id=current_user["id"],
-            reason=payload.reason
+            reason=payload.reason,
         )
         return {"success": True, "visit": cancelled}
     except PolicyNotApprovedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VisitCancellationError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except VisitNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/{visit_id}")
 async def get_visit_details(
     visit_id: uuid.UUID,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    pool: asyncpg.Pool = Depends(get_db_pool),
 ):
-    """Retrieves single visit with detailed financial breakdown."""
+    """Retrieves single visit strictly for authorized owner/admin with PII privacy filtering."""
     visit_svc = VisitService(pool)
     try:
-        return await visit_svc.get_visit_by_id(visit_id)
-    except VisitError as e:
+        return await visit_svc.get_visit_by_id(
+            visit_id=visit_id,
+            actor_user_id=current_user["id"],
+        )
+    except VisitAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/doctor/{doctor_id}")
@@ -116,8 +139,20 @@ async def list_doctor_visits(
     limit: int = 50,
     offset: int = 0,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    pool: asyncpg.Pool = Depends(get_db_pool),
 ):
-    """Lists visits handled by a doctor with pagination."""
+    """Lists visits handled by a doctor strictly for the owning APPROVED doctor, ADMIN, or SUPPORT."""
     visit_svc = VisitService(pool)
-    return await visit_svc.list_doctor_visits(doctor_id, limit=limit, offset=offset)
+    try:
+        return await visit_svc.list_doctor_visits(
+            doctor_id=doctor_id,
+            actor_user_id=current_user["id"],
+            limit=limit,
+            offset=offset,
+        )
+    except VisitAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
