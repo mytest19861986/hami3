@@ -168,9 +168,10 @@ async def test_api_suite():
             )
             holder_id = str(holder["id"])
 
+        selected_plan = next((p for p in plans if p.get("max_visits") and p["max_visits"] >= 5), plans[0])
         order_payload = {
             "holder_id": holder_id,
-            "plan_id": plans[0]["id"],
+            "plan_id": selected_plan["id"],
             "idempotency_key": f"IDEM-{uuid.uuid4().hex[:12]}",
             "payment_method": "GATEWAY",
             "gateway_name": "ZARINPAL",
@@ -236,7 +237,7 @@ async def test_api_suite():
         print(f"  ✓ Record Visit PASS: visit_id={visit_res['visit']['id']}, total={visit_res['visit']['total_amount_toman']}.")
 
         # 15. Wallet Settlement Request API
-        print("\n[HTTP TEST 15/15] Testing POST /api/v1/wallet/settle...")
+        print("\n[HTTP TEST 15/17] Testing POST /api/v1/wallet/settle...")
         settle_payload = {
             "amount_toman": 150000,
             "bank_card_number": "6037991199999990",
@@ -248,11 +249,32 @@ async def test_api_suite():
         assert "Insufficient funds" in r_settle.json()["detail"]
         print("  ✓ Wallet Settle PASS: Insufficient balance safely guarded with 400 Bad Request.")
 
+        # 16. Digital Membership Card Retrieval API
+        print("\n[HTTP TEST 16/17] Testing GET /api/v1/cards/membership/{membership_id}...")
+        r_card = await client.get(f"/api/v1/cards/membership/{membership_id}", headers=auth_headers)
+        assert r_card.status_code == 200
+        card_data = r_card.json()
+        assert card_data["success"] is True
+        assert card_data["card"]["card_number"].startswith("HAMI-1405-")
+        assert "HAMICARD:v1:" in card_data["card"]["qr_code_payload"]
+        qr_payload = card_data["card"]["qr_code_payload"]
+        print(f"  ✓ Virtual Card PASS: card_number={card_data['card']['card_number']}, qr_signed=OK.")
+
+        # 17. Clinic Doctor QR Scan Verification API
+        print("\n[HTTP TEST 17/17] Testing POST /api/v1/cards/verify-qr...")
+        r_scan = await client.post("/api/v1/cards/verify-qr", json={"qr_payload": qr_payload}, headers=doc_headers)
+        assert r_scan.status_code == 200
+        scan_data = r_scan.json()
+        assert scan_data["verified"] is True
+        assert scan_data["can_record_visit"] is True
+        assert scan_data["card"]["status"] == "ACTIVE"
+        print("  ✓ Clinic QR Verify PASS: verified=True, can_record_visit=True.")
+
     await close_pool()
     close_redis()
 
     print("\n" + "=" * 70)
-    print("ALL 15 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
+    print("ALL 17 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
     print("=" * 70)
 
 
