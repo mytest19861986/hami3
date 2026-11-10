@@ -53,5 +53,7 @@ htmlcov/
 scripts/*.png
 scripts/*.txt
 scripts/__pycache__/
+scratch/
+ops/backups/
 
 
