@@ -15,6 +15,7 @@ SUITES = [
     ("Phase 3 Mathematical Validators", "tests/test_validators.py"),
     ("Phase 3 Profiles & Geography Reference", "tests/test_profiles.py"),
     ("Phase 3 Doctors Network & Discount Plans", "tests/test_doctors_and_plans.py"),
+    ("Phase 3 CMS & Content Pages", "tests/test_content.py"),
 ]
 
 def main():
