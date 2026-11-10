@@ -67,3 +67,4 @@ async def load_and_validate_settings(conn: asyncpg.Connection) -> Dict[str, Any]
         )
 
     return settings_map
+

@@ -51,3 +51,4 @@ def generate_otp_code(digits: int = 6) -> str:
     range_start = 10 ** (digits - 1)
     range_end = (10 ** digits) - 1
     return str(secrets.randbelow(range_end - range_start + 1) + range_start)
+

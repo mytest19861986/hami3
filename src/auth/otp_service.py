@@ -134,3 +134,4 @@ class OtpService:
         """Test harness helper only: reads active OTP from Redis."""
         mobile = normalize_iranian_mobile(raw_mobile)
         return self.r.get(f"otp:code:{mobile}")
+

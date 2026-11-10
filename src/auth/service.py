@@ -305,3 +305,4 @@ class AuthService:
             """, actor_user_id, str(agent_id))
 
             return "UPDATE 1" in res
+

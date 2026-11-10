@@ -163,3 +163,4 @@ class RbacEngine:
             """, actor_user_id, str(target_user_id), role_to_assign)
 
             return True
+
