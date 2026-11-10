@@ -4,8 +4,8 @@
 **Mission ID:** `M-HAMICARD-ZERO-TO-PROD`  
 **Baseline:** `BL-HAMICARD-PRD-V1`  
 **Repository:** `https://github.com/mytest19861986/hami3`  
-**Current HEAD Commit (develop):** `4779a2a` (Merge Pull Request #1)  
-**CI/CD Pipeline Status:** **PASS (100% GREEN)** — Run `42824658741` (14 Suites, 74 Tests Passing)
+**Current HEAD Commit (develop):** `81e782c`  
+**CI/CD Pipeline Status:** **PASS (100% GREEN)** — Run `42828206745` (14 Suites, 78 Tests Passing in 47s)
 
 ---
 
@@ -15,8 +15,8 @@
 | :--- | :---: | :--- |
 | **Pull Request #1** | **MERGED** | شاخه `feature/phase3-profiles-and-validators` شامل تمامی کدهای فاز ۱ تا ۴ در شاخه اصلی `develop` مرج گردید. |
 | **محیط خط لوله CI** | **ACTIVE** | مخزن گیت‌هاب مجهز به GitHub Actions با سرویس‌های PostgreSQL 16 Alpine و Redis 7 Alpine روی Ubuntu 24.04. |
-| **اجرای پایپ‌لاین روی develop** | **SUCCESS** | شناسه اجرای `42824658741` در زمان ۵۴ ثانیه با موفقیت ۱۰۰٪ پاس شد. |
-| **ماتریس تست‌ها** | **۷۴ از ۷۴ سبز** | تمام ۱۴ سوئیت آزمون جامع از لایه دیتابیس تا احراز هویت، اعتبارسنج‌ها، دامنه‌ها، وب‌پورتال و REST API با موفقیت اجرا شدند. |
+| **اجرای پایپ‌لاین روی develop** | **SUCCESS** | شناسه اجرای `42828206745` در زمان ۴۷ ثانیه با موفقیت ۱۰۰٪ پاس شد. |
+| **ماتریس تست‌ها** | **۷۸ از ۷۸ سبز** | تمام ۱۴ سوئیت آزمون جامع از لایه دیتابیس تا احراز هویت، اعتبارسنج‌ها، دامنه‌ها، وب‌پورتال و ۱۵ اندپوینت REST API با موفقیت اجرا شدند. |
 | **کیفیت کد (Linter)** | **ZERO DEFECTS** | انطباق کامل با Ruff linter (پایتون ۳.۱۳) بدون هیچ‌گونه خطا یا هشدار. |
 
 ---
