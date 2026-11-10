@@ -1,15 +1,18 @@
 """
 Wallet & Append-Only Financial Ledger Service (WALLET-001..010, BR-15, AC-11)
-REMEDIATION: HC-T14 (F-06, F-07, T14-AC1..AC4)
+REMEDIATION: HC-T14 (F-06, F-07, T14-AC1..AC4), HC-T20 (T20-AC1..AC4)
 
 Guarantees:
 - Atomic single-connection transaction composition (`conn` parameter supported across
   mutations so callers never split wallet deduction and settlement creation across two
   separate transactions!)
+- Serialized per-wallet row locking (`FOR UPDATE`) prior to idempotency evaluation so
+  concurrent identical/conflicting replays NEVER double-lock, double-credit, or race into
+  unhandled 500 errors.
 - Fail-closed policy gating (`OPEN_06`, `OPEN_04`, `OPEN_18`) so unapproved/blocked policies
-  disable sensitive financial operations
+  disable sensitive financial operations.
 - Mathematical invariants: non-negative balances, strictly positive settlement/credit amounts,
-  idempotent ledger entries
+  idempotent ledger entries across credit, lock, payout, and refund.
 """
 
 import uuid
@@ -36,7 +39,12 @@ class WalletNotFoundError(WalletError):
 
 
 class DuplicateFinancialTransactionError(WalletError):
-    """Raised on idempotency key replay."""
+    """Raised on idempotency key replay in financial ledger mutations."""
+    pass
+
+
+class IdempotencyConflictError(WalletError):
+    """Raised when a client Idempotency-Key is reused with a different request payload."""
     pass
 
 
@@ -92,6 +100,33 @@ class WalletService:
                 raise WalletNotFoundError(f"Wallet for user {user_id} not found.")
             return dict(row)
 
+    async def find_settlement_by_idempotency_key(
+        self,
+        conn: asyncpg.Connection,
+        user_id: uuid.UUID,
+        idempotency_key: str,
+    ) -> Dict[str, Any] | None:
+        """
+        Looks up a previously committed settlement record linked to a scoped
+        SETTLEMENT_LOCK ledger idempotency key belonging to `user_id`.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT s.id, s.user_id, s.amount_toman, s.bank_card_number,
+                   s.bank_sheba_number, s.bank_account_holder_name,
+                   s.status, s.created_at
+            FROM wallet_ledger_entries wle
+            JOIN wallets w ON wle.wallet_id = w.id
+            JOIN settlements s ON wle.reference_id = s.id::text AND s.user_id = w.user_id
+            WHERE wle.idempotency_key = $1
+              AND w.user_id = $2
+              AND wle.entry_type = 'SETTLEMENT_LOCK'
+            """,
+            idempotency_key,
+            user_id,
+        )
+        return dict(row) if row else None
+
     async def _credit_commission_on_conn(
         self,
         conn: asyncpg.Connection,
@@ -104,22 +139,21 @@ class WalletService:
     ) -> Dict[str, Any]:
         await require_approved_policy(conn, "OPEN_18_CURRENCY_AND_ROUNDING")
 
+        await conn.execute(
+            "INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id,
+        )
+        wallet = await conn.fetchrow(
+            "SELECT id, status, withdrawable_balance_toman, locked_balance_toman FROM wallets WHERE user_id = $1 FOR UPDATE",
+            user_id,
+        )
+
         existing_entry = await conn.fetchrow(
             "SELECT id, balance_after_toman FROM wallet_ledger_entries WHERE idempotency_key = $1",
             idempotency_key,
         )
         if existing_entry:
             return await self.get_wallet_by_user_id(user_id, conn=conn)
-
-        wallet = await conn.fetchrow(
-            "SELECT id, status, withdrawable_balance_toman, locked_balance_toman FROM wallets WHERE user_id = $1 FOR UPDATE",
-            user_id,
-        )
-        if not wallet:
-            wallet = await conn.fetchrow(
-                "INSERT INTO wallets (user_id) VALUES ($1) RETURNING id, status, withdrawable_balance_toman, locked_balance_toman",
-                user_id,
-            )
 
         if wallet["status"] != "ACTIVE":
             raise WalletFrozenError(f"Wallet is '{wallet['status']}'. Transactions blocked.")
@@ -217,19 +251,19 @@ class WalletService:
                 f"Settlement amount {amount_toman} Toman is below approved minimum {min_amount} Toman."
             )
 
-        existing_entry = await conn.fetchrow(
-            "SELECT id FROM wallet_ledger_entries WHERE idempotency_key = $1",
-            idempotency_key,
-        )
-        if existing_entry:
-            raise DuplicateFinancialTransactionError("Duplicate settlement lock idempotency key.")
-
         wallet = await conn.fetchrow(
             "SELECT id, status, withdrawable_balance_toman, locked_balance_toman FROM wallets WHERE user_id = $1 FOR UPDATE",
             user_id,
         )
         if not wallet:
             raise WalletNotFoundError("Wallet not found.")
+
+        existing_entry = await conn.fetchrow(
+            "SELECT id FROM wallet_ledger_entries WHERE idempotency_key = $1",
+            idempotency_key,
+        )
+        if existing_entry:
+            raise DuplicateFinancialTransactionError("Duplicate settlement lock idempotency key.")
 
         if wallet["status"] != "ACTIVE":
             raise WalletFrozenError(f"Wallet is '{wallet['status']}'. Settlement blocked.")
@@ -319,8 +353,11 @@ class WalletService:
     ) -> Dict[str, Any]:
         """
         Deducts from locked_balance_toman upon successful bank transfer payout.
-        Requires approved OPEN_04 & OPEN_18 financial policies.
+        Requires approved OPEN_04 & OPEN_18 financial policies and enforces idempotency.
         """
+        if amount_toman <= 0:
+            raise WalletError("Payout amount must be positive.")
+
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await require_approved_policy(conn, "OPEN_04_FINANCIAL_PERMISSIONS_MATRIX")
@@ -330,7 +367,19 @@ class WalletService:
                     "SELECT id, locked_balance_toman, withdrawable_balance_toman FROM wallets WHERE user_id = $1 FOR UPDATE",
                     user_id,
                 )
-                if not wallet or wallet["locked_balance_toman"] < amount_toman:
+                if not wallet:
+                    raise WalletNotFoundError("Wallet not found.")
+
+                existing_entry = await conn.fetchrow(
+                    "SELECT id FROM wallet_ledger_entries WHERE idempotency_key = $1",
+                    idempotency_key,
+                )
+                if existing_entry:
+                    raise DuplicateFinancialTransactionError(
+                        "Duplicate settlement payout idempotency key."
+                    )
+
+                if wallet["locked_balance_toman"] < amount_toman:
                     raise WalletError("Invalid locked balance for settlement finalization.")
 
                 new_locked = wallet["locked_balance_toman"] - amount_toman
@@ -373,7 +422,13 @@ class WalletService:
         idempotency_key: str,
         reason: str,
     ) -> Dict[str, Any]:
-        """Unlocks funds back to withdrawable balance if settlement is REJECTED or CANCELLED."""
+        """
+        Unlocks funds back to withdrawable balance if settlement is REJECTED or CANCELLED.
+        Enforces idempotency under FOR UPDATE lock so double refunds are blocked.
+        """
+        if amount_toman <= 0:
+            raise WalletError("Refund amount must be positive.")
+
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await require_approved_policy(conn, "OPEN_18_CURRENCY_AND_ROUNDING")
@@ -382,7 +437,19 @@ class WalletService:
                     "SELECT id, withdrawable_balance_toman, locked_balance_toman FROM wallets WHERE user_id = $1 FOR UPDATE",
                     user_id,
                 )
-                if not wallet or wallet["locked_balance_toman"] < amount_toman:
+                if not wallet:
+                    raise WalletNotFoundError("Wallet not found.")
+
+                existing_entry = await conn.fetchrow(
+                    "SELECT id FROM wallet_ledger_entries WHERE idempotency_key = $1",
+                    idempotency_key,
+                )
+                if existing_entry:
+                    raise DuplicateFinancialTransactionError(
+                        "Duplicate settlement refund idempotency key."
+                    )
+
+                if wallet["locked_balance_toman"] < amount_toman:
                     raise WalletError("Invalid locked balance for refund.")
 
                 balance_before = wallet["withdrawable_balance_toman"]
