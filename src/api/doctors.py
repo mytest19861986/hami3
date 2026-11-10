@@ -3,12 +3,12 @@ Doctors Network & Public Directory API Endpoints (DOC-001..014, AC-02)
 """
 
 import uuid
-from typing import Optional
+
 import asyncpg
-from fastapi import APIRouter, Depends, Query, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from src.api.deps import get_db_pool
-from src.doctors.service import DoctorService, DoctorNotFoundError
+from src.doctors.service import DoctorNotFoundError, DoctorService
 from src.reviews.service import DoctorReviewService
 
 router = APIRouter(prefix="/doctors", tags=["Doctors Network"])
@@ -16,10 +16,10 @@ router = APIRouter(prefix="/doctors", tags=["Doctors Network"])
 
 @router.get("")
 async def search_doctors(
-    province_id: Optional[int] = Query(None, description="Province ID"),
-    city_id: Optional[int] = Query(None, description="City ID"),
-    specialty: Optional[str] = Query(None, description="Medical specialty"),
-    q: Optional[str] = Query(None, description="Search query by name or clinic"),
+    province_id: int | None = Query(None, description="Province ID"),
+    city_id: int | None = Query(None, description="City ID"),
+    specialty: str | None = Query(None, description="Medical specialty"),
+    q: str | None = Query(None, description="Search query by name or clinic"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     pool: asyncpg.Pool = Depends(get_db_pool)

@@ -11,13 +11,15 @@ Features:
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 import redis
 
-from src.core.security import hash_password, verify_password
 from src.auth.otp_service import OtpService, normalize_iranian_mobile
-from src.auth.session_service import SessionService, AccountBlockedError
+from src.auth.session_service import AccountBlockedError, SessionService
+from src.core.security import hash_password, verify_password
+
 
 class AuthError(Exception):
     pass
@@ -39,8 +41,8 @@ class AuthService:
         self,
         raw_mobile: str,
         otp_code: str,
-        ip_address: Optional[str] = None,
-        device_info: Optional[str] = None
+        ip_address: str | None = None,
+        device_info: str | None = None
     ) -> Dict[str, Any]:
         """
         Validates OTP, registers new USER or logs in existing user, and creates session.
@@ -125,8 +127,8 @@ class AuthService:
         self,
         raw_mobile: str,
         plain_password: str,
-        ip_address: Optional[str] = None,
-        device_info: Optional[str] = None
+        ip_address: str | None = None,
+        device_info: str | None = None
     ) -> Dict[str, Any]:
         """Authenticates user via mobile and Argon2id password hash."""
         mobile = normalize_iranian_mobile(raw_mobile)

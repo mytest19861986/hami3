@@ -5,8 +5,9 @@ fail-closed operational status, public directory search, and contracts.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
-from datetime import datetime, date
+from datetime import date
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -44,7 +45,7 @@ class DoctorService:
         city_id: int,
         clinic_address: str,
         clinic_phone: str,
-        custom_discount_percent: Optional[float] = None
+        custom_discount_percent: float | None = None
     ) -> Dict[str, Any]:
         """Registers a new doctor profile in PENDING status."""
         code_clean = medical_council_code.strip()
@@ -107,7 +108,7 @@ class DoctorService:
                 raise DoctorNotFoundError(f"Doctor {doctor_id} not found.")
             return dict(row)
 
-    async def get_doctor_by_user_id(self, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    async def get_doctor_by_user_id(self, user_id: uuid.UUID) -> Dict[str, Any] | None:
         """Retrieves a doctor profile by associated user ID."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -207,7 +208,7 @@ class DoctorService:
         self,
         doctor_id: uuid.UUID,
         admin_user_id: uuid.UUID,
-        reason: Optional[str] = None
+        reason: str | None = None
     ) -> Dict[str, Any]:
         """Suspends doctor profile and immediately delists from public directory."""
         async with self.pool.acquire() as conn:
@@ -242,10 +243,10 @@ class DoctorService:
 
     async def search_public_directory(
         self,
-        province_id: Optional[int] = None,
-        city_id: Optional[int] = None,
-        specialty: Optional[str] = None,
-        query: Optional[str] = None,
+        province_id: int | None = None,
+        city_id: int | None = None,
+        specialty: str | None = None,
+        query: str | None = None,
         limit: int = 20,
         offset: int = 0
     ) -> Dict[str, Any]:
@@ -351,7 +352,7 @@ class DoctorService:
             )
             return dict(row)
 
-    async def get_active_contract(self, doctor_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+    async def get_active_contract(self, doctor_id: uuid.UUID) -> Dict[str, Any] | None:
         """Returns currently active contract for a doctor if one exists."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(

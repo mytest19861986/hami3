@@ -2,13 +2,13 @@
 User Profiles API Endpoints (PROFILE-001..012)
 """
 
-import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user
+from src.api.deps import get_current_user, get_db_pool
 from src.profiles.service import ProfileService, ProfileValidationError
 
 router = APIRouter(prefix="/profile", tags=["User Profiles"])
@@ -17,16 +17,16 @@ router = APIRouter(prefix="/profile", tags=["User Profiles"])
 class ProfileUpdateSchema(BaseModel):
     first_name: str = Field(..., min_length=1, max_length=100, example="علی")
     last_name: str = Field(..., min_length=1, max_length=100, example="محمدی")
-    national_code: Optional[str] = Field(None, example="0012345678")
-    birth_date: Optional[str] = Field(None, example="1370-05-12")
-    gender: Optional[str] = Field(None, example="MALE")
-    province_id: Optional[int] = Field(None, example=1)
-    city_id: Optional[int] = Field(None, example=1)
-    address: Optional[str] = Field(None, example="خیابان ولیعصر، پلاک ۱۰")
-    postal_code: Optional[str] = Field(None, example="1234567890")
-    bank_card_number: Optional[str] = Field(None, example="6037991812345678")
-    bank_sheba_number: Optional[str] = Field(None, example="IR120120000000001234567890")
-    bank_account_holder_name: Optional[str] = Field(None, example="علی محمدی")
+    national_code: str | None = Field(None, example="0012345678")
+    birth_date: str | None = Field(None, example="1370-05-12")
+    gender: str | None = Field(None, example="MALE")
+    province_id: int | None = Field(None, example=1)
+    city_id: int | None = Field(None, example=1)
+    address: str | None = Field(None, example="خیابان ولیعصر، پلاک ۱۰")
+    postal_code: str | None = Field(None, example="1234567890")
+    bank_card_number: str | None = Field(None, example="6037991812345678")
+    bank_sheba_number: str | None = Field(None, example="IR120120000000001234567890")
+    bank_account_holder_name: str | None = Field(None, example="علی محمدی")
 
 
 @router.get("/me")

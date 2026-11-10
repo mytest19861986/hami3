@@ -2,9 +2,8 @@
 Geography & Reference API Endpoints (PROFILE-004, PROFILE-005)
 """
 
-from typing import List, Optional
 import asyncpg
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 
 from src.api.deps import get_db_pool
 from src.profiles.service import ReferenceService
@@ -21,7 +20,7 @@ async def list_provinces(pool: asyncpg.Pool = Depends(get_db_pool)):
 
 @router.get("/cities")
 async def list_cities(
-    province_id: Optional[int] = Query(None, description="Filter cities by province ID"),
+    province_id: int | None = Query(None, description="Filter cities by province ID"),
     pool: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Returns cities, optionally filtered by province ID."""

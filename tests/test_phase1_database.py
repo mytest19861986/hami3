@@ -11,10 +11,11 @@ Verifies:
 """
 
 import asyncio
+import sys
 import uuid
+
 import asyncpg
 import redis
-import sys
 
 PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 REDIS_HOST = "localhost"

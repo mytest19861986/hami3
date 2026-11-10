@@ -12,9 +12,12 @@ Guarantees:
 """
 
 import re
+from typing import Tuple
+
 import redis
-from typing import Optional, Tuple
+
 from src.core.security import generate_otp_code
+
 
 class OtpError(Exception):
     pass
@@ -130,7 +133,7 @@ class OtpService:
         self.r.delete(attempts_key)
         return True
 
-    def get_active_otp_for_test(self, raw_mobile: str) -> Optional[str]:
+    def get_active_otp_for_test(self, raw_mobile: str) -> str | None:
         """Test harness helper only: reads active OTP from Redis."""
         mobile = normalize_iranian_mobile(raw_mobile)
         return self.r.get(f"otp:code:{mobile}")

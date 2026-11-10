@@ -5,8 +5,9 @@ manages doctor visit logs, cancellation rollback, and clinical audit trail.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -42,7 +43,7 @@ class VisitService:
         service_title: str,
         total_amount_toman: int,
         discount_percent: float,
-        private_notes: Optional[str] = None
+        private_notes: str | None = None
     ) -> Dict[str, Any]:
         """
         Records a medical visit with atomic quota decrement and financial computation.

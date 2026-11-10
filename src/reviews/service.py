@@ -5,7 +5,8 @@ Enforces the single-review per visit invariant and administrative moderation.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict
+
 import asyncpg
 
 
@@ -33,7 +34,7 @@ class DoctorReviewService:
         visit_id: uuid.UUID,
         user_id: uuid.UUID,
         rating: int,
-        comment: Optional[str] = None
+        comment: str | None = None
     ) -> Dict[str, Any]:
         """Submits a patient review for a completed medical visit."""
         if not (1 <= rating <= 5):

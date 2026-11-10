@@ -12,8 +12,10 @@ Guarantees:
 """
 
 import uuid
-from typing import List, Set, Optional, Dict, Any
+from typing import Set
+
 import asyncpg
+
 
 class RbacAccessDeniedError(Exception):
     """Raised when user lacks permission or fails role verification check."""

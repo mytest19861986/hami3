@@ -3,14 +3,15 @@ Wallet & Settlement Requests API Endpoints (WALLET-001..010, SETTLE-001..017, AC
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user
-from src.wallets.service import WalletService, InsufficientFundsError, WalletFrozenError
+from src.api.deps import get_current_user, get_db_pool
 from src.common.validators import validate_iranian_card_number, validate_iranian_shaba
+from src.wallets.service import InsufficientFundsError, WalletFrozenError, WalletService
 
 router = APIRouter(prefix="/wallet", tags=["Wallet & Settlements"])
 

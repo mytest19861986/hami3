@@ -5,8 +5,9 @@ automatic membership activation upon success, and referral commission distributi
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+from typing import Any, Dict
+
 import asyncpg
 
 from src.wallets.service import WalletService
@@ -44,8 +45,8 @@ class PaymentService:
         plan_id: uuid.UUID,
         idempotency_key: str,
         payment_method: str = "GATEWAY",
-        sales_case_id: Optional[uuid.UUID] = None,
-        gateway_name: Optional[str] = "ZARINPAL"
+        sales_case_id: uuid.UUID | None = None,
+        gateway_name: str | None = "ZARINPAL"
     ) -> Dict[str, Any]:
         """Creates a pending order for a discount plan with strict idempotency."""
         async with self.pool.acquire() as conn:
@@ -90,8 +91,8 @@ class PaymentService:
         order_id: uuid.UUID,
         gateway_transaction_id: str,
         gateway_tracking_code: str,
-        verified_by: Optional[uuid.UUID] = None,
-        referral_code: Optional[str] = None
+        verified_by: uuid.UUID | None = None,
+        referral_code: str | None = None
     ) -> Dict[str, Any]:
         """
         Verifies payment success, activates card holder membership,

@@ -10,9 +10,9 @@ Standards:
 
 import hashlib
 import secrets
-from typing import Optional
+
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 # Argon2id password hasher with OWASP parameters
 ph = PasswordHasher(

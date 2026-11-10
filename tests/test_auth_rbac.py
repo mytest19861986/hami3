@@ -14,22 +14,26 @@ Verifies:
 """
 
 import asyncio
-import uuid
-import sys
 import os
-import redis
+import sys
+import uuid
+
 import asyncpg
+import redis
 
 # Add root directory to python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.auth.otp_service import (
-    OtpService, OtpRateLimitError, OtpMaxAttemptsExceededError,
-    OtpExpiredOrInvalidError, SmsDeliveryError
+    OtpExpiredOrInvalidError,
+    OtpMaxAttemptsExceededError,
+    OtpRateLimitError,
+    OtpService,
+    SmsDeliveryError,
 )
+from src.auth.rbac import ProfileNotApprovedError, RbacAccessDeniedError, RbacEngine
 from src.auth.service import AuthService, InvalidCredentialsError
 from src.auth.session_service import AccountBlockedError
-from src.auth.rbac import RbacEngine, RbacAccessDeniedError, ProfileNotApprovedError
 
 PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 REDIS_HOST = "localhost"

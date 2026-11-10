@@ -4,12 +4,13 @@ Manages user alerts, status updates, unread badges, and read confirmations.
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from src.api.deps import get_db_pool, get_current_user
-from src.notifications.service import NotificationService, NotificationError
+from src.api.deps import get_current_user, get_db_pool
+from src.notifications.service import NotificationService
 
 router = APIRouter(prefix="/notifications", tags=["In-App Notifications"])
 

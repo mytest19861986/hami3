@@ -6,18 +6,14 @@ Enforces the dual state machine for agent sales:
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user, require_permission
-from src.sales.service import (
-    SalesCaseService,
-    InvalidStateTransitionError,
-    AgentNotApprovedError,
-    SalesCaseError
-)
+from src.api.deps import get_current_user, get_db_pool, require_permission
+from src.sales.service import AgentNotApprovedError, InvalidStateTransitionError, SalesCaseError, SalesCaseService
 
 router = APIRouter(prefix="/sales", tags=["Sales Cases & Logistics"])
 
@@ -26,12 +22,12 @@ class CreateSalesCaseSchema(BaseModel):
     agent_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     holder_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     plan_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
-    notes: Optional[str] = Field(None, example="پرونده ثبت شده توسط نمایندگی تهران")
+    notes: str | None = Field(None, example="پرونده ثبت شده توسط نمایندگی تهران")
 
 
 class UpdateLogisticStatusSchema(BaseModel):
     status: str = Field(..., example="SHIPPED")
-    shipping_tracking_code: Optional[str] = Field(None, example="123456789012345678901234")
+    shipping_tracking_code: str | None = Field(None, example="123456789012345678901234")
 
 
 @router.post("/cases")

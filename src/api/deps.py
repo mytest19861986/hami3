@@ -5,15 +5,14 @@ authentication context, and RBAC security enforcement.
 """
 
 import os
-import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 import redis
-from fastapi import Header, HTTPException, status, Depends
+from fastapi import Depends, Header, HTTPException, status
 
-from src.auth.service import AuthService
-from src.auth.session_service import SessionService
 from src.auth.rbac import RbacEngine
+from src.auth.session_service import SessionService
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -22,8 +21,8 @@ DATABASE_URL = os.getenv(
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Global state holders for app lifespan
-_pool: Optional[asyncpg.Pool] = None
-_redis: Optional[redis.Redis] = None
+_pool: asyncpg.Pool | None = None
+_redis: redis.Redis | None = None
 
 
 async def init_pool() -> asyncpg.Pool:
@@ -67,7 +66,7 @@ def get_redis() -> redis.Redis:
 
 
 async def get_current_user(
-    authorization: Optional[str] = Header(None),
+    authorization: str | None = Header(None),
     pool: asyncpg.Pool = Depends(get_db_pool),
     r: redis.Redis = Depends(get_redis)
 ) -> Dict[str, Any]:

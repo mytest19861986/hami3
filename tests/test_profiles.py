@@ -1,10 +1,10 @@
 """Integration and unit tests for ProfileService & ReferenceService (Phase 3)."""
 import asyncio
 import uuid
-import pytest
-import asyncpg
-from src.profiles.service import ProfileService, ReferenceService, ProfileValidationError
 
+import asyncpg
+
+from src.profiles.service import ProfileService, ProfileValidationError, ReferenceService
 
 DB_URL = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 

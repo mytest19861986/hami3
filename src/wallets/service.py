@@ -5,7 +5,8 @@ idempotent commission credits, and settlement locking/settling cycles.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -68,7 +69,7 @@ class WalletService:
         reference_id: str,
         idempotency_key: str,
         description: str,
-        created_by: Optional[uuid.UUID] = None
+        created_by: uuid.UUID | None = None
     ) -> Dict[str, Any]:
         """
         Atomically credits commission to wallet and records immutable ledger entry.

@@ -11,11 +11,13 @@ Guarantees:
 """
 
 import uuid
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, Tuple
+from datetime import UTC, datetime, timedelta
+from typing import Any, Dict
+
 import asyncpg
 
-from src.core.security import hash_token, generate_secure_token
+from src.core.security import generate_secure_token, hash_token
+
 
 class SessionError(Exception):
     pass
@@ -40,15 +42,15 @@ class SessionService:
     async def create_session(
         self,
         user_id: uuid.UUID,
-        device_info: Optional[str] = None,
-        ip_address: Optional[str] = None,
+        device_info: str | None = None,
+        ip_address: str | None = None,
         refresh_ttl_days: int = 7
     ) -> Dict[str, Any]:
         """Creates a brand new session and token family."""
         raw_refresh_token = generate_secure_token(32)
         token_digest = hash_token(raw_refresh_token)
         family_id = uuid.uuid4()
-        expires_at = datetime.now(timezone.utc) + timedelta(days=refresh_ttl_days)
+        expires_at = datetime.now(UTC) + timedelta(days=refresh_ttl_days)
 
         async with self.pool.acquire() as conn:
             # Check user status
@@ -73,8 +75,8 @@ class SessionService:
     async def rotate_refresh_token(
         self,
         raw_refresh_token: str,
-        ip_address: Optional[str] = None,
-        device_info: Optional[str] = None,
+        ip_address: str | None = None,
+        device_info: str | None = None,
         grace_period_seconds: int = 5
     ) -> Dict[str, Any]:
         """
@@ -102,7 +104,7 @@ class SessionService:
                     user_id = token_row["user_id"]
                     family_id = token_row["family_id"]
                     status = token_row["status"]
-                    now = datetime.now(timezone.utc)
+                    now = datetime.now(UTC)
 
                     # Check user account status
                     user_status = await conn.fetchval("SELECT status FROM users WHERE id = $1;", user_id)
@@ -199,13 +201,13 @@ class SessionService:
 
         return result_payload
 
-    async def verify_active_session(self, raw_token: str) -> Optional[Dict[str, Any]]:
+    async def verify_active_session(self, raw_token: str) -> Dict[str, Any] | None:
         """
         Verifies that the provided raw session/refresh token corresponds to an ACTIVE,
         non-expired session in PostgreSQL (SSOT).
         """
         token_digest = hash_token(raw_token)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT id, user_id, family_id, status, expires_at

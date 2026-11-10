@@ -5,18 +5,14 @@ Supports administrative moderation and aggregate ratings calculation.
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user, require_permission
-from src.reviews.service import (
-    DoctorReviewService,
-    DuplicateReviewError,
-    InvalidRatingError,
-    ReviewError
-)
+from src.api.deps import get_current_user, get_db_pool, require_permission
+from src.reviews.service import DoctorReviewService, DuplicateReviewError, InvalidRatingError, ReviewError
 
 router = APIRouter(prefix="/reviews", tags=["Doctor Reviews & Ratings"])
 
@@ -24,7 +20,7 @@ router = APIRouter(prefix="/reviews", tags=["Doctor Reviews & Ratings"])
 class SubmitReviewSchema(BaseModel):
     visit_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     rating: int = Field(..., ge=1, le=5, example=5)
-    comment: Optional[str] = Field(None, max_length=1000, example="دکتر بسیار خوش برخورد و حرفه‌ای بودند.")
+    comment: str | None = Field(None, max_length=1000, example="دکتر بسیار خوش برخورد و حرفه‌ای بودند.")
 
 
 class ModerateReviewSchema(BaseModel):

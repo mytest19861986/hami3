@@ -5,7 +5,8 @@ validity durations, visit quotas, and agent/referrer commission rates.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -29,11 +30,11 @@ class DiscountPlanService:
         price_toman: int,
         discount_percent: float,
         validity_days: int,
-        max_visits: Optional[int] = None,
+        max_visits: int | None = None,
         agent_commission_percent: float = 0.0,
         referrer_commission_percent: float = 0.0,
-        description: Optional[str] = None,
-        created_by: Optional[uuid.UUID] = None,
+        description: str | None = None,
+        created_by: uuid.UUID | None = None,
         is_active: bool = True
     ) -> Dict[str, Any]:
         """Creates a new discount plan with strict domain parameter validation."""

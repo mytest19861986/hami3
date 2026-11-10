@@ -11,11 +11,10 @@ Tests:
 import asyncio
 import os
 import uuid
+
 import asyncpg
 
-from src.sales.service import (
-    SalesCaseService, SalesCaseError, InvalidStateTransitionError, AgentNotApprovedError
-)
+from src.sales.service import AgentNotApprovedError, InvalidStateTransitionError, SalesCaseService
 from src.wallets.service import WalletService
 
 PG_URI = os.getenv(

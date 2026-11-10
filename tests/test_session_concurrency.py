@@ -11,18 +11,16 @@ Verifies:
 """
 
 import asyncio
-import uuid
-import sys
 import os
+import sys
+import uuid
+
 import asyncpg
 
 # Add root directory to python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.auth.session_service import (
-    SessionService, SecurityReplayAttackError, SessionExpiredError,
-    SessionNotFoundError, AccountBlockedError
-)
+from src.auth.session_service import AccountBlockedError, SecurityReplayAttackError, SessionService
 
 PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 

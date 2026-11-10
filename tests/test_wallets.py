@@ -15,11 +15,10 @@ Tests:
 import asyncio
 import os
 import uuid
+
 import asyncpg
 
-from src.wallets.service import (
-    WalletService, WalletError, InsufficientFundsError, DuplicateFinancialTransactionError
-)
+from src.wallets.service import InsufficientFundsError, WalletService
 
 PG_URI = os.getenv(
     "DATABASE_URL",

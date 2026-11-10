@@ -4,9 +4,10 @@ Generates unique user referral codes, tracks multi-tier user invitations,
 and computes marketer statistics and affiliate conversion rates.
 """
 
-import uuid
 import secrets
-from typing import Dict, Any, List, Optional
+import uuid
+from typing import Any, Dict
+
 import asyncpg
 
 
@@ -101,7 +102,7 @@ class ReferralService:
         self,
         referrer_user_id: uuid.UUID,
         referred_user_id: uuid.UUID,
-        custom_code: Optional[str] = None
+        custom_code: str | None = None
     ) -> Dict[str, Any]:
         """Creates a referral link between two users directly."""
         if referrer_user_id == referred_user_id:

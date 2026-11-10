@@ -5,7 +5,8 @@ and in-app messaging with unread badges and timestamps.
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -23,7 +24,7 @@ class NotificationService:
         user_id: uuid.UUID,
         title: str,
         message: str,
-        link_url: Optional[str] = None
+        link_url: str | None = None
     ) -> Dict[str, Any]:
         """Creates a new in-app notification for a user."""
         title_clean = title.strip()

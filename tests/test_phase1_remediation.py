@@ -13,17 +13,17 @@ Validates:
 """
 
 import asyncio
-import uuid
-import sys
 import os
+import sys
+import uuid
 
 # Add root directory to python path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import asyncpg
-import pytest
-from src.common.pii import mask_national_code, mask_phone, mask_card_number, mask_shaba
-from src.core.settings import load_and_validate_settings, SystemConfigurationError
+
+from src.common.pii import mask_card_number, mask_national_code, mask_phone, mask_shaba
+from src.core.settings import SystemConfigurationError, load_and_validate_settings
 
 PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 

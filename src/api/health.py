@@ -4,6 +4,7 @@ Provides real-time liveness, readiness, and subsystem metrics for Prometheus/Kub
 """
 
 import time
+
 import asyncpg
 import redis
 from fastapi import APIRouter, Depends
@@ -22,7 +23,7 @@ async def healthcheck(
     # 1. PostgreSQL benchmark
     db_start = time.perf_counter()
     async with pool.acquire() as conn:
-        db_ver = await conn.fetchval("SELECT version()")
+        await conn.fetchval("SELECT version()")
     db_latency_ms = round((time.perf_counter() - db_start) * 1000, 2)
 
     # 2. Redis benchmark

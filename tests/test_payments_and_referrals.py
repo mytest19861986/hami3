@@ -12,14 +12,11 @@ Tests:
 import asyncio
 import os
 import uuid
+
 import asyncpg
 
-from src.payments.service import (
-    PaymentService, PaymentError, OrderNotFoundError, InvalidPaymentStateError
-)
-from src.referrals.service import (
-    ReferralService, ReferralError, SelfReferralNotAllowedError
-)
+from src.payments.service import PaymentService
+from src.referrals.service import ReferralService, SelfReferralNotAllowedError
 from src.wallets.service import WalletService
 
 PG_URI = os.getenv(

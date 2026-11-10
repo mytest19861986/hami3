@@ -13,11 +13,13 @@ Tests:
 import asyncio
 import os
 import uuid
-from datetime import datetime, timezone, timedelta
+
 import asyncpg
 
 from src.visits.service import (
-    VisitService, VisitError, QuotaExhaustedError, MembershipInactiveError, VisitCancellationError
+    MembershipInactiveError,
+    QuotaExhaustedError,
+    VisitService,
 )
 
 PG_URI = os.getenv(

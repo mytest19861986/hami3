@@ -13,11 +13,10 @@ Tests:
 import asyncio
 import os
 import uuid
+
 import asyncpg
 
-from src.content.service import (
-    ContentService, ContentError, PageNotFoundError, InvalidSlugError
-)
+from src.content.service import ContentService, InvalidSlugError, PageNotFoundError
 
 PG_URI = os.getenv(
     "DATABASE_URL",

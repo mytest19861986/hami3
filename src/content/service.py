@@ -4,9 +4,10 @@ Manages static and informational pages (Terms, Privacy, About Us, FAQ, Contact)
 with markdown/HTML content, publishing controls, and administrative auditing.
 """
 
-import uuid
 import re
-from typing import Dict, Any, List, Optional
+import uuid
+from typing import Any, Dict, List
+
 import asyncpg
 
 
@@ -100,7 +101,7 @@ class ContentService:
         title: str,
         body_html: str,
         is_published: bool = True,
-        updated_by: Optional[uuid.UUID] = None
+        updated_by: uuid.UUID | None = None
     ) -> Dict[str, Any]:
         """Creates or updates a content page by slug, with administrative audit logging."""
         valid_slug = self.validate_slug(slug)
@@ -215,7 +216,7 @@ class ContentService:
                     return True
                 return False
 
-    async def seed_default_pages(self, admin_id: Optional[uuid.UUID] = None) -> int:
+    async def seed_default_pages(self, admin_id: uuid.UUID | None = None) -> int:
         """Seeds default terms, privacy, about-us, faq, and contact pages."""
         seeded = 0
         for p in DEFAULT_PAGES:

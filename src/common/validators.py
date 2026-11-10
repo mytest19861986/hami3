@@ -1,9 +1,8 @@
 """Common Iranian validation routines: National Code, Bank Card (Luhn), and IBAN/Sheba (ISO 7064)."""
 import re
-from typing import Optional
 
 
-def validate_iranian_national_code(code: Optional[str]) -> bool:
+def validate_iranian_national_code(code: str | None) -> bool:
     """
     Validates an Iranian National Code (کد ملی).
     Requirements:
@@ -35,7 +34,7 @@ def validate_iranian_national_code(code: Optional[str]) -> bool:
         return check_digit == (11 - remainder)
 
 
-def validate_iranian_card_number(card: Optional[str]) -> bool:
+def validate_iranian_card_number(card: str | None) -> bool:
     """
     Validates an Iranian 16-digit debit/credit card number using the Luhn algorithm (Mod 10).
     """
@@ -59,7 +58,7 @@ def validate_iranian_card_number(card: Optional[str]) -> bool:
     return total % 10 == 0
 
 
-def validate_iranian_shaba(shaba: Optional[str]) -> bool:
+def validate_iranian_shaba(shaba: str | None) -> bool:
     """
     Validates an Iranian IBAN/Sheba (شماره شبا).
     Format: 'IR' + 24 numeric digits = 26 characters total.
@@ -89,7 +88,7 @@ def validate_iranian_shaba(shaba: Optional[str]) -> bool:
     return int(numeric_string) % 97 == 1
 
 
-def validate_iranian_mobile(mobile: Optional[str]) -> bool:
+def validate_iranian_mobile(mobile: str | None) -> bool:
     """
     Validates standard Iranian mobile number format: 09XXXXXXXXX (11 digits).
     """

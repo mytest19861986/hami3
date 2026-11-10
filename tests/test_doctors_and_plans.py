@@ -13,18 +13,17 @@ Tests:
 
 import asyncio
 import os
-import sys
 import uuid
 from datetime import date, timedelta
+
 import asyncpg
 
 from src.doctors.service import (
-    DoctorService, DoctorError, DoctorNotFoundError,
-    DuplicateMedicalCouncilCodeError, DoctorVerificationError
+    DoctorService,
+    DoctorVerificationError,
+    DuplicateMedicalCouncilCodeError,
 )
-from src.plans.service import (
-    DiscountPlanService, PlanError, PlanNotFoundError
-)
+from src.plans.service import DiscountPlanService, PlanError
 
 PG_URI = os.getenv(
     "DATABASE_URL",

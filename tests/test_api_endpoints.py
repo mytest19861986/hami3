@@ -11,10 +11,11 @@ Tests:
 
 import asyncio
 import uuid
+
 import httpx
 
+from src.api.deps import close_pool, close_redis, init_pool, init_redis
 from src.api.main import app
-from src.api.deps import init_pool, close_pool, init_redis, close_redis
 
 
 async def test_api_suite():
@@ -44,7 +45,7 @@ async def test_api_suite():
         assert r_prov.status_code == 200
         provinces = r_prov.json()
         assert len(provinces) == 31
-        print(f"  ✓ Provinces PASS: 31 provinces returned.")
+        print("  ✓ Provinces PASS: 31 provinces returned.")
 
         r_city = await client.get("/api/v1/reference/cities?province_id=1")
         assert r_city.status_code == 200
@@ -76,7 +77,7 @@ async def test_api_suite():
         terms = r_cms.json()
         assert terms["slug"] == "terms"
         assert "قوانین" in terms["title"]
-        print(f"  ✓ CMS Content PASS: 'terms' page retrieved successfully.")
+        print("  ✓ CMS Content PASS: 'terms' page retrieved successfully.")
 
         # 6. Auth OTP Request & Verify
         print("\n[HTTP TEST 6/10] Testing POST /api/v1/auth/otp/request & verify...")
@@ -100,7 +101,7 @@ async def test_api_suite():
         assert "session" in verify_data
         session_token = verify_data["session"]["refresh_token"]
         auth_headers = {"Authorization": f"Bearer {session_token}"}
-        print(f"  ✓ OTP Verify PASS: session_token issued.")
+        print("  ✓ OTP Verify PASS: session_token issued.")
 
         # 7. Authenticated Profile Me
         print("\n[HTTP TEST 7/10] Testing GET /api/v1/profile/me...")
@@ -146,7 +147,7 @@ async def test_api_suite():
         assert r_manifest.status_code == 200
         man_data = r_manifest.json()
         assert man_data["short_name"] == "حامی‌کارت"
-        print(f"  ✓ Web Portal & PWA Manifest PASS: served successfully.")
+        print("  ✓ Web Portal & PWA Manifest PASS: served successfully.")
 
     await close_pool()
     close_redis()

@@ -5,18 +5,14 @@ and affiliate referral commission distribution.
 """
 
 import uuid
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user
-from src.payments.service import (
-    PaymentService,
-    OrderNotFoundError,
-    InvalidPaymentStateError,
-    PaymentError
-)
+from src.api.deps import get_current_user, get_db_pool
+from src.payments.service import InvalidPaymentStateError, OrderNotFoundError, PaymentError, PaymentService
 
 router = APIRouter(prefix="/payments", tags=["Payments & Orders"])
 
@@ -26,14 +22,14 @@ class CreateOrderSchema(BaseModel):
     plan_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     idempotency_key: str = Field(..., min_length=5, max_length=100, example="ORD-IDEM-001")
     payment_method: str = Field("GATEWAY", example="GATEWAY")
-    sales_case_id: Optional[uuid.UUID] = Field(None, example=None)
-    gateway_name: Optional[str] = Field("ZARINPAL", example="ZARINPAL")
+    sales_case_id: uuid.UUID | None = Field(None, example=None)
+    gateway_name: str | None = Field("ZARINPAL", example="ZARINPAL")
 
 
 class VerifyPaymentSchema(BaseModel):
     gateway_transaction_id: str = Field(..., example="TX-998877")
     gateway_tracking_code: str = Field(..., example="TRK-112233")
-    referral_code: Optional[str] = Field(None, example="HAMI-ABC123")
+    referral_code: str | None = Field(None, example="HAMI-ABC123")
 
 
 @router.post("/orders")

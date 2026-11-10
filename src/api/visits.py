@@ -5,18 +5,19 @@ and supports visit cancellation with automatic quota restoration.
 """
 
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict
+
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_current_user, require_permission
+from src.api.deps import get_current_user, get_db_pool, require_permission
 from src.visits.service import (
-    VisitService,
-    QuotaExhaustedError,
     MembershipInactiveError,
+    QuotaExhaustedError,
     VisitCancellationError,
-    VisitError
+    VisitError,
+    VisitService,
 )
 
 router = APIRouter(prefix="/visits", tags=["Visits & Quota Consumption"])
@@ -29,7 +30,7 @@ class RecordVisitSchema(BaseModel):
     service_title: str = Field(..., min_length=2, max_length=255, example="ویزیت تخصصی قلب و عروق")
     total_amount_toman: int = Field(..., ge=0, example=450000)
     discount_percent: float = Field(..., ge=0, le=100, example=30.0)
-    private_notes: Optional[str] = Field(None, example="معاینه و نوار قلب انجام شد")
+    private_notes: str | None = Field(None, example="معاینه و نوار قلب انجام شد")
 
 
 class CancelVisitSchema(BaseModel):

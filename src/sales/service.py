@@ -7,8 +7,9 @@ Integrates with wallet service for automated commission payout upon finalization
 """
 
 import uuid
-from typing import Dict, Any, List, Optional
 from datetime import datetime
+from typing import Any, Dict
+
 import asyncpg
 
 from src.wallets.service import WalletService
@@ -39,7 +40,7 @@ class SalesCaseService:
         agent_id: uuid.UUID,
         holder_id: uuid.UUID,
         plan_id: uuid.UUID,
-        notes: Optional[str] = None
+        notes: str | None = None
     ) -> Dict[str, Any]:
         """Creates a new sales case initiated by an approved sales agent."""
         async with self.pool.acquire() as conn:
@@ -78,7 +79,7 @@ class SalesCaseService:
         case_id: uuid.UUID,
         new_status: str,
         actor_user_id: uuid.UUID,
-        shipping_tracking_code: Optional[str] = None
+        shipping_tracking_code: str | None = None
     ) -> Dict[str, Any]:
         """
         Transitions logistic state with strict invariant validation:

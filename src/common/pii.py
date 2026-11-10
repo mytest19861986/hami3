@@ -10,9 +10,9 @@ Guarantees:
 """
 
 import re
-from typing import Optional
 
-def mask_national_code(code: Optional[str]) -> Optional[str]:
+
+def mask_national_code(code: str | None) -> str | None:
     """Masks 10-digit national code, revealing only last 4 digits."""
     if not code:
         return code
@@ -21,7 +21,7 @@ def mask_national_code(code: Optional[str]) -> Optional[str]:
         return "******" + clean[-4:] if len(clean) >= 4 else "******"
     return "******" + clean[-4:]
 
-def mask_phone(phone: Optional[str]) -> Optional[str]:
+def mask_phone(phone: str | None) -> str | None:
     """Masks Iranian mobile phone, revealing prefix (4 chars) and suffix (4 chars)."""
     if not phone:
         return phone
@@ -34,7 +34,7 @@ def mask_phone(phone: Optional[str]) -> Optional[str]:
         return f"{clean[:3]}***{clean[-4:]}"
     return "****"
 
-def mask_card_number(card: Optional[str]) -> Optional[str]:
+def mask_card_number(card: str | None) -> str | None:
     """Masks 16-digit debit/credit card, revealing first 4 and last 4 digits."""
     if not card:
         return card
@@ -43,7 +43,7 @@ def mask_card_number(card: Optional[str]) -> Optional[str]:
         return f"{clean[:4]}********{clean[-4:]}"
     return "************"
 
-def mask_shaba(shaba: Optional[str]) -> Optional[str]:
+def mask_shaba(shaba: str | None) -> str | None:
     """Masks Iranian Sheba / IBAN (IR + 24 digits), revealing only country code and last 2 digits."""
     if not shaba:
         return shaba

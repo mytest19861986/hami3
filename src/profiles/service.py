@@ -2,19 +2,21 @@
 Enforces Iranian National Code, Card (Luhn), and Sheba (ISO 7064) validations,
 province-city parent-child hierarchy, and role-based PII masking.
 """
-from typing import Optional, Dict, Any, List
 import uuid
+from typing import Any, Dict, List
+
 import asyncpg
-from src.common.validators import (
-    validate_iranian_national_code,
-    validate_iranian_card_number,
-    validate_iranian_shaba,
-)
+
 from src.common.pii import (
-    mask_national_code,
     mask_card_number,
-    mask_shaba,
+    mask_national_code,
     mask_phone,
+    mask_shaba,
+)
+from src.common.validators import (
+    validate_iranian_card_number,
+    validate_iranian_national_code,
+    validate_iranian_shaba,
 )
 
 
@@ -42,7 +44,7 @@ class ReferenceService:
             )
             return [dict(r) for r in rows]
 
-    async def validate_province_and_city(self, province_id: Optional[int], city_id: Optional[int]) -> bool:
+    async def validate_province_and_city(self, province_id: int | None, city_id: int | None) -> bool:
         """Validates that city belongs to province."""
         if province_id is None and city_id is None:
             return True
@@ -75,7 +77,7 @@ class ProfileService:
         self.pool = pool
         self.ref_service = ReferenceService(pool)
 
-    async def get_profile(self, user_id: uuid.UUID, viewer_roles: List[str]) -> Optional[Dict[str, Any]]:
+    async def get_profile(self, user_id: uuid.UUID, viewer_roles: List[str]) -> Dict[str, Any] | None:
         """
         Retrieves user profile. Masks sensitive financial and PII fields
         unless viewer has administrative privileges (SUPER_ADMIN or ADMIN).
@@ -118,17 +120,17 @@ class ProfileService:
         user_id: uuid.UUID,
         first_name: str,
         last_name: str,
-        national_code: Optional[str] = None,
-        birth_date: Optional[str] = None,
-        gender: Optional[str] = None,
-        province_id: Optional[int] = None,
-        city_id: Optional[int] = None,
-        address: Optional[str] = None,
-        postal_code: Optional[str] = None,
-        avatar_url: Optional[str] = None,
-        bank_card_number: Optional[str] = None,
-        bank_sheba_number: Optional[str] = None,
-        bank_account_holder_name: Optional[str] = None,
+        national_code: str | None = None,
+        birth_date: str | None = None,
+        gender: str | None = None,
+        province_id: int | None = None,
+        city_id: int | None = None,
+        address: str | None = None,
+        postal_code: str | None = None,
+        avatar_url: str | None = None,
+        bank_card_number: str | None = None,
+        bank_sheba_number: str | None = None,
+        bank_account_holder_name: str | None = None,
     ) -> Dict[str, Any]:
         """
         Creates or updates a user profile enforcing all PRD domain invariants.

@@ -12,14 +12,11 @@ Tests:
 import asyncio
 import os
 import uuid
+
 import asyncpg
 
-from src.reviews.service import (
-    DoctorReviewService, ReviewError, DuplicateReviewError, InvalidRatingError
-)
-from src.notifications.service import (
-    NotificationService, NotificationError
-)
+from src.notifications.service import NotificationService
+from src.reviews.service import DoctorReviewService, DuplicateReviewError, InvalidRatingError
 
 PG_URI = os.getenv(
     "DATABASE_URL",

@@ -2,16 +2,22 @@
 Authentication & Authorization API Endpoints (AUTH-001..017, RBAC-001..009)
 """
 
-from typing import Dict, Any, Optional
+from typing import Any, Dict
+
 import asyncpg
 import redis
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool, get_redis, get_current_user
+from src.api.deps import get_current_user, get_db_pool, get_redis
+from src.auth.otp_service import (
+    OtpExpiredOrInvalidError,
+    OtpMaxAttemptsExceededError,
+    OtpRateLimitError,
+    normalize_iranian_mobile,
+)
 from src.auth.service import AuthService
-from src.auth.otp_service import OtpRateLimitError, OtpExpiredOrInvalidError, OtpMaxAttemptsExceededError, normalize_iranian_mobile
-from src.auth.session_service import SessionService, SecurityReplayAttackError, AccountBlockedError
+from src.auth.session_service import AccountBlockedError, SecurityReplayAttackError, SessionService
 from src.common.validators import validate_iranian_mobile
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -110,7 +116,7 @@ async def login_password(
         return res
     except AccountBlockedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid mobile or password.")
 
 
@@ -135,7 +141,7 @@ async def refresh_session(
             "refresh_token": new_token,
             "token_type": "bearer"
         }
-    except SecurityReplayAttackError as e:
+    except SecurityReplayAttackError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Security violation: Replay attack detected. Session terminated."

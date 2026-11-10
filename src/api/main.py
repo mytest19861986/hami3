@@ -5,25 +5,26 @@ Baseline: BL-HAMICARD-PRD-V1
 
 import os
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from src.api.deps import init_pool, close_pool, init_redis, close_redis
-from src.api.health import router as health_router
 from src.api.auth import router as auth_router
-from src.api.reference import router as reference_router
-from src.api.doctors import router as doctors_router
-from src.api.plans import router as plans_router
 from src.api.content import router as content_router
-from src.api.profiles import router as profiles_router
-from src.api.wallets import router as wallets_router
-from src.api.visits import router as visits_router
-from src.api.sales import router as sales_router
-from src.api.payments import router as payments_router
-from src.api.reviews import router as reviews_router
+from src.api.deps import close_pool, close_redis, init_pool, init_redis
+from src.api.doctors import router as doctors_router
+from src.api.health import router as health_router
 from src.api.notifications import router as notifications_router
+from src.api.payments import router as payments_router
+from src.api.plans import router as plans_router
+from src.api.profiles import router as profiles_router
+from src.api.reference import router as reference_router
+from src.api.reviews import router as reviews_router
+from src.api.sales import router as sales_router
+from src.api.visits import router as visits_router
+from src.api.wallets import router as wallets_router
 from src.core.settings import load_and_validate_settings
 
 
