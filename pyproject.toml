@@ -1,0 +1,42 @@
+[project]
+name = "hamicard"
+version = "1.0.0"
+description = "سامانه خدمات رفاهی و درمانی حامی‌کارت"
+readme = "README.md"
+requires-python = ">=3.13"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+exclude = [
+    "scripts",
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "C4",  # flake8-comprehensions
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "B008",  # Do not perform function call `Depends` in argument defaults (standard FastAPI pattern)
+    "B904",  # Within an `except` clause, raise exceptions with `from err`
+    "UP006", # Keep Dict/List for older typing compatibility where desired
+    "UP035", # Deprecated typing imports
+    "E501",  # Line too long (Persian text and SQL queries)
+    "W291",  # Trailing whitespace in multi-line SQL templates
+    "W293",  # Blank line contains whitespace
+    "F841",  # Unused local variable in test assertions
+    "C414",  # Unnecessary list() call within sorted()
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -8,11 +8,9 @@ Retention rules:
 - Compressed gzip streams
 """
 
-import os
-import sys
-import time
-import subprocess
 import glob
+import os
+import subprocess
 from datetime import datetime
 
 BACKUP_DIR = os.getenv("BACKUP_DIR", "ops/backups")
