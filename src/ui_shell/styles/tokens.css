@@ -1,0 +1,67 @@
+/* ==========================================================================
+   HamiCard Design System Tokens (Phase 3 Isolated UI Shell - HC-T16)
+   POLICY NOTICE: Color palette and typography below correspond to OPEN-15
+   and are explicitly flagged as PROPOSED PENDING OWNER SIGN-OFF.
+   Baseline: BL-HAMICARD-PRD-V1 | Section 21 (UX-001..019) & Section 28
+   ========================================================================== */
+
+:root {
+  /* Proposed Brand Colors (OPEN-15: Pending Owner Sign-off) */
+  --hc-brand-primary: #0d9488;
+  --hc-brand-primary-strong: #0f766e; /* WCAG AA text >= 5.4:1 on white */
+  --hc-brand-secondary: #059669;
+  --hc-brand-surface: #f0fdfa;
+  --hc-brand-border: #99f6e4;
+
+  /* Neutral Surface & Text Hierarchy (WCAG AA/AAA) */
+  --hc-surface-bg: #f8fafc;
+  --hc-surface-card: #ffffff;
+  --hc-surface-muted: #f1f5f9;
+  --hc-border-subtle: #cbd5e1;
+  --hc-border-strong: #94a3b8;
+
+  --hc-text-primary: #0f172a;
+  --hc-text-secondary: #475569;
+  --hc-text-muted: #64748b;
+  --hc-text-inverse: #ffffff;
+
+  /* Semantic Status Tokens */
+  --hc-status-info-bg: #eff6ff;
+  --hc-status-info-border: #bfdbfe;
+  --hc-status-info-fg: #1e40af;
+
+  --hc-status-warn-bg: #fffbeb;
+  --hc-status-warn-border: #fde68a;
+  --hc-status-warn-fg: #92400e;
+
+  --hc-status-err-bg: #fef2f2;
+  --hc-status-err-border: #fecaca;
+  --hc-status-err-fg: #991b1b;
+
+  --hc-status-ok-bg: #ecfdf5;
+  --hc-status-ok-border: #a7f3d0;
+  --hc-status-ok-fg: #065f46;
+
+  /* Proposed Typography Stack (OPEN-15) */
+  --hc-font-sans: 'Vazirmatn', 'IRANSansX', 'Tahoma', system-ui, -apple-system, sans-serif;
+
+  /* Spacing & Layout Scale */
+  --hc-space-1: 0.25rem;
+  --hc-space-2: 0.5rem;
+  --hc-space-3: 0.75rem;
+  --hc-space-4: 1rem;
+  --hc-space-5: 1.25rem;
+  --hc-space-6: 1.5rem;
+  --hc-space-8: 2rem;
+
+  /* Radii & Shadows */
+  --hc-radius-sm: 0.5rem;
+  --hc-radius-md: 0.75rem;
+  --hc-radius-lg: 1rem;
+  --hc-radius-pill: 9999px;
+  --hc-shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.08);
+  --hc-shadow-md: 0 8px 24px -6px rgba(15, 23, 42, 0.12);
+
+  /* Focus Ring */
+  --hc-focus-ring: 0 0 0 3px rgba(15, 118, 110, 0.35);
+}
