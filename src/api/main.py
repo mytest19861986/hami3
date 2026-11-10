@@ -24,13 +24,17 @@ from src.api.sales import router as sales_router
 from src.api.payments import router as payments_router
 from src.api.reviews import router as reviews_router
 from src.api.notifications import router as notifications_router
+from src.core.settings import load_and_validate_settings
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize DB connection pool and Redis
-    await init_pool()
+    pool = await init_pool()
     init_redis()
+    # Enforce Fail-Closed Startup Invariant (OPEN-01..18)
+    async with pool.acquire() as conn:
+        app.state.settings = await load_and_validate_settings(conn)
     yield
     # Shutdown: Cleanly close pools
     await close_pool()
