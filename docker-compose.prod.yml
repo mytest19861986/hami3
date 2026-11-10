@@ -74,3 +74,4 @@ volumes:
     name: hamicard_postgres_prod_data
   redis_prod_data:
     name: hamicard_redis_prod_data
+
