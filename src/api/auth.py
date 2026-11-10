@@ -76,8 +76,8 @@ async def verify_otp(
 
     try:
         res = await auth_svc.authenticate_via_otp(
-            mobile=clean_mobile,
-            code=payload.code,
+            raw_mobile=clean_mobile,
+            otp_code=payload.code,
             device_info=req.headers.get("User-Agent", "Unknown Device"),
             ip_address=client_ip
         )

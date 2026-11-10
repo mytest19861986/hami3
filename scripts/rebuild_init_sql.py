@@ -238,3 +238,4 @@ ON CONFLICT DO NOTHING;
 
 if __name__ == '__main__':
     build_init_sql()
+

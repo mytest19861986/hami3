@@ -14,6 +14,13 @@ from src.api.reference import router as reference_router
 from src.api.doctors import router as doctors_router
 from src.api.plans import router as plans_router
 from src.api.content import router as content_router
+from src.api.profiles import router as profiles_router
+from src.api.wallets import router as wallets_router
+from src.api.visits import router as visits_router
+from src.api.sales import router as sales_router
+from src.api.payments import router as payments_router
+from src.api.reviews import router as reviews_router
+from src.api.notifications import router as notifications_router
 
 
 @asynccontextmanager
@@ -51,6 +58,13 @@ app.include_router(reference_router, prefix=API_V1_PREFIX)
 app.include_router(doctors_router, prefix=API_V1_PREFIX)
 app.include_router(plans_router, prefix=API_V1_PREFIX)
 app.include_router(content_router, prefix=API_V1_PREFIX)
+app.include_router(profiles_router, prefix=API_V1_PREFIX)
+app.include_router(wallets_router, prefix=API_V1_PREFIX)
+app.include_router(visits_router, prefix=API_V1_PREFIX)
+app.include_router(sales_router, prefix=API_V1_PREFIX)
+app.include_router(payments_router, prefix=API_V1_PREFIX)
+app.include_router(reviews_router, prefix=API_V1_PREFIX)
+app.include_router(notifications_router, prefix=API_V1_PREFIX)
 
 
 @app.get("/")

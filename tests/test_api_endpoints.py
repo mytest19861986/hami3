@@ -78,8 +78,8 @@ async def test_api_suite():
         assert "قوانین" in terms["title"]
         print(f"  ✓ CMS Content PASS: 'terms' page retrieved successfully.")
 
-        # 6. Auth OTP Request
-        print("\n[HTTP TEST 6/6] Testing POST /api/v1/auth/otp/request...")
+        # 6. Auth OTP Request & Verify
+        print("\n[HTTP TEST 6/10] Testing POST /api/v1/auth/otp/request & verify...")
         mobile = f"0999{uuid.uuid4().int % 10000000:07d}"
         r_otp = await client.post("/api/v1/auth/otp/request", json={"mobile": mobile})
         assert r_otp.status_code == 200
@@ -88,11 +88,60 @@ async def test_api_suite():
         assert 115 <= otp_res["cooldown_seconds"] <= 120
         print(f"  ✓ OTP Request PASS: cooldown={otp_res['cooldown_seconds']}s.")
 
+        # In dev mode, OTP is logged/stored in redis
+        import redis
+        rd = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        raw_code = rd.get(f"otp:code:{mobile}")
+        assert raw_code is not None, "OTP code not found in redis"
+
+        r_verify = await client.post("/api/v1/auth/otp/verify", json={"mobile": mobile, "code": raw_code})
+        assert r_verify.status_code == 200
+        verify_data = r_verify.json()
+        assert "session" in verify_data
+        session_token = verify_data["session"]["refresh_token"]
+        auth_headers = {"Authorization": f"Bearer {session_token}"}
+        print(f"  ✓ OTP Verify PASS: session_token issued.")
+
+        # 7. Authenticated Profile Me
+        print("\n[HTTP TEST 7/10] Testing GET /api/v1/profile/me...")
+        r_prof = await client.get("/api/v1/profile/me", headers=auth_headers)
+        assert r_prof.status_code == 200
+        prof_data = r_prof.json()
+        assert "has_profile" in prof_data
+        print(f"  ✓ Profile Me PASS: user_id={prof_data.get('user_id')}, has_profile={prof_data['has_profile']}.")
+
+        # 8. Authenticated Wallet Me
+        print("\n[HTTP TEST 8/10] Testing GET /api/v1/wallet/me...")
+        r_wal = await client.get("/api/v1/wallet/me", headers=auth_headers)
+        assert r_wal.status_code == 200
+        wal_data = r_wal.json()
+        assert wal_data["withdrawable_balance_toman"] == 0
+        assert wal_data["status"] == "ACTIVE"
+        print(f"  ✓ Wallet Me PASS: balance={wal_data['withdrawable_balance_toman']}, status={wal_data['status']}.")
+
+        # 9. Doctor Reviews Public Query
+        print("\n[HTTP TEST 9/10] Testing GET /api/v1/reviews/doctor/{doctor_id}...")
+        test_doc_id = docs_data["items"][0]["id"]
+        r_rev = await client.get(f"/api/v1/reviews/doctor/{test_doc_id}")
+        assert r_rev.status_code == 200
+        rev_data = r_rev.json()
+        assert "average_rating" in rev_data
+        assert "total_reviews" in rev_data
+        print(f"  ✓ Doctor Reviews PASS: total={rev_data['total_reviews']}, avg={rev_data['average_rating']}.")
+
+        # 10. Authenticated Notifications
+        print("\n[HTTP TEST 10/10] Testing GET /api/v1/notifications/unread-count...")
+        r_notif = await client.get("/api/v1/notifications/unread-count", headers=auth_headers)
+        assert r_notif.status_code == 200
+        notif_data = r_notif.json()
+        assert "unread_count" in notif_data
+        print(f"  ✓ Notifications PASS: unread_count={notif_data['unread_count']}.")
+
     await close_pool()
     close_redis()
 
     print("\n" + "=" * 70)
-    print("ALL 6 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
+    print("ALL 10 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
     print("=" * 70)
 
 

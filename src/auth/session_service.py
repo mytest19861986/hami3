@@ -199,6 +199,24 @@ class SessionService:
 
         return result_payload
 
+    async def verify_active_session(self, raw_token: str) -> Optional[Dict[str, Any]]:
+        """
+        Verifies that the provided raw session/refresh token corresponds to an ACTIVE,
+        non-expired session in PostgreSQL (SSOT).
+        """
+        token_digest = hash_token(raw_token)
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, user_id, family_id, status, expires_at
+                FROM refresh_tokens
+                WHERE token_hash = $1;
+            """, token_digest)
+
+            if not row or row["status"] != "ACTIVE" or row["expires_at"] < now:
+                return None
+            return dict(row)
+
     async def revoke_session(self, raw_refresh_token: str) -> bool:
         """Revokes a single refresh token (e.g. on client logout)."""
         token_digest = hash_token(raw_refresh_token)
