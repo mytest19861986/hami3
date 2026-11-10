@@ -407,6 +407,65 @@
     let currentUserData = null;
     let deferredPrompt = null;
     let otpTimerInterval = null;
+    let _refreshInFlightPromise = null;
+
+    /**
+     * Single-flight refresh token coordinator (T13-AC4 / F-01):
+     * Ensures parallel callers experiencing a 401 coalesce onto ONE refresh request,
+     * eliminating avoidable concurrent refresh collisions / replay triggers.
+     */
+    async function refreshSessionSingleFlight() {
+      if (!currentAuthToken) return null;
+      if (_refreshInFlightPromise) {
+        return _refreshInFlightPromise;
+      }
+
+      _refreshInFlightPromise = (async () => {
+        try {
+          const res = await fetch(`${API_BASE}/auth/refresh`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: currentAuthToken })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.refresh_token) {
+              currentAuthToken = data.refresh_token;
+              localStorage.setItem('hamicard_session_token', currentAuthToken);
+              return currentAuthToken;
+            }
+          }
+          await logout();
+          return null;
+        } catch (err) {
+          console.error('Single-flight refresh failed:', err);
+          return null;
+        } finally {
+          _refreshInFlightPromise = null;
+        }
+      })();
+
+      return _refreshInFlightPromise;
+    }
+
+    async function authenticatedFetch(url, options = {}) {
+      if (!currentAuthToken) {
+        throw new Error('No active session token');
+      }
+      const makeHeaders = (tok) => ({
+        ...(options.headers || {}),
+        'Authorization': `Bearer ${tok}`
+      });
+
+      let res = await fetch(url, { ...options, headers: makeHeaders(currentAuthToken) });
+      if (res.status === 401) {
+        const nextToken = await refreshSessionSingleFlight();
+        if (nextToken) {
+          res = await fetch(url, { ...options, headers: makeHeaders(nextToken) });
+        }
+      }
+      return res;
+    }
 
     // Service Worker Registration
     if ('serviceWorker' in navigator) {
@@ -696,9 +755,7 @@
     async function checkAuthSession() {
       if (!currentAuthToken) return;
       try {
-        const res = await fetch(`${API_BASE}/profile/me`, {
-          headers: {'Authorization': `Bearer ${currentAuthToken}`}
-        });
+        const res = await authenticatedFetch(`${API_BASE}/profile/me`);
         if (res.ok) {
           const profile = await res.json();
           currentUserData = profile;
@@ -711,7 +768,7 @@
           // Load wallet
           loadWallet();
         } else {
-          logout();
+          await logout();
         }
       } catch (e) {
         console.error('Session check failed:', e);
@@ -720,9 +777,7 @@
 
     async function loadWallet() {
       try {
-        const res = await fetch(`${API_BASE}/wallet/me`, {
-          headers: {'Authorization': `Bearer ${currentAuthToken}`}
-        });
+        const res = await authenticatedFetch(`${API_BASE}/wallet/me`);
         if (res.ok) {
           const wal = await res.json();
           document.getElementById('dash-wallet-bal').textContent = `${parseInt(wal.withdrawable_balance_toman).toLocaleString('fa-IR')} تومان`;
@@ -730,13 +785,29 @@
       } catch (e) {}
     }
 
-    function logout() {
+    async function logout() {
+      const tokenToRevoke = currentAuthToken;
       currentAuthToken = null;
+      _refreshInFlightPromise = null;
       localStorage.removeItem('hamicard_session_token');
       document.getElementById('login-btn').classList.remove('hidden');
       document.getElementById('user-info-bar').classList.add('hidden');
       document.getElementById('user-info-bar').classList.remove('flex');
       closeDashboardModal();
+      if (tokenToRevoke) {
+        try {
+          await fetch(`${API_BASE}/auth/logout`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${tokenToRevoke}`
+            },
+            body: JSON.stringify({ refresh_token: tokenToRevoke })
+          });
+        } catch (e) {
+          console.warn('Server logout revocation request skipped:', e);
+        }
+      }
     }
 
     function openDashboardModal() {

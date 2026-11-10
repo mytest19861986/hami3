@@ -1,7 +1,10 @@
 """
 FastAPI Dependencies & Context Injections
+REMEDIATION: HC-T13 (F-04, F-05, T13-AC3, T13-AC5)
+
 Provides database connection pools, Redis ephemeral cache,
-authentication context, and RBAC security enforcement.
+authentication context (backed by PostgreSQL session families),
+and authoritative `user_roles` RBAC enforcement.
 """
 
 import os
@@ -9,18 +12,17 @@ from typing import Any, Dict
 
 import asyncpg
 import redis
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Response, status
 
-from src.auth.rbac import RbacEngine
+from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.auth.session_service import SessionService
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
+    "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev",
 )
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Global state holders for app lifespan
 _pool: asyncpg.Pool | None = None
 _redis: redis.Redis | None = None
 
@@ -28,7 +30,8 @@ _redis: redis.Redis | None = None
 async def init_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
+        dsn = os.getenv("DATABASE_URL", DATABASE_URL)
+        _pool = await asyncpg.create_pool(dsn, min_size=5, max_size=20)
     return _pool
 
 
@@ -42,7 +45,8 @@ async def close_pool():
 def init_redis() -> redis.Redis:
     global _redis
     if _redis is None:
-        _redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        r_url = os.getenv("REDIS_URL", REDIS_URL)
+        _redis = redis.Redis.from_url(r_url, decode_responses=True)
     return _redis
 
 
@@ -66,51 +70,67 @@ def get_redis() -> redis.Redis:
 
 
 async def get_current_user(
+    response: Response,
     authorization: str | None = Header(None),
     pool: asyncpg.Pool = Depends(get_db_pool),
-    r: redis.Redis = Depends(get_redis)
 ) -> Dict[str, Any]:
     """
-    Extracts authenticated user from Bearer session token.
-    Enforces active user and active session state (AC-14).
+    Validates Bearer session token against PostgreSQL active sessions (SSOT),
+    resolves authoritative roles from `user_roles` (F-04), and enforces no-store cache headers (AUTH-013).
     """
-    if not authorization or not authorization.startswith("Bearer "):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
+
+    if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid Authorization header."
+            detail="Missing or invalid Authorization header.",
         )
 
-    raw_token = authorization.split(" ")[1].strip()
+    raw_token = authorization.split(" ", 1)[1].strip()
     session_svc = SessionService(pool)
     session = await session_svc.verify_active_session(raw_token)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has expired or was revoked."
+            detail="Session has expired or was revoked.",
         )
 
-    # Fetch user details
+    rbac = RbacEngine(pool)
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, mobile, status, roles, is_mobile_verified FROM users WHERE id = $1",
-            session["user_id"]
+            "SELECT id, mobile, status, is_mobile_verified FROM users WHERE id = $1",
+            session["user_id"],
         )
         if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found.",
+            )
         if user["status"] != "ACTIVE":
+            await session_svc.revoke_session_family(session["family_id"])
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"User account is {user['status']}."
+                detail="Account access unavailable.",
             )
 
-        return dict(user)
+        try:
+            authoritative_roles = await rbac.get_user_roles(conn, user["id"])
+        except RbacAccessDeniedError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+        user_dict = dict(user)
+        user_dict["roles"] = sorted(list(authoritative_roles))
+        user_dict["session_id"] = session["id"]
+        user_dict["session_family_id"] = session["family_id"]
+        return user_dict
 
 
 def require_permission(permission_id: str):
-    """Factory dependency for fine-grained RBAC permission checks."""
+    """Factory dependency for fine-grained RBAC permission checks backed by `user_roles`."""
     async def dependency(
         current_user: Dict[str, Any] = Depends(get_current_user),
-        pool: asyncpg.Pool = Depends(get_db_pool)
+        pool: asyncpg.Pool = Depends(get_db_pool),
     ):
         rbac = RbacEngine(pool)
         user_id = current_user["id"]
@@ -118,7 +138,8 @@ def require_permission(permission_id: str):
         if not has_perm:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission denied: Missing required permission '{permission_id}'."
+                detail=f"Permission denied: Missing required permission '{permission_id}'.",
             )
         return current_user
+
     return dependency

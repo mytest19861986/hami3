@@ -43,6 +43,9 @@ class MockSmsAdapter(BaseSmsAdapter):
         self.sent_messages: list[Dict[str, Any]] = []
 
     async def send_otp(self, mobile: str, code: str, template: str | None = None) -> bool:
+        env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").lower().strip()
+        if env == "production":
+            raise SmsAdapterError("Fail-Closed: MockSmsAdapter cannot be used in production.")
         record = {
             "type": "OTP",
             "mobile": mobile,
@@ -50,7 +53,7 @@ class MockSmsAdapter(BaseSmsAdapter):
             "template": template or "otp-verify",
         }
         self.sent_messages.append(record)
-        logger.info(f"[MockSMS] Sent OTP code {code} to {mobile}")
+        logger.info("[MockSMS] Dispatched OTP message to %s", mobile)
         return True
 
     async def send_notification(self, mobile: str, message: str) -> bool:
@@ -166,12 +169,17 @@ class GhasedakSmsAdapter(BaseSmsAdapter):
 
 
 def get_sms_adapter(provider_name: str | None = None) -> BaseSmsAdapter:
-    """Factory resolver for configured SMS provider."""
+    """Factory resolver for configured SMS provider (fail-closed in production)."""
     provider = (provider_name or os.getenv("SMS_PROVIDER", "mock")).lower().strip()
+    env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").lower().strip()
     if provider == "kavenegar":
         return KavenegarSmsAdapter()
     elif provider == "ghasedak":
         return GhasedakSmsAdapter()
+    elif env == "production":
+        raise SmsAdapterError(
+            f"Fail-Closed: Unconfigured or mock SMS provider '{provider}' prohibited in production."
+        )
     else:
         return MockSmsAdapter()
 

@@ -29,7 +29,13 @@ async def get_membership_card(
     """Returns virtual membership card with signed QR payload and dynamic PII masking."""
     card_svc = CardService(pool)
     try:
-        user_role = current_user.get("roles", ["USER"])[0] if current_user.get("roles") else "USER"
+        roles = current_user.get("roles", [])
+        if "SUPER_ADMIN" in roles:
+            user_role = "SUPER_ADMIN"
+        elif "ADMIN" in roles:
+            user_role = "ADMIN"
+        else:
+            user_role = roles[0] if roles else "USER"
         card = await card_svc.get_virtual_card(membership_id, requesting_role=user_role)
         return {"success": True, "card": card}
     except MembershipNotFoundError as e:

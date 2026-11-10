@@ -89,9 +89,11 @@ async def test_api_suite():
         assert 115 <= otp_res["cooldown_seconds"] <= 120
         print(f"  ✓ OTP Request PASS: cooldown={otp_res['cooldown_seconds']}s.")
 
-        # In dev mode, OTP is logged/stored in redis
+        # In dev mode, OTP is stored in Redis (no prod helper backdoor)
+        import os
+
         import redis
-        rd = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        rd = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
         raw_code = rd.get(f"otp:code:{mobile}")
         assert raw_code is not None, "OTP code not found in redis"
 
