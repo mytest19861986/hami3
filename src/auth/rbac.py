@@ -166,3 +166,10 @@ class RbacEngine:
 
             return True
 
+    async def has_permission(self, user_id: uuid.UUID, required_permission: str) -> bool:
+        """Helper that returns boolean True/False instead of raising exceptions."""
+        try:
+            return await self.check_permission(user_id, required_permission)
+        except RbacAccessDeniedError:
+            return False
+

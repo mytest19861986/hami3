@@ -139,7 +139,7 @@ async def test_api_suite():
         print(f"  ✓ Notifications PASS: unread_count={notif_data['unread_count']}.")
 
         # 11. Root Web Portal, PWA Manifest & Service Worker
-        print("\n[HTTP TEST 11/11] Testing GET /, /manifest.json, and /static/sw.js...")
+        print("\n[HTTP TEST 11/15] Testing GET /, /manifest.json, and /static/sw.js...")
         r_root = await client.get("/")
         assert r_root.status_code == 200
         assert "حامی‌کارت" in r_root.text
@@ -152,11 +152,107 @@ async def test_api_suite():
         assert "hamicard-cache" in r_sw.text
         print("  ✓ Web Portal, Manifest & SW PASS: served successfully.")
 
+        # 12. Create Order API
+        print("\n[HTTP TEST 12/15] Testing POST /api/v1/payments/orders...")
+        from src.api.deps import _pool
+        from src.auth.session_service import SessionService
+
+        async with _pool.acquire() as conn:
+            holder = await conn.fetchrow(
+                """
+                INSERT INTO plan_holders (first_name, last_name, national_code, mobile)
+                VALUES ('سارا', 'راد', $1, $2) RETURNING id
+                """,
+                f"{uuid.uuid4().int % 1000000000:010d}",
+                f"0933{uuid.uuid4().int % 10000000:07d}",
+            )
+            holder_id = str(holder["id"])
+
+        order_payload = {
+            "holder_id": holder_id,
+            "plan_id": plans[0]["id"],
+            "idempotency_key": f"IDEM-{uuid.uuid4().hex[:12]}",
+            "payment_method": "GATEWAY",
+            "gateway_name": "ZARINPAL",
+        }
+        r_order = await client.post("/api/v1/payments/orders", json=order_payload, headers=auth_headers)
+        assert r_order.status_code == 200
+        order_data = r_order.json()
+        assert order_data["success"] is True
+        order_id = order_data["order"]["id"]
+        print(f"  ✓ Create Order PASS: order_id={order_id}, amount={order_data['order']['amount_toman']}.")
+
+        # 13. Verify Payment API & Membership Activation
+        print("\n[HTTP TEST 13/15] Testing POST /api/v1/payments/orders/{order_id}/verify...")
+        verify_payload = {
+            "gateway_transaction_id": f"TX-{uuid.uuid4().hex[:8]}",
+            "gateway_tracking_code": f"TRK-{uuid.uuid4().hex[:8]}",
+        }
+        r_ver = await client.post(f"/api/v1/payments/orders/{order_id}/verify", json=verify_payload, headers=auth_headers)
+        assert r_ver.status_code == 200
+        ver_res = r_ver.json()
+        assert ver_res["success"] is True
+        membership_id = ver_res["membership"]["id"]
+        print(f"  ✓ Verify Payment PASS: membership_id={membership_id}, status={ver_res['membership']['status']}.")
+
+        # 14. Doctor Visit Recording API (with atomic quota decrement)
+        print("\n[HTTP TEST 14/15] Testing POST /api/v1/visits/record...")
+        session_svc = SessionService(_pool)
+        async with _pool.acquire() as conn:
+            doc_user = await conn.fetchrow(
+                "INSERT INTO users (mobile, roles) VALUES ($1, '{\"DOCTOR\"}') RETURNING id",
+                f"0919{uuid.uuid4().int % 10000000:07d}",
+            )
+            await conn.execute("INSERT INTO user_roles (user_id, role_id) VALUES ($1, 'DOCTOR')", doc_user["id"])
+            doc = await conn.fetchrow(
+                """
+                INSERT INTO doctors (
+                    user_id, medical_council_code, specialty, clinic_name,
+                    province_id, city_id, clinic_address, clinic_phone, verification_status, is_public_listed
+                ) VALUES ($1, $2, 'Cardiology', 'Heart Clinic', 1, 1, 'Tehran', '0218888', 'APPROVED', TRUE)
+                RETURNING id
+                """,
+                doc_user["id"],
+                f"MED-{uuid.uuid4().hex[:6]}",
+            )
+            doc_id = str(doc["id"])
+            doc_sess = await session_svc.create_session(user_id=doc_user["id"], device_info="test-agent", ip_address="127.0.0.1")
+            doc_headers = {"Authorization": f"Bearer {doc_sess['refresh_token']}"}
+
+        visit_payload = {
+            "doctor_id": doc_id,
+            "holder_id": holder_id,
+            "membership_id": str(membership_id),
+            "service_title": "ویزیت تخصصی چکاپ",
+            "total_amount_toman": 500000,
+            "discount_percent": 25.0,
+        }
+        r_visit = await client.post("/api/v1/visits/record", json=visit_payload, headers=doc_headers)
+        assert r_visit.status_code == 200
+        visit_res = r_visit.json()
+        assert visit_res["success"] is True
+        assert visit_res["visit"]["discount_amount_toman"] == 125000
+        assert visit_res["visit"]["patient_paid_amount_toman"] == 375000
+        print(f"  ✓ Record Visit PASS: visit_id={visit_res['visit']['id']}, total={visit_res['visit']['total_amount_toman']}.")
+
+        # 15. Wallet Settlement Request API
+        print("\n[HTTP TEST 15/15] Testing POST /api/v1/wallet/settle...")
+        settle_payload = {
+            "amount_toman": 150000,
+            "bank_card_number": "6037991199999990",
+            "bank_sheba_number": "IR630170000000100412345678",
+            "bank_account_holder_name": "سارا راد",
+        }
+        r_settle = await client.post("/api/v1/wallet/settle", json=settle_payload, headers=auth_headers)
+        assert r_settle.status_code == 400
+        assert "Insufficient funds" in r_settle.json()["detail"]
+        print("  ✓ Wallet Settle PASS: Insufficient balance safely guarded with 400 Bad Request.")
+
     await close_pool()
     close_redis()
 
     print("\n" + "=" * 70)
-    print("ALL 11 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
+    print("ALL 15 FASTAPI HTTP ENDPOINT TESTS PASSED (100% SUCCESS)!")
     print("=" * 70)
 
 
