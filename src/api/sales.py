@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from src.api.deps import get_current_user, get_db_pool, require_permission
+from src.core.policy import PolicyNotApprovedError
 from src.sales.service import AgentNotApprovedError, InvalidStateTransitionError, SalesCaseError, SalesCaseService
 
 router = APIRouter(prefix="/sales", tags=["Sales Cases & Logistics"])
@@ -95,6 +96,8 @@ async def finalize_financial_status(
             actor_user_id=current_user["id"]
         )
         return {"success": True, **result}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except InvalidStateTransitionError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except SalesCaseError as e:

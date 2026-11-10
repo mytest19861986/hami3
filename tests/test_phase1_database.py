@@ -11,13 +11,17 @@ Verifies:
 """
 
 import asyncio
+import os
 import sys
 import uuid
 
 import asyncpg
 import redis
 
-PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
+PG_DSN = os.getenv(
+    "DATABASE_URL",
+    "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev",
+)
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 
@@ -79,17 +83,21 @@ async def run_tests():
         sys.exit(1)
     print(f"  ✓ All {len(EXPECTED_TABLES)} required tables are present in PostgreSQL schema.")
 
-    # 3. Verify OPEN-01..18 in system_settings
+    # 3. Verify OPEN-01..18 in system_settings (all seeded as PROPOSED, not owner-approved)
     print("[3/6] Verifying OPEN-01 to OPEN-18 parametric settings...")
-    settings_rows = await conn.fetch("SELECT key, value_json FROM system_settings;")
+    settings_rows = await conn.fetch("SELECT key, value_json, approval_status FROM system_settings;")
     settings_keys = {r["key"] for r in settings_rows}
-    
+
     for prefix in EXPECTED_OPEN_KEYS:
-        matched = any(k.startswith(prefix) for k in settings_keys)
+        matched = [r for r in settings_rows if r["key"].startswith(prefix)]
         if not matched:
             print(f"  ✗ FAILED: Missing configuration for {prefix}")
             sys.exit(1)
-    print(f"  ✓ All 18 OPEN decisions configured with safe defaults in system_settings (found {len(settings_rows)} keys).")
+        for row in matched:
+            if row["approval_status"] != "PROPOSED":
+                print(f"  ✗ FAILED: Seeded {row['key']} has unexpected status {row['approval_status']} (expected PROPOSED)")
+                sys.exit(1)
+    print(f"  ✓ All 18 OPEN decisions configured and explicitly flagged PROPOSED in system_settings (found {len(settings_rows)} keys).")
 
     # 4. Test Concurrency Invariant: AC-12 / BR-21 (Single Open Settlement per User)
     print("[4/6] Testing AC-12 / SETTLE-005: Single open settlement request constraint...")
@@ -127,7 +135,23 @@ async def run_tests():
         sys.exit(1)
     print("  ✓ Mathematical Invariant AC-12 PASS: Second open settlement blocked by idx_one_open_settlement_per_user.")
 
-    # Mark first settlement as PAID -> Now a new settlement can be requested
+    # Verify positive-only amount invariant (no hardcoded 100k SQL minimum, strict > 0 enforced)
+    non_positive_blocked = False
+    try:
+        await conn.fetchval("""
+            INSERT INTO settlements (user_id, wallet_id, amount_toman, bank_card_number, bank_sheba_number, bank_account_holder_name, status)
+            VALUES ($1, $2, 0, '6037997112345678', 'IR120120000000001234567890', 'کاربر آزمایشی', 'PENDING')
+            RETURNING id;
+        """, user_id, wallet_id)
+    except asyncpg.CheckViolationError:
+        non_positive_blocked = True
+
+    if not non_positive_blocked:
+        print("  ✗ FAILED: chk_settlements_amount_positive failed to block amount_toman <= 0!")
+        sys.exit(1)
+    print("  ✓ Mathematical Invariant T14-AC2 PASS: Non-positive settlement amount blocked by chk_settlements_amount_positive.")
+
+    # Mark first settlement as PAID -> Now a new settlement below 100k can be requested in SQL without SQL alter
     await conn.execute("UPDATE settlements SET status = 'PAID', external_payment_ref = 'PAYA-12345' WHERE id = $1;", settle_1)
     settle_2 = await conn.fetchval("""
         INSERT INTO settlements (user_id, wallet_id, amount_toman, bank_card_number, bank_sheba_number, bank_account_holder_name, status)

@@ -25,7 +25,10 @@ import asyncpg
 from src.common.pii import mask_card_number, mask_national_code, mask_phone, mask_shaba
 from src.core.settings import SystemConfigurationError, load_and_validate_settings
 
-PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
+PG_DSN = os.getenv(
+    "DATABASE_URL",
+    "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev",
+)
 
 PRD_ROLES = ["SUPER_ADMIN", "ADMIN", "SUPPORT", "DOCTOR", "AGENT", "USER"]
 
@@ -224,10 +227,14 @@ async def test_fail_closed_system_settings():
     print("\n[REMEDIATION TEST 4/6] Testing Fail-Closed System Settings Startup Policy...")
     conn = await asyncpg.connect(PG_DSN)
     try:
-        # 1. Normal state: all 18 keys exist
+        # 1. Normal state: all 18 keys exist and remain PROPOSED by default
         settings = await load_and_validate_settings(conn)
         assert len(settings) >= 18
-        print(f"  ✓ Normal startup validation: all {len(settings)} mandatory settings loaded safely.")
+        for k, meta in settings.items():
+            if k.startswith("OPEN_"):
+                assert meta["approval_status"] == "PROPOSED", f"{k} must start PROPOSED"
+                assert meta["is_approved"] is False
+        print(f"  ✓ Normal startup validation: all {len(settings)} mandatory settings loaded cleanly (default=PROPOSED).")
 
         # 2. Tampered state: missing a mandatory key in an isolated transaction
         tr = conn.transaction()

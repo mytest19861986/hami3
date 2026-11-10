@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from src.api.deps import get_current_user, get_db_pool
+from src.core.policy import PolicyNotApprovedError
 from src.payments.service import InvalidPaymentStateError, OrderNotFoundError, PaymentError, PaymentService
 
 router = APIRouter(prefix="/payments", tags=["Payments & Orders"])
@@ -76,6 +77,8 @@ async def verify_payment(
             referral_code=payload.referral_code
         )
         return {"success": True, **result}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except OrderNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except InvalidPaymentStateError as e:

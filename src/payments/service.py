@@ -10,6 +10,10 @@ from typing import Any, Dict
 
 import asyncpg
 
+from src.core.policy import (
+    require_approved_policy,
+    round_toman,
+)
 from src.wallets.service import WalletService
 
 
@@ -100,6 +104,12 @@ class PaymentService:
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                rounding_policy = await require_approved_policy(
+                    conn, "OPEN_18_CURRENCY_AND_ROUNDING"
+                )
+                if referral_code:
+                    await require_approved_policy(conn, "OPEN_05_COMBINED_COMMISSION_POLICY")
+
                 order = await conn.fetchrow(
                     """
                     SELECT op.*, dp.validity_days, dp.max_visits, dp.referrer_commission_percent
@@ -165,7 +175,9 @@ class PaymentService:
                     rate = float(order["referrer_commission_percent"])
                     if ref_record and rate > 0:
                         ref_user_id = ref_record["referrer_user_id"]
-                        comm_amount = int(round(order["amount_toman"] * (rate / 100.0)))
+                        comm_amount = round_toman(
+                            order["amount_toman"] * (rate / 100.0), rounding_policy
+                        )
                         idem_comm = f"COMM-REF-ORD-{order_id}"
 
                         comm_row = await conn.fetchrow(
@@ -177,16 +189,22 @@ class PaymentService:
                             ) VALUES ($1, 'REFERRAL', $2, $3, $4, 'APPROVED', $5, NOW())
                             ON CONFLICT (idempotency_key) DO UPDATE SET updated_at = NOW()
                             RETURNING id
-                            """, ref_user_id, order_id, rate, comm_amount, idem_comm
+                            """,
+                            ref_user_id,
+                            order_id,
+                            rate,
+                            comm_amount,
+                            idem_comm,
                         )
 
-                        # Credit referrer wallet
+                        # Credit referrer wallet on same transaction connection
                         await self.wallet_svc.credit_commission(
                             user_id=ref_user_id,
                             amount_toman=comm_amount,
                             reference_id=str(order_id),
                             idempotency_key=idem_comm,
-                            description=f"پورسانت معرفی بابت خرید اشتراک {order_id}"
+                            description=f"پورسانت معرفی بابت خرید اشتراک {order_id}",
+                            conn=conn,
                         )
                         commission_info = {
                             "referrer_user_id": str(ref_user_id),

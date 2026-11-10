@@ -10,6 +10,8 @@ from typing import Any, Dict, List
 
 import asyncpg
 
+from src.core.policy import require_approved_policy, round_toman
+
 
 class VisitError(Exception):
     """Base exception for visit operations."""
@@ -57,12 +59,25 @@ class VisitService:
         if discount_percent < 0 or discount_percent > 100:
             raise VisitError("Discount percent must be between 0 and 100.")
 
-        # Compute monetary breakdown
-        discount_amount = int(round(total_amount_toman * (discount_percent / 100.0)))
-        patient_paid_amount = total_amount_toman - discount_amount
-
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                rounding_policy = await require_approved_policy(
+                    conn, "OPEN_18_CURRENCY_AND_ROUNDING"
+                )
+                med_limit = await require_approved_policy(
+                    conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT"
+                )
+                if private_notes and not med_limit.get("allow_private_notes", True):
+                    raise VisitError(
+                        "Private clinical notes are disabled by OPEN-16 policy."
+                    )
+
+                # Compute monetary breakdown per OPEN-18 policy
+                discount_amount = round_toman(
+                    total_amount_toman * (discount_percent / 100.0), rounding_policy
+                )
+                patient_paid_amount = total_amount_toman - discount_amount
+
                 # 1. Fetch membership to check unlimited vs bounded quota
                 mem = await conn.fetchrow(
                     """
@@ -165,6 +180,10 @@ class VisitService:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                refund_policy = await require_approved_policy(
+                    conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY"
+                )
+
                 # 1. Fetch visit
                 visit = await conn.fetchrow(
                     "SELECT * FROM visits WHERE id = $1 FOR UPDATE", visit_id
@@ -175,17 +194,18 @@ class VisitService:
                 if visit["status"] == "CANCELLED":
                     raise VisitCancellationError("Visit is already cancelled.")
 
-                # 2. Revert quota on membership
-                await conn.execute(
-                    """
-                    UPDATE memberships
-                    SET used_visits = GREATEST(0, used_visits - 1),
-                        remaining_visits = CASE WHEN remaining_visits IS NOT NULL THEN remaining_visits + 1 ELSE NULL END,
-                        status = CASE WHEN status = 'EXHAUSTED' THEN 'ACTIVE' ELSE status END,
-                        updated_at = NOW()
-                    WHERE id = $1
-                    """, visit["membership_id"]
-                )
+                # 2. Revert quota on membership if OPEN-07 policy restores quota
+                if refund_policy.get("restore_quota", True):
+                    await conn.execute(
+                        """
+                        UPDATE memberships
+                        SET used_visits = GREATEST(0, used_visits - 1),
+                            remaining_visits = CASE WHEN remaining_visits IS NOT NULL THEN remaining_visits + 1 ELSE NULL END,
+                            status = CASE WHEN status = 'EXHAUSTED' THEN 'ACTIVE' ELSE status END,
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """, visit["membership_id"]
+                    )
 
                 # 3. Update visit status
                 cancelled_row = await conn.fetchrow(

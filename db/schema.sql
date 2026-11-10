@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS system_settings (
     data_type VARCHAR(20) NOT NULL DEFAULT 'json'
         CHECK (data_type IN ('string', 'integer', 'boolean', 'json', 'decimal')),
     is_mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+    approval_status VARCHAR(20) NOT NULL DEFAULT 'PROPOSED'
+        CHECK (approval_status IN ('PROPOSED', 'APPROVED', 'BLOCKED')),
+    approved_by UUID NULL,
+    approved_at TIMESTAMPTZ NULL,
     description TEXT NOT NULL,
     is_secret BOOLEAN NOT NULL DEFAULT FALSE,
     updated_by UUID NULL,
@@ -582,7 +586,7 @@ CREATE TABLE IF NOT EXISTS settlements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
-    amount_toman BIGINT NOT NULL CHECK (amount_toman >= 100000),
+    amount_toman BIGINT NOT NULL CONSTRAINT chk_settlements_amount_positive CHECK (amount_toman > 0),
     bank_card_number VARCHAR(16) NOT NULL,
     bank_sheba_number VARCHAR(26) NOT NULL,
     bank_account_holder_name VARCHAR(150) NOT NULL,

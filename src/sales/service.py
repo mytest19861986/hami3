@@ -12,6 +12,7 @@ from typing import Any, Dict
 
 import asyncpg
 
+from src.core.policy import require_approved_policy, round_toman
 from src.wallets.service import WalletService
 
 
@@ -156,6 +157,11 @@ class SalesCaseService:
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                await require_approved_policy(conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER")
+                rounding_policy = await require_approved_policy(
+                    conn, "OPEN_18_CURRENCY_AND_ROUNDING"
+                )
+
                 case = await conn.fetchrow(
                     """
                     SELECT sc.*, dp.price_toman, dp.agent_commission_percent, a.user_id as agent_user_id
@@ -171,10 +177,10 @@ class SalesCaseService:
                 if case["financial_status"] == 'FINALIZED':
                     raise InvalidStateTransitionError("Sales case is already finalized.")
 
-                # Compute commission
+                # Compute commission per OPEN-18 policy rounding
                 rate = float(case["agent_commission_percent"])
                 price = int(case["price_toman"])
-                commission_amount = int(round(price * (rate / 100.0)))
+                commission_amount = round_toman(price * (rate / 100.0), rounding_policy)
                 agent_user_id = case["agent_user_id"]
                 idem_key = f"COMM-SALE-{case_id}"
 
@@ -188,7 +194,9 @@ class SalesCaseService:
                         updated_at = NOW()
                     WHERE id = $2
                     RETURNING *
-                    """, actor_user_id, case_id
+                    """,
+                    actor_user_id,
+                    case_id,
                 )
 
                 # Insert commission record
@@ -201,10 +209,16 @@ class SalesCaseService:
                     ) VALUES ($1, 'AGENT_SALE', $2, $3, $4, 'APPROVED', $5, $6, NOW())
                     ON CONFLICT (idempotency_key) DO UPDATE SET updated_at = NOW()
                     RETURNING id
-                    """, agent_user_id, case_id, rate, commission_amount, idem_key, actor_user_id
+                    """,
+                    agent_user_id,
+                    case_id,
+                    rate,
+                    commission_amount,
+                    idem_key,
+                    actor_user_id,
                 )
 
-                # Credit agent wallet
+                # Credit agent wallet on same transaction connection
                 if commission_amount > 0:
                     await self.wallet_svc.credit_commission(
                         user_id=agent_user_id,
@@ -212,7 +226,8 @@ class SalesCaseService:
                         reference_id=str(case_id),
                         idempotency_key=idem_key,
                         description=f"پورسانت پرونده فروش {case_id}",
-                        created_by=actor_user_id
+                        created_by=actor_user_id,
+                        conn=conn,
                     )
 
                 return {

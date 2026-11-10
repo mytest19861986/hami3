@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from src.api.deps import get_current_user, get_db_pool, require_permission
+from src.core.policy import PolicyNotApprovedError
 from src.visits.service import (
     MembershipInactiveError,
     QuotaExhaustedError,
@@ -59,6 +60,8 @@ async def record_visit(
             private_notes=payload.private_notes
         )
         return {"success": True, "visit": result}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except QuotaExhaustedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except MembershipInactiveError as e:
@@ -85,6 +88,8 @@ async def cancel_visit(
             reason=payload.reason
         )
         return {"success": True, "visit": cancelled}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VisitCancellationError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except VisitError as e:
