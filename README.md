@@ -18,7 +18,7 @@
 - **کش و صف نشست:** Redis 7 Alpine با سیاست ماندگاری AOF و الگوریتم `volatile-lru`
 - **رمزنگاری و امنیت:** Argon2id برای گذرواژه‌ها طبق استاندارد OWASP | SHA-256 برای سشن‌ها | الگوریتم‌های اعتبارسنجی بومی (کد ملی، Luhn شتاب، ISO 7064 شبا)
 - **فرانت‌اند و سطوح کاربری:** پورتال وب واکنش‌گرا (RTL)، وب‌مانیفست PWA، سرویس‌ورکر و نوار شناور اختصاصی نصب موبایل (WebAPK و iOS Safari)
-- **کانتینرسازی و CI/CD:** Docker multi-stage | Docker Compose | GitHub Actions با اجرای خودکار ۱۴ سوئیت آزمون مستر
+- **کانتینرسازی و CI/CD:** Docker multi-stage | Docker Compose | GitHub Actions با اجرای خودکار ۱۶ سوئیت آزمون مستر (بیش از ۹۰ سناریو)
 
 ---
 
@@ -71,7 +71,7 @@ docker compose -f docker-compose.dev.yml up -d
 pip install -r requirements-dev.txt
 ```
 
-### ۴. اجرای آزمون‌های خودکار مستر (۱۴ سوئیت)
+### ۴. اجرای آزمون‌های خودکار مستر (۱۶ سوئیت)
 ```bash
 python scripts/run_all_tests.py
 ```
@@ -104,7 +104,9 @@ uvicorn src.api.main:app --host 127.0.0.1 --port 8000 --reload
 | ۱۱ | فروش نمایندگی | `tests/test_sales_cases.py` | ماشین وضعیت دوگانه لجستیک/مالی، کد پستی (AC-09/10) |
 | ۱۲ | پرداخت‌ها و معرف | `tests/test_payments_and_referrals.py` | ثبت سفارش با آیدمپوتنسی، فعال‌سازی کارت و کمیسیون |
 | ۱۳ | نظرات و اعلان‌ها | `tests/test_reviews_and_notifications.py` | ثبت نظر برای ویزیت تکمیل‌شده و اعلان زنده |
-| ۱۴ | لایه کامل REST API | `tests/test_api_endpoints.py` | تست جامع ۱۱ اندپوینت HTTP، روت وب‌پورتال و مانیفست |
+| ۱۴ | لایه کامل REST API | `tests/test_api_endpoints.py` | تست جامع ۱۵ اندپوینت HTTP، روت وب‌پورتال و مانیفست |
+| ۱۵ | آداپتورهای خارجی | `tests/test_adapters.py` | درگاه پرداخت Zarinpal/PayPing و پیامک Kavenegar/Ghasedak (OPEN-11) |
+| ۱۶ | کارت عضویت دیجیتال | `tests/test_cards.py` | صدور کارت HAMI-1405، امضای HMAC کد QR و استعلام درمانگاهی |
 
 ---
 
