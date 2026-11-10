@@ -1594,6 +1594,122 @@
         }
       }
     },
+    "/api/v1/cards/membership/{membership_id}": {
+      "get": {
+        "tags": [
+          "Digital Membership Cards"
+        ],
+        "summary": "Get Membership Card",
+        "description": "Returns virtual membership card with signed QR payload and dynamic PII masking.",
+        "operationId": "get_membership_card_api_v1_cards_membership__membership_id__get",
+        "parameters": [
+          {
+            "name": "membership_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Membership Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cards/verify-qr": {
+      "post": {
+        "tags": [
+          "Digital Membership Cards"
+        ],
+        "summary": "Verify Card Qr",
+        "description": "Clinic/Doctor scan verification endpoint.\nValidates QR signature and returns instant eligibility and remaining visit balance.",
+        "operationId": "verify_card_qr_api_v1_cards_verify_qr_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyQrSchema"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/reviews": {
       "post": {
         "tags": [
@@ -2597,6 +2713,22 @@
           "gateway_tracking_code"
         ],
         "title": "VerifyPaymentSchema"
+      },
+      "VerifyQrSchema": {
+        "properties": {
+          "qr_payload": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 10,
+            "title": "Qr Payload",
+            "example": "HAMICARD:v1:3fa85f64-5717-4562-b3fc-2c963f66afa6:a1b2c3d4e5f60718"
+          }
+        },
+        "type": "object",
+        "required": [
+          "qr_payload"
+        ],
+        "title": "VerifyQrSchema"
       }
     }
   }
