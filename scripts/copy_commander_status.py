@@ -1,7 +1,7 @@
 import pyperclip
+from pathlib import Path
 
-with open('docs/COMMANDER_STATUS_006.md', 'r', encoding='utf-8') as f:
-    content = f.read()
-
+status_file = Path(__file__).resolve().parent.parent / "docs" / "COMMANDER_STATUS_007.md"
+content = status_file.read_text(encoding="utf-8")
 pyperclip.copy(content)
-print("SUCCESS: Copied docs/COMMANDER_STATUS_006.md to Windows Clipboard!")
+print(f"Successfully copied {status_file.name} ({len(content)} characters) to clipboard!")
