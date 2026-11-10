@@ -138,8 +138,8 @@ async def test_api_suite():
         assert "unread_count" in notif_data
         print(f"  ✓ Notifications PASS: unread_count={notif_data['unread_count']}.")
 
-        # 11. Root Web Portal & PWA Manifest
-        print("\n[HTTP TEST 11/11] Testing GET / and /manifest.json...")
+        # 11. Root Web Portal, PWA Manifest & Service Worker
+        print("\n[HTTP TEST 11/11] Testing GET /, /manifest.json, and /static/sw.js...")
         r_root = await client.get("/")
         assert r_root.status_code == 200
         assert "حامی‌کارت" in r_root.text
@@ -147,7 +147,10 @@ async def test_api_suite():
         assert r_manifest.status_code == 200
         man_data = r_manifest.json()
         assert man_data["short_name"] == "حامی‌کارت"
-        print("  ✓ Web Portal & PWA Manifest PASS: served successfully.")
+        r_sw = await client.get("/static/sw.js")
+        assert r_sw.status_code == 200
+        assert "hamicard-cache" in r_sw.text
+        print("  ✓ Web Portal, Manifest & SW PASS: served successfully.")
 
     await close_pool()
     close_redis()
