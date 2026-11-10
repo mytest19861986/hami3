@@ -23,6 +23,7 @@ SUITES = [
     ("Phase 3 Reviews & Notifications", "tests/test_reviews_and_notifications.py"),
     ("FastAPI HTTP REST API Layer", "tests/test_api_endpoints.py"),
     ("External Adapters (SMS & Payment Gateways)", "tests/test_adapters.py"),
+    ("Digital Membership Cards & QR Verification", "tests/test_cards.py"),
 ]
 
 def main():

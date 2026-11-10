@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import router as auth_router
+from src.api.cards import router as cards_router
 from src.api.content import router as content_router
 from src.api.deps import close_pool, close_redis, init_pool, init_redis
 from src.api.doctors import router as doctors_router
@@ -71,6 +72,7 @@ app.include_router(wallets_router, prefix=API_V1_PREFIX)
 app.include_router(visits_router, prefix=API_V1_PREFIX)
 app.include_router(sales_router, prefix=API_V1_PREFIX)
 app.include_router(payments_router, prefix=API_V1_PREFIX)
+app.include_router(cards_router, prefix=API_V1_PREFIX)
 app.include_router(reviews_router, prefix=API_V1_PREFIX)
 app.include_router(notifications_router, prefix=API_V1_PREFIX)
 
