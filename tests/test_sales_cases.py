@@ -14,6 +14,7 @@ import uuid
 
 import asyncpg
 
+from src.core.policy import PolicyNotApprovedError, set_policy_approval
 from src.sales.service import AgentNotApprovedError, InvalidStateTransitionError, SalesCaseService
 from src.wallets.service import WalletService
 
@@ -167,6 +168,19 @@ async def test_financial_finalization_and_commission_credit(pool: asyncpg.Pool):
     case_id = case["id"]
     await sales_svc.update_logistic_status(case_id, "APPROVED", actor_user_id=admin_user["id"])
 
+    # 1b. While OPEN_03 / OPEN_18 remain PROPOSED, financial finalization MUST be disabled (T14-AC1)
+    policy_blocked = False
+    try:
+        await sales_svc.finalize_financial_status(case_id=case_id, actor_user_id=admin_user["id"])
+    except PolicyNotApprovedError:
+        policy_blocked = True
+    assert policy_blocked, "Sales finalization succeeded while OPEN-03/OPEN-18 remained PROPOSED!"
+
+    # Approve OPEN-03 & OPEN-18 temporarily for positive-path verification
+    async with pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER", "APPROVED")
+        await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
+
     # 2. Finalize financial status
     final_res = await sales_svc.finalize_financial_status(case_id=case_id, actor_user_id=admin_user["id"])
     assert final_res["case"]["financial_status"] == "FINALIZED"
@@ -199,6 +213,9 @@ async def main():
         print("ALL 4 SALES CASES & DUAL STATE MACHINE TEST SUITES PASSED (100% SUCCESS)!")
         print("=" * 70)
     finally:
+        async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER", "PROPOSED")
+            await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "PROPOSED")
         await pool.close()
 
 

@@ -15,6 +15,7 @@ import uuid
 
 import asyncpg
 
+from src.core.policy import PolicyNotApprovedError, set_policy_approval
 from src.payments.service import PaymentService
 from src.referrals.service import ReferralService, SelfReferralNotAllowedError
 from src.wallets.service import WalletService
@@ -74,6 +75,21 @@ async def test_payment_fulfillment_and_membership_activation(pool: asyncpg.Pool)
         plan_id=plan["id"],
         idempotency_key=f"ORD-{uuid.uuid4().hex}"
     )
+
+    # Fulfill payment is disabled while OPEN_18 is PROPOSED
+    pay_blocked = False
+    try:
+        await pay_svc.verify_and_fulfill_payment(
+            order_id=order["id"],
+            gateway_transaction_id="TXN-BLOCKED",
+            gateway_tracking_code="TRK-BLOCKED"
+        )
+    except PolicyNotApprovedError:
+        pay_blocked = True
+    assert pay_blocked, "Payment fulfillment succeeded while OPEN-18 is PROPOSED!"
+
+    async with pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
 
     # Fulfill payment
     fulfill_res = await pay_svc.verify_and_fulfill_payment(
@@ -157,6 +173,10 @@ async def test_referral_commission_credit_on_order(pool: asyncpg.Pool):
         idempotency_key=f"ORD-REF-{uuid.uuid4().hex}"
     )
 
+    async with pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_05_COMBINED_COMMISSION_POLICY", "APPROVED")
+        await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
+
     # 3. Fulfill payment with referral code
     fulfill_res = await pay_svc.verify_and_fulfill_payment(
         order_id=order["id"],
@@ -194,6 +214,9 @@ async def main():
         print("ALL 4 PAYMENTS & REFERRALS TEST SUITES PASSED (100% SUCCESS)!")
         print("=" * 70)
     finally:
+        async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_05_COMBINED_COMMISSION_POLICY", "PROPOSED")
+            await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "PROPOSED")
         await pool.close()
 
 

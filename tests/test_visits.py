@@ -16,6 +16,7 @@ import uuid
 
 import asyncpg
 
+from src.core.policy import PolicyNotApprovedError, set_policy_approval
 from src.visits.service import (
     MembershipInactiveError,
     QuotaExhaustedError,
@@ -255,6 +256,27 @@ async def test_unlimited_quota_membership(pool: asyncpg.Pool):
 async def main():
     pool = await asyncpg.create_pool(PG_URI, min_size=2, max_size=5)
     try:
+        visit_svc = VisitService(pool)
+        blocked_visit = False
+        try:
+            await visit_svc.record_visit(
+                doctor_id=uuid.uuid4(),
+                holder_id=uuid.uuid4(),
+                membership_id=uuid.uuid4(),
+                service_title="ویزیت آزمایشی",
+                total_amount_toman=100000,
+                discount_percent=10.0,
+            )
+        except PolicyNotApprovedError:
+            blocked_visit = True
+        assert blocked_visit, "record_visit must fail closed while OPEN-18/OPEN-16 are PROPOSED"
+        print("\n[VISIT TEST 0/4] Fail-Closed Policy Guard Verified (PROPOSED blocks mutation).")
+
+        async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY", "APPROVED")
+            await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "APPROVED")
+            await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
+
         await test_visit_financial_computation_and_quota_decrement(pool)
         await test_quota_exhaustion_and_zero_overselling(pool)
         await test_visit_cancellation_and_quota_rollback(pool)
@@ -263,6 +285,10 @@ async def main():
         print("ALL 4 MEDICAL VISITS & QUOTA TESTS PASSED (100% SUCCESS)!")
         print("=" * 70)
     finally:
+        async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY", "PROPOSED")
+            await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "PROPOSED")
+            await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "PROPOSED")
         await pool.close()
 
 

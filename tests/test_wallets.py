@@ -18,6 +18,7 @@ import uuid
 
 import asyncpg
 
+from src.core.policy import PolicyNotApprovedError, set_policy_approval
 from src.wallets.service import InsufficientFundsError, WalletService
 
 PG_URI = os.getenv(
@@ -176,6 +177,13 @@ async def test_append_only_ledger_history(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
         user_row = await conn.fetchrow("INSERT INTO users (mobile) VALUES ($1) RETURNING id", f"0934{uuid.uuid4().int % 10000000:07d}")
         user_id = user_row["id"]
+        # Dynamically lower OPEN-06 minimum to 50,000 for this subtest
+        await set_policy_approval(
+            conn,
+            "OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN",
+            "APPROVED",
+            updated_value_json={"min_amount_toman": 50000, "lock_on_request": True},
+        )
 
     # 3 operations: Credit 100k, Credit 200k, Lock 50k
     await wallet_svc.credit_commission(user_id=user_id, amount_toman=100000, reference_id="REF-1", idempotency_key=f"IDEM-1-{uuid.uuid4().hex}", description="پورسانت ۱")
@@ -190,9 +198,40 @@ async def test_append_only_ledger_history(pool: asyncpg.Pool):
     print("  ✓ Append-only financial ledger statements exactly audited in reverse chronological order.")
 
 
+async def test_unapproved_policy_fail_closed(pool: asyncpg.Pool):
+    print("\n[WALLET TEST 0/4] Testing Fail-Closed Block When Financial Policies Are PROPOSED...")
+    wallet_svc = WalletService(pool)
+    async with pool.acquire() as conn:
+        user_row = await conn.fetchrow("INSERT INTO users (mobile) VALUES ($1) RETURNING id", f"0939{uuid.uuid4().int % 10000000:07d}")
+        user_id = user_row["id"]
+
+    blocked_credit = False
+    try:
+        await wallet_svc.credit_commission(
+            user_id=user_id,
+            amount_toman=100000,
+            reference_id="UNAPPROVED-TEST",
+            idempotency_key=f"UNAPP-{uuid.uuid4().hex}",
+            description="blocked while PROPOSED",
+        )
+    except PolicyNotApprovedError:
+        blocked_credit = True
+    assert blocked_credit, "credit_commission should be blocked while OPEN_18 is PROPOSED"
+    print("  ✓ Unapproved OPEN-18 blocks commission credit as required.")
+
+
 async def main():
     pool = await asyncpg.create_pool(PG_URI, min_size=2, max_size=5)
     try:
+        await test_unapproved_policy_fail_closed(pool)
+        async with pool.acquire() as conn:
+            for key in (
+                "OPEN_04_FINANCIAL_PERMISSIONS_MATRIX",
+                "OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN",
+                "OPEN_18_CURRENCY_AND_ROUNDING",
+            ):
+                await set_policy_approval(conn, key, "APPROVED")
+
         await test_wallet_initialization_and_commission_credit(pool)
         await test_settlement_locking_and_insufficient_funds(pool)
         await test_settlement_payout_and_refund_cycles(pool)
@@ -201,6 +240,15 @@ async def main():
         print("ALL 4 WALLET & FINANCIAL LEDGER TEST SUITES PASSED (100% SUCCESS)!")
         print("=" * 70)
     finally:
+        async with pool.acquire() as conn:
+            await set_policy_approval(
+                conn,
+                "OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN",
+                "PROPOSED",
+                updated_value_json={"min_amount_toman": 100000, "lock_on_request": True},
+            )
+            await set_policy_approval(conn, "OPEN_04_FINANCIAL_PERMISSIONS_MATRIX", "PROPOSED")
+            await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "PROPOSED")
         await pool.close()
 
 
