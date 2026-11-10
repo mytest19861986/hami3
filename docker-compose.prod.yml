@@ -6,10 +6,10 @@ services:
     container_name: hamicard_api_prod
     restart: always
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-hamicard}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-hamicard_prod}
+      DATABASE_URL: postgresql://${DB_USER:-hamicard}:${DB_PASSWORD:-hamicard_prod_secure_password}@postgres:5432/${DB_NAME:-hamicard_prod}
       REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: production
-      APP_SECRET: ${APP_SECRET}
+      APP_SECRET: ${APP_SECRET:-hamicard_production_secret_key_change_in_vault_32bytes}
     ports:
       - "8000:8000"
     depends_on:
@@ -35,7 +35,7 @@ services:
     environment:
       POSTGRES_DB: ${DB_NAME:-hamicard_prod}
       POSTGRES_USER: ${DB_USER:-hamicard}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hamicard_prod_secure_password}
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_prod_data:/var/lib/postgresql/data

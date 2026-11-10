@@ -3,7 +3,7 @@
 # Baseline: BL-HAMICARD-PRD-V1 | Python 3.13 Slim
 # ==============================================================================
 
-FROM python:3.13-slim as builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ COPY requirements.txt .
 RUN pip install --user --no-cache-dir -r requirements.txt
 
 # Final runtime image
-FROM python:3.13-slim as runner
+FROM python:3.13-slim AS runner
 
 WORKDIR /app
 
