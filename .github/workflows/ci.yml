@@ -1,13 +1,14 @@
-name: HamiCard CI Pipeline
+name: HamiCard CI/CD Automated Test Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, develop, 'feature/**' ]
   pull_request:
     branches: [ main, develop ]
 
 jobs:
-  database-and-concurrency-tests:
+  full-system-verification:
+    name: 14-Suite Master Automated Verification
     runs-on: ubuntu-24.04
 
     services:
@@ -39,22 +40,30 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
           cache: 'pip'
 
+      - name: Install System Utilities & Postgres Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install asyncpg redis pytest
+          pip install -r requirements-dev.txt
 
       - name: Apply Database Schema & Seed Data
         run: |
-          sudo apt-get update && sudo apt-get install -y postgresql-client
           PGPASSWORD=hamicard_dev_secret_pass psql -h localhost -U hamicard -d hamicard_dev -f db/init.sql
 
-      - name: Run Database & Concurrency Verification Test Suite
+      - name: Run Master Automated Test Suite (14 Suites / 74 Tests)
+        env:
+          PYTHONPATH: .
+          DATABASE_URL: postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev
+          REDIS_URL: redis://localhost:6379/0
         run: |
-          python tests/test_phase1_database.py
+          python scripts/run_all_tests.py

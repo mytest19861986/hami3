@@ -1,0 +1,77 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hamicard_api_prod
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-hamicard}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-hamicard_prod}
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: production
+      APP_SECRET: ${APP_SECRET}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: hamicard_postgres_prod
+    restart: always
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hamicard_prod}
+      POSTGRES_USER: ${DB_USER:-hamicard}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-hamicard} -d ${DB_NAME:-hamicard_prod}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4096M
+
+  redis:
+    image: redis:7-alpine
+    container_name: hamicard_redis_prod
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy volatile-lru
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+
+volumes:
+  postgres_prod_data:
+    name: hamicard_postgres_prod_data
+  redis_prod_data:
+    name: hamicard_redis_prod_data
+

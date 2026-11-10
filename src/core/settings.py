@@ -9,6 +9,7 @@ Enforces:
 
 import json
 from typing import Any, Dict
+
 import asyncpg
 
 EXPECTED_OPEN_KEYS = [
@@ -46,7 +47,7 @@ async def load_and_validate_settings(conn: asyncpg.Connection) -> Dict[str, Any]
         FROM system_settings
         WHERE is_mandatory = TRUE;
     """)
-    
+
     settings_map: Dict[str, Any] = {}
     for r in rows:
         key = r["key"]
@@ -67,3 +68,4 @@ async def load_and_validate_settings(conn: asyncpg.Connection) -> Dict[str, Any]
         )
 
     return settings_map
+

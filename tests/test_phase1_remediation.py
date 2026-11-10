@@ -13,17 +13,17 @@ Validates:
 """
 
 import asyncio
-import uuid
-import sys
 import os
+import sys
+import uuid
 
 # Add root directory to python path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import asyncpg
-import pytest
-from src.common.pii import mask_national_code, mask_phone, mask_card_number, mask_shaba
-from src.core.settings import load_and_validate_settings, SystemConfigurationError
+
+from src.common.pii import mask_card_number, mask_national_code, mask_phone, mask_shaba
+from src.core.settings import SystemConfigurationError, load_and_validate_settings
 
 PG_DSN = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
 
@@ -274,10 +274,11 @@ async def test_audit_logs_recording():
     print("\n[REMEDIATION TEST 6/6] Testing Audit Log Recording & Immutability...")
     conn = await asyncpg.connect(PG_DSN)
     try:
+        test_mobile = f"0912{uuid.uuid4().int % 10000000:07d}"
         actor_id = await conn.fetchval("""
             INSERT INTO users (mobile, status, roles)
-            VALUES ('09129990011', 'ACTIVE', '{"SUPER_ADMIN"}') RETURNING id;
-        """)
+            VALUES ($1, 'ACTIVE', '{"SUPER_ADMIN"}') RETURNING id;
+        """, test_mobile)
 
         # Record audit log
         log_id = await conn.fetchval("""

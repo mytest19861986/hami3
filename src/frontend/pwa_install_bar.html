@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>حامی‌کارت | نصب نسخه موبایل و PWA</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0284c7">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="حامی‌کارت">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Vazirmatn', sans-serif;
+    }
+
+    body {
+      background-color: #f8fafc;
+      color: #0f172a;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .demo-card {
+      background: white;
+      padding: 30px;
+      border-radius: 20px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+      max-width: 480px;
+      width: 100%;
+    }
+
+    .demo-logo {
+      width: 64px;
+      height: 64px;
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: bold;
+      font-size: 24px;
+      margin-bottom: 16px;
+      box-shadow: 0 8px 16px -4px rgba(2, 132, 199, 0.3);
+    }
+
+    /* ==========================================================================
+       FLOATING BOTTOM PWA INSTALL BAR (ANDROID & iOS ADAPTIVE)
+       ========================================================================== */
+    .pwa-floating-bar {
+      position: fixed;
+      bottom: 16px;
+      left: 16px;
+      right: 16px;
+      max-width: 500px;
+      margin: 0 auto;
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      color: white;
+      border-radius: 18px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      box-shadow: 0 20px 30px -10px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1);
+      z-index: 9999;
+      transform: translateY(120%);
+      transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+      opacity: 0;
+    }
+
+    .pwa-floating-bar.active {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    .pwa-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      text-align: right;
+    }
+
+    .pwa-app-icon {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, #0ea5e9, #0284c7);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 800;
+      font-size: 18px;
+      flex-shrink: 0;
+      box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
+    }
+
+    .pwa-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #f8fafc;
+      margin-bottom: 2px;
+    }
+
+    .pwa-desc {
+      font-size: 11px;
+      color: #94a3b8;
+    }
+
+    .pwa-badge {
+      display: inline-block;
+      background: rgba(34, 197, 94, 0.2);
+      color: #4ade80;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 6px;
+      margin-right: 4px;
+    }
+
+    .pwa-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .pwa-install-btn {
+      background: linear-gradient(135deg, #0ea5e9, #0284c7);
+      color: white;
+      border: none;
+      padding: 9px 16px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4);
+    }
+
+    .pwa-install-btn:active {
+      transform: scale(0.96);
+    }
+
+    .pwa-close-btn {
+      background: transparent;
+      border: none;
+      color: #64748b;
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.2s ease;
+    }
+
+    .pwa-close-btn:hover {
+      color: #cbd5e1;
+    }
+
+    /* iOS Modal Guidance */
+    .ios-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(6px);
+      z-index: 10000;
+      align-items: flex-end;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .ios-modal.active {
+      display: flex;
+    }
+
+    .ios-sheet {
+      background: white;
+      border-radius: 24px;
+      padding: 24px;
+      width: 100%;
+      max-width: 440px;
+      text-align: right;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+      animation: slideUp 0.3s ease-out;
+    }
+
+    @keyframes slideUp {
+      from { transform: translateY(100%); }
+      to { transform: translateY(0); }
+    }
+
+    .ios-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin: 16px 0;
+      font-size: 13px;
+      color: #334155;
+      line-height: 1.6;
+    }
+
+    .ios-step-num {
+      width: 24px;
+      height: 24px;
+      background: #e0f2fe;
+      color: #0284c7;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="demo-card">
+    <div class="demo-logo">ح</div>
+    <h2 style="margin-bottom: 8px;">سامانه خدمات رفاهی و درمانی حامی‌کارت</h2>
+    <p style="color: #64748b; font-size: 14px; margin-bottom: 24px;">
+      تجربه روان و پرسرعت خدمات درمانی بدون نیاز به دانلود از بازار یا گوگل‌پلی.
+    </p>
+    <div style="background: #f1f5f9; padding: 12px; border-radius: 12px; font-size: 12px; color: #475569;">
+      📱 جهت تست، نوار نصب شناور در پایین صفحه فعال است.
+    </div>
+  </div>
+
+  <!-- FLOATING PWA INSTALL BAR -->
+  <div id="pwaFloatingBar" class="pwa-floating-bar active">
+    <div class="pwa-info">
+      <div class="pwa-app-icon">ح</div>
+      <div>
+        <div class="pwa-title">
+          نصب اپلیکیشن حامی‌کارت
+          <span class="pwa-badge">نسخه PWA</span>
+        </div>
+        <div class="pwa-desc">دسترسی سریع، بدون فیلتر و کم‌حجم</div>
+      </div>
+    </div>
+    <div class="pwa-actions">
+      <button id="pwaInstallBtn" class="pwa-install-btn" onclick="triggerPwaInstall()">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+        </svg>
+        <span>نصب مستقیم</span>
+      </button>
+      <button class="pwa-close-btn" onclick="dismissPwaBar()" title="بستن">
+        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- IOS INSTALL GUIDANCE MODAL -->
+  <div id="iosInstallModal" class="ios-modal" onclick="closeIosModal(event)">
+    <div class="ios-sheet" onclick="event.stopPropagation()">
+      <h3 style="margin-bottom: 12px; color: #0f172a;">نصب حامی‌کارت در آیفون و آیپد (iOS)</h3>
+      <p style="font-size: 12px; color: #64748b; margin-bottom: 16px;">برای دسترسی دائمی بدون نیاز به اپ‌استور مراحل زیر را انجام دهید:</p>
+      
+      <div class="ios-step">
+        <div class="ios-step-num">۱</div>
+        <div>روی دکمه <strong>Share</strong> (آیکون اشتراک‌گذاری در نوار پایین مرورگر سافاری) بزنید.</div>
+      </div>
+      <div class="ios-step">
+        <div class="ios-step-num">۲</div>
+        <div>در منوی باز شده به پایین اسکرول کنید و گزینه <strong>Add to Home Screen</strong> (افزودن به صفحه اصلی) را انتخاب کنید.</div>
+      </div>
+      <div class="ios-step">
+        <div class="ios-step-num">۳</div>
+        <div>در گوشه بالا دکمه <strong>Add</strong> را بزنید تا آیکون برنامه به صفحه گوشی اضافه شود.</div>
+      </div>
+
+      <button style="width: 100%; margin-top: 16px; padding: 12px; background: #0284c7; color: white; border: none; border-radius: 12px; font-weight: 700; cursor: pointer;" onclick="closeIosModal()">
+        متوجه شدم
+      </button>
+    </div>
+  </div>
+
+  <script>
+    let deferredPrompt = null;
+    const isIos = /iphone|ipad|ipod/.test(window.navigator.userAgent.toLowerCase());
+    const isInStandaloneMode = ('standalone' in window.navigator) && (window.navigator.standalone);
+
+    // Listen for Android beforeinstallprompt
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      showPwaBar();
+    });
+
+    function showPwaBar() {
+      if (localStorage.getItem('pwa_bar_dismissed') === 'true') return;
+      if (isInStandaloneMode) return; // Already installed!
+      document.getElementById('pwaFloatingBar').classList.add('active');
+    }
+
+    function triggerPwaInstall() {
+      if (deferredPrompt) {
+        // Android / Desktop Chrome PWA prompt
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then((choiceResult) => {
+          if (choiceResult.outcome === 'accepted') {
+            dismissPwaBar();
+          }
+          deferredPrompt = null;
+        });
+      } else if (isIos) {
+        // Show iOS instructions sheet
+        document.getElementById('iosInstallModal').classList.add('active');
+      } else {
+        alert("جهت نصب، از منوی مرورگر خود گزینه 'نصب برنامه' (Install App) یا 'افزودن به صفحه اصلی' را انتخاب فرمایید.");
+      }
+    }
+
+    function dismissPwaBar() {
+      document.getElementById('pwaFloatingBar').classList.remove('active');
+      localStorage.setItem('pwa_bar_dismissed', 'true');
+    }
+
+    function closeIosModal() {
+      document.getElementById('iosInstallModal').classList.remove('active');
+      dismissPwaBar();
+    }
+
+    // Auto display after 1 second if not installed
+    setTimeout(showPwaBar, 1000);
+  </script>
+</body>
+</html>
