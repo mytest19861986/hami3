@@ -1,20 +1,47 @@
 """
 Visits Domain Service (VISIT-001..013, AC-07, AC-08)
-Executes atomic quota decrement on memberships, calculates financial discounts,
-manages doctor visit logs, cancellation rollback, and clinical audit trail.
+REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5)
+
+Security & Concurrency Guarantees:
+- Service-boundary authorization via authoritative `user_roles` (`RbacEngine`):
+  * Doctors MUST have active `'DOCTOR'` role AND `doctors.verification_status == 'APPROVED'`.
+  * Ordinary doctors are strictly bound to their own `doctors.id` (doctor impersonation -> 403).
+  * `ADMIN` / `SUPER_ADMIN` overrides require target doctor APPROVED and record actual
+    `actor_user_id`, `actor_role`, and `admin_override=True` in `audit_logs`.
+- Visit cancellation requires explicit `'visits:cancel'` permission (`ADMIN` / `SUPER_ADMIN`),
+  executes an atomic conditional transition (`WHERE status='COMPLETED'`), and restores quota
+  at most once (`T18-AC4`).
+- Visit read & listing enforce strict IDOR ownership + `mask_national_code` + redaction of
+  `private_notes` from unauthorized / non-owning / support viewers.
+- Atomic `FOR UPDATE` row locking preserves `AC-07` zero-overselling under parallel bursts,
+  and exact `Decimal` arithmetic enforces `OPEN_18_CURRENCY_AND_ROUNDING`.
 """
 
+import json
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from typing import Any, Dict, List, Set
 
 import asyncpg
 
-from src.core.policy import require_approved_policy, round_toman
+from src.auth.rbac import RbacAccessDeniedError, RbacEngine
+from src.common.pii import mask_national_code
+from src.core.policy import require_approved_policy
 
 
 class VisitError(Exception):
     """Base exception for visit operations."""
+    pass
+
+
+class VisitAuthorizationError(VisitError):
+    """Raised when an actor lacks RBAC permission, ownership, or APPROVED doctor status."""
+    pass
+
+
+class VisitNotFoundError(VisitError):
+    """Raised when target visit or doctor does not exist."""
     pass
 
 
@@ -29,29 +56,55 @@ class MembershipInactiveError(VisitError):
 
 
 class VisitCancellationError(VisitError):
-    """Raised on invalid visit cancellation."""
+    """Raised on invalid or repeated visit cancellation."""
     pass
+
+
+def _resolve_actor_role_label(roles: Set[str]) -> str:
+    for candidate in ("SUPER_ADMIN", "ADMIN", "DOCTOR", "SUPPORT", "AGENT", "USER"):
+        if candidate in roles:
+            return candidate
+    return "USER"
+
+
+def _round_percent_toman(
+    total_amount_toman: int,
+    discount_percent: float | Decimal | int,
+    rounding_policy: Dict[str, Any] | None = None,
+) -> int:
+    raw = (Decimal(int(total_amount_toman)) * Decimal(str(discount_percent))) / Decimal("100")
+    mode = (rounding_policy or {}).get("rounding_mode", "FLOOR").strip().upper()
+    if mode == "FLOOR":
+        return int(raw.to_integral_value(rounding=ROUND_FLOOR))
+    if mode == "CEIL":
+        return int(raw.to_integral_value(rounding=ROUND_CEILING))
+    return int(raw.to_integral_value(rounding=ROUND_HALF_UP))
 
 
 class VisitService:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
+        self.rbac = RbacEngine(pool)
 
     async def record_visit(
         self,
-        doctor_id: uuid.UUID,
         holder_id: uuid.UUID,
         membership_id: uuid.UUID,
         service_title: str,
         total_amount_toman: int,
         discount_percent: float,
-        private_notes: str | None = None
+        actor_user_id: uuid.UUID | None = None,
+        doctor_id: uuid.UUID | None = None,
+        private_notes: str | None = None,
     ) -> Dict[str, Any]:
         """
-        Records a medical visit with atomic quota decrement and financial computation.
-        Strictly enforces AC-07: Zero overselling, atomic Row Count check.
+        Records a medical visit with strict service-boundary actor/doctor authorization,
+        exact Decimal discount calculation, and atomic quota decrement (`AC-07`, `T18-AC1/AC2/AC5`).
         """
-        title_clean = service_title.strip()
+        if actor_user_id is None:
+            raise VisitAuthorizationError("Authenticated actor_user_id is required to record visits.")
+
+        title_clean = (service_title or "").strip()
         if not title_clean:
             raise VisitError("Service title cannot be empty.")
         if total_amount_toman < 0:
@@ -61,6 +114,55 @@ class VisitService:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                try:
+                    actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+                except RbacAccessDeniedError as exc:
+                    raise VisitAuthorizationError(str(exc)) from exc
+
+                is_admin = bool(actor_roles & {"ADMIN", "SUPER_ADMIN"})
+                is_doctor = "DOCTOR" in actor_roles
+                if not is_admin and not is_doctor:
+                    raise VisitAuthorizationError(
+                        "Only APPROVED doctors or administrators may record medical visits."
+                    )
+
+                # Resolve and bind target doctor identity authoritatively
+                actor_doc = await conn.fetchrow(
+                    "SELECT id, user_id, verification_status FROM doctors WHERE user_id = $1",
+                    actor_user_id,
+                )
+
+                if is_admin:
+                    lookup_doc_id = doctor_id or (actor_doc["id"] if actor_doc else None)
+                    if lookup_doc_id is None:
+                        raise VisitError("Target doctor_id is required when recording as admin.")
+                    target_doc = await conn.fetchrow(
+                        "SELECT id, user_id, verification_status FROM doctors WHERE id = $1",
+                        lookup_doc_id,
+                    )
+                    if not target_doc:
+                        raise VisitNotFoundError(f"Doctor {lookup_doc_id} not found.")
+                    if target_doc["verification_status"] != "APPROVED":
+                        raise VisitAuthorizationError(
+                            f"Target doctor account is in '{target_doc['verification_status']}' status; must be APPROVED."
+                        )
+                    resolved_doctor_id = target_doc["id"]
+                    admin_override = target_doc["user_id"] != actor_user_id
+                else:
+                    if not actor_doc:
+                        raise VisitAuthorizationError("Actor does not have a registered doctor profile.")
+                    if actor_doc["verification_status"] != "APPROVED":
+                        raise VisitAuthorizationError(
+                            f"Doctor account is in '{actor_doc['verification_status']}' status; operational visit recording blocked."
+                        )
+                    if doctor_id is not None and doctor_id != actor_doc["id"]:
+                        raise VisitAuthorizationError(
+                            "Forbidden: Doctor cannot record visits impersonating another doctor_id."
+                        )
+                    resolved_doctor_id = actor_doc["id"]
+                    admin_override = False
+
+                # Policy checks (fail-closed)
                 rounding_policy = await require_approved_policy(
                     conn, "OPEN_18_CURRENCY_AND_ROUNDING"
                 )
@@ -72,37 +174,40 @@ class VisitService:
                         "Private clinical notes are disabled by OPEN-16 policy."
                     )
 
-                # Compute monetary breakdown per OPEN-18 policy
-                discount_amount = round_toman(
-                    total_amount_toman * (discount_percent / 100.0), rounding_policy
+                # Exact Decimal breakdown per OPEN-18 policy
+                discount_amount = _round_percent_toman(
+                    total_amount_toman, discount_percent, rounding_policy
                 )
-                patient_paid_amount = total_amount_toman - discount_amount
+                patient_paid_amount = int(total_amount_toman) - discount_amount
 
-                # 1. Fetch membership to check unlimited vs bounded quota
+                # 1. Lock membership row to verify active status & holder match
                 mem = await conn.fetchrow(
                     """
                     SELECT id, status, end_date, max_visits, remaining_visits, used_visits
                     FROM memberships
                     WHERE id = $1 AND holder_id = $2
                     FOR UPDATE
-                    """, membership_id, holder_id
+                    """,
+                    membership_id,
+                    holder_id,
                 )
                 if not mem:
                     raise MembershipInactiveError("Membership not found for this card holder.")
 
                 if mem["status"] != "ACTIVE":
-                    raise MembershipInactiveError(f"Membership is in status '{mem['status']}'. Must be ACTIVE.")
+                    raise MembershipInactiveError(
+                        f"Membership is in status '{mem['status']}'. Must be ACTIVE."
+                    )
 
-                # Check expiration
                 if mem["end_date"] <= datetime.now(mem["end_date"].tzinfo):
                     await conn.execute(
-                        "UPDATE memberships SET status = 'EXPIRED' WHERE id = $1", membership_id
+                        "UPDATE memberships SET status = 'EXPIRED' WHERE id = $1",
+                        membership_id,
                     )
                     raise MembershipInactiveError("Membership has expired.")
 
-                # 2. Atomic Quota Decrement
+                # 2. Atomic Quota Decrement (AC-07)
                 if mem["max_visits"] is not None:
-                    # Bounded quota: Atomic conditional update
                     res = await conn.fetchrow(
                         """
                         UPDATE memberships
@@ -112,19 +217,22 @@ class VisitService:
                             updated_at = NOW()
                         WHERE id = $1 AND status = 'ACTIVE' AND remaining_visits >= 1
                         RETURNING id, remaining_visits, used_visits, status
-                        """, membership_id
+                        """,
+                        membership_id,
                     )
                     if not res:
-                        raise QuotaExhaustedError("Membership quota exhausted: remaining_visits = 0 (AC-07).")
+                        raise QuotaExhaustedError(
+                            "Membership quota exhausted: remaining_visits = 0 (AC-07)."
+                        )
                 else:
-                    # Unlimited quota (max_visits IS NULL)
                     await conn.execute(
                         """
                         UPDATE memberships
                         SET used_visits = used_visits + 1,
                             updated_at = NOW()
                         WHERE id = $1 AND status = 'ACTIVE'
-                        """, membership_id
+                        """,
+                        membership_id,
                     )
 
                 # 3. Create Visit Record
@@ -140,27 +248,40 @@ class VisitService:
                               patient_paid_amount_toman, status, visit_date, private_notes,
                               created_at
                     """,
-                    doctor_id, holder_id, membership_id, title_clean,
-                    total_amount_toman, discount_percent, discount_amount,
-                    patient_paid_amount, private_notes
+                    resolved_doctor_id,
+                    holder_id,
+                    membership_id,
+                    title_clean,
+                    total_amount_toman,
+                    discount_percent,
+                    discount_amount,
+                    patient_paid_amount,
+                    private_notes,
                 )
 
-                # 4. Audit Log
+                # 4. Authoritative Audit Log (no clinical notes or patient national code!)
+                actor_role = _resolve_actor_role_label(actor_roles)
                 await conn.execute(
                     """
                     INSERT INTO audit_logs (
-                        actor_role, action, entity_name, entity_id, new_values
+                        actor_user_id, actor_role, action, entity_name, entity_id, new_values
                     ) VALUES (
-                        'DOCTOR', 'VISIT_RECORDED', 'visits', $1::varchar,
-                        jsonb_build_object(
-                            'doctor_id', $2::varchar,
-                            'holder_id', $3::varchar,
-                            'total_toman', $4::bigint,
-                            'discount_toman', $5::bigint
-                        )
+                        $1, $2, 'VISIT_RECORDED', 'visits', $3::varchar, $4::jsonb
                     )
-                    """, str(visit_row["id"]), str(doctor_id), str(holder_id),
-                    total_amount_toman, discount_amount
+                    """,
+                    actor_user_id,
+                    actor_role,
+                    str(visit_row["id"]),
+                    json.dumps(
+                        {
+                            "doctor_id": str(resolved_doctor_id),
+                            "holder_id": str(holder_id),
+                            "total_toman": int(total_amount_toman),
+                            "discount_toman": int(discount_amount),
+                            "admin_override": admin_override,
+                        },
+                        ensure_ascii=False,
+                    ),
                 )
 
                 return dict(visit_row)
@@ -168,46 +289,56 @@ class VisitService:
     async def cancel_visit(
         self,
         visit_id: uuid.UUID,
-        canceller_user_id: uuid.UUID,
-        reason: str
+        canceller_user_id: uuid.UUID | None,
+        reason: str,
     ) -> Dict[str, Any]:
         """
-        Cancels a visit, reverts quota consumption on membership atomically, and logs reason.
+        Cancels a visit strictly for `visits:cancel`-authorized admins (`ADMIN` / `SUPER_ADMIN`),
+        atomically transitions status once (`WHERE status='COMPLETED'`), restores bounded quota
+        at most once, and records actual actor + role (`F-09`, `T18-AC4`).
         """
-        reason_clean = reason.strip()
+        if canceller_user_id is None:
+            raise VisitAuthorizationError("Authenticated canceller_user_id is required.")
+
+        reason_clean = (reason or "").strip()
         if not reason_clean:
             raise VisitError("Cancellation reason cannot be empty.")
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                try:
+                    actor_roles = await self.rbac.get_user_roles(conn, canceller_user_id)
+                    actor_perms = await self.rbac.get_user_permissions(conn, canceller_user_id)
+                except RbacAccessDeniedError as exc:
+                    raise VisitAuthorizationError(str(exc)) from exc
+
+                if "SUPER_ADMIN" not in actor_roles and "visits:cancel" not in actor_perms:
+                    raise VisitAuthorizationError(
+                        "Permission denied: 'visits:cancel' permission required to cancel visits."
+                    )
+
                 refund_policy = await require_approved_policy(
                     conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY"
                 )
+                if refund_policy.get("refund_requires_reason", True) and len(reason_clean) < 3:
+                    raise VisitError("Detailed cancellation reason is required by OPEN-07.")
 
-                # 1. Fetch visit
                 visit = await conn.fetchrow(
-                    "SELECT * FROM visits WHERE id = $1 FOR UPDATE", visit_id
+                    "SELECT * FROM visits WHERE id = $1 FOR UPDATE",
+                    visit_id,
                 )
                 if not visit:
-                    raise VisitError(f"Visit {visit_id} not found.")
+                    raise VisitNotFoundError(f"Visit {visit_id} not found.")
 
-                if visit["status"] == "CANCELLED":
+                if visit["status"] != "COMPLETED":
                     raise VisitCancellationError("Visit is already cancelled.")
 
-                # 2. Revert quota on membership if OPEN-07 policy restores quota
-                if refund_policy.get("restore_quota", True):
-                    await conn.execute(
-                        """
-                        UPDATE memberships
-                        SET used_visits = GREATEST(0, used_visits - 1),
-                            remaining_visits = CASE WHEN remaining_visits IS NOT NULL THEN remaining_visits + 1 ELSE NULL END,
-                            status = CASE WHEN status = 'EXHAUSTED' THEN 'ACTIVE' ELSE status END,
-                            updated_at = NOW()
-                        WHERE id = $1
-                        """, visit["membership_id"]
-                    )
+                # Lock membership BEFORE transitioning so quota reversal is serialized
+                mem = await conn.fetchrow(
+                    "SELECT id, max_visits, status, end_date FROM memberships WHERE id = $1 FOR UPDATE",
+                    visit["membership_id"],
+                )
 
-                # 3. Update visit status
                 cancelled_row = await conn.fetchrow(
                     """
                     UPDATE visits
@@ -216,59 +347,215 @@ class VisitService:
                         cancelled_by = $2,
                         cancelled_at = NOW(),
                         updated_at = NOW()
-                    WHERE id = $3
+                    WHERE id = $3 AND status = 'COMPLETED'
                     RETURNING *
-                    """, reason_clean, canceller_user_id, visit_id
+                    """,
+                    reason_clean,
+                    canceller_user_id,
+                    visit_id,
                 )
+                if not cancelled_row:
+                    raise VisitCancellationError("Visit was already cancelled concurrently.")
 
-                # 4. Audit Log
+                quota_restored = False
+                if mem and refund_policy.get("restore_quota", True):
+                    await conn.execute(
+                        """
+                        UPDATE memberships
+                        SET used_visits = GREATEST(0, used_visits - 1),
+                            remaining_visits = CASE
+                                WHEN max_visits IS NOT NULL
+                                    THEN LEAST(max_visits, COALESCE(remaining_visits, 0) + 1)
+                                ELSE NULL
+                            END,
+                            status = CASE
+                                WHEN status = 'EXHAUSTED' AND end_date > NOW() THEN 'ACTIVE'
+                                ELSE status
+                            END,
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        visit["membership_id"],
+                    )
+                    quota_restored = True
+
+                actor_role = _resolve_actor_role_label(actor_roles)
                 await conn.execute(
                     """
                     INSERT INTO audit_logs (
-                        actor_user_id, action, entity_name, entity_id, new_values
+                        actor_user_id, actor_role, action, entity_name, entity_id,
+                        old_values, new_values
                     ) VALUES (
-                        $1, 'VISIT_CANCELLED', 'visits', $2::varchar,
-                        jsonb_build_object('reason', $3::text)
+                        $1, $2, 'VISIT_CANCELLED', 'visits', $3::varchar,
+                        jsonb_build_object('status', 'COMPLETED'),
+                        $4::jsonb
                     )
-                    """, canceller_user_id, str(visit_id), reason_clean
+                    """,
+                    canceller_user_id,
+                    actor_role,
+                    str(visit_id),
+                    json.dumps(
+                        {
+                            "status": "CANCELLED",
+                            "reason": reason_clean,
+                            "quota_restored": quota_restored,
+                        },
+                        ensure_ascii=False,
+                    ),
                 )
 
                 return dict(cancelled_row)
 
-    async def get_visit_by_id(self, visit_id: uuid.UUID) -> Dict[str, Any]:
-        """Retrieves single visit with detailed financial breakdown."""
+    async def get_visit_by_id(
+        self,
+        visit_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieves single visit with strict authorization & privacy filtering (`F-10`, `T18-AC1/AC3`):
+        - Owning APPROVED doctor or ADMIN/SUPER_ADMIN: authorized (admins see unmasked national code;
+          doctors receive masked national code).
+        - Patient/Buyer (`orders_payments.buyer_user_id` or `profiles.national_code`): sees own visit
+          with `private_notes = None` and masked `patient_national_code`.
+        - SUPPORT: sees masked `patient_national_code` and `private_notes = None`.
+        - Unrelated users/doctors or unapproved/suspended doctors: rejected (`403`).
+        """
+        if actor_user_id is None:
+            raise VisitAuthorizationError("Authenticated actor_user_id is required.")
+
         async with self.pool.acquire() as conn:
+            try:
+                actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+            except RbacAccessDeniedError as exc:
+                raise VisitAuthorizationError(str(exc)) from exc
+
             row = await conn.fetchrow(
                 """
-                SELECT v.*, d.clinic_name, d.specialty,
-                       ph.first_name as patient_first_name, ph.last_name as patient_last_name,
-                       ph.national_code as patient_national_code
+                SELECT v.*, d.user_id AS doctor_user_id, d.verification_status AS doctor_verification_status,
+                       d.clinic_name, d.specialty,
+                       ph.first_name AS patient_first_name, ph.last_name AS patient_last_name,
+                       ph.national_code AS patient_national_code,
+                       op.buyer_user_id AS order_buyer_user_id,
+                       actor_prof.national_code AS actor_profile_national_code
                 FROM visits v
                 JOIN doctors d ON v.doctor_id = d.id
                 JOIN plan_holders ph ON v.holder_id = ph.id
+                JOIN memberships m ON v.membership_id = m.id
+                LEFT JOIN orders_payments op ON m.order_id = op.id
+                LEFT JOIN profiles actor_prof ON actor_prof.user_id = $2
                 WHERE v.id = $1
-                """, visit_id
+                """,
+                visit_id,
+                actor_user_id,
             )
             if not row:
-                raise VisitError(f"Visit {visit_id} not found.")
-            return dict(row)
+                raise VisitNotFoundError(f"Visit {visit_id} not found.")
+
+            is_admin = bool(actor_roles & {"ADMIN", "SUPER_ADMIN"})
+            is_support = "SUPPORT" in actor_roles
+            is_owning_approved_doctor = (
+                "DOCTOR" in actor_roles
+                and row["doctor_user_id"] == actor_user_id
+                and row["doctor_verification_status"] == "APPROVED"
+            )
+            is_patient_or_buyer = (
+                row["order_buyer_user_id"] == actor_user_id
+                or (
+                    row["actor_profile_national_code"] is not None
+                    and row["actor_profile_national_code"] == row["patient_national_code"]
+                )
+            )
+
+            if not (is_admin or is_support or is_owning_approved_doctor or is_patient_or_buyer):
+                raise VisitAuthorizationError(
+                    "Access denied: You are not authorized to view this visit."
+                )
+
+            data = dict(row)
+            data.pop("doctor_user_id", None)
+            data.pop("doctor_verification_status", None)
+            data.pop("order_buyer_user_id", None)
+            data.pop("actor_profile_national_code", None)
+
+            if not is_admin:
+                data["patient_national_code"] = mask_national_code(data.get("patient_national_code"))
+
+            if not (is_admin or is_owning_approved_doctor):
+                data["private_notes"] = None
+
+            return data
 
     async def list_doctor_visits(
         self,
         doctor_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """Lists visits handled by a specific doctor."""
+        """
+        Lists visits handled by `doctor_id` ONLY for the owning APPROVED doctor,
+        `ADMIN`/`SUPER_ADMIN`, or `SUPPORT` (`F-10`, `T18-AC1..AC3`).
+        """
+        if actor_user_id is None:
+            raise VisitAuthorizationError("Authenticated actor_user_id is required.")
+
+        limit_clamped = max(1, min(int(limit), 100))
+        offset_clamped = max(0, int(offset))
+
         async with self.pool.acquire() as conn:
+            try:
+                actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+            except RbacAccessDeniedError as exc:
+                raise VisitAuthorizationError(str(exc)) from exc
+
+            is_admin = bool(actor_roles & {"ADMIN", "SUPER_ADMIN"})
+            is_support = "SUPPORT" in actor_roles
+
+            doc = await conn.fetchrow(
+                "SELECT id, user_id, verification_status FROM doctors WHERE id = $1",
+                doctor_id,
+            )
+            if not doc:
+                if not (is_admin or is_support):
+                    raise VisitAuthorizationError(
+                        "Access denied: Cannot enumerate doctor visits."
+                    )
+                raise VisitNotFoundError(f"Doctor {doctor_id} not found.")
+
+            is_owning_approved_doctor = (
+                "DOCTOR" in actor_roles
+                and doc["user_id"] == actor_user_id
+                and doc["verification_status"] == "APPROVED"
+            )
+
+            if not (is_admin or is_support or is_owning_approved_doctor):
+                raise VisitAuthorizationError(
+                    "Access denied: You can only list visits for your own APPROVED doctor profile."
+                )
+
             rows = await conn.fetch(
                 """
-                SELECT v.*, ph.first_name as patient_first_name, ph.last_name as patient_last_name
+                SELECT v.*, ph.first_name AS patient_first_name, ph.last_name AS patient_last_name,
+                       ph.national_code AS patient_national_code
                 FROM visits v
                 JOIN plan_holders ph ON v.holder_id = ph.id
                 WHERE v.doctor_id = $1
                 ORDER BY v.visit_date DESC
                 LIMIT $2 OFFSET $3
-                """, doctor_id, limit, offset
+                """,
+                doctor_id,
+                limit_clamped,
+                offset_clamped,
             )
-            return [dict(r) for r in rows]
+
+            results: List[Dict[str, Any]] = []
+            for r in rows:
+                item = dict(r)
+                if not is_admin:
+                    item["patient_national_code"] = mask_national_code(
+                        item.get("patient_national_code")
+                    )
+                if not (is_admin or is_owning_approved_doctor):
+                    item["private_notes"] = None
+                results.append(item)
+            return results
