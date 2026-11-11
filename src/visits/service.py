@@ -1,6 +1,6 @@
 """
 Visits Domain Service (VISIT-001..013, AC-07, AC-08)
-REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5)
+REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5), HC-T25 (D-2 VISIT-009, OPEN-02)
 
 Security & Concurrency Guarantees:
 - Service-boundary authorization via authoritative `user_roles` (`RbacEngine`):
@@ -8,19 +8,25 @@ Security & Concurrency Guarantees:
   * Ordinary doctors are strictly bound to their own `doctors.id` (doctor impersonation -> 403).
   * `ADMIN` / `SUPER_ADMIN` overrides require target doctor APPROVED and record actual
     `actor_user_id`, `actor_role`, and `admin_override=True` in `audit_logs`.
+- Authoritative Server-Derived Discount (`VISIT-009 P0`, `OPEN-02`, `OPEN-18`):
+  * Client-submitted `discount_percent` is NEVER trusted or applied.
+  * Effective rate is resolved atomically on the server from DB `discount_plans.discount_percent`
+    and `doctors.custom_discount_percent`, governed by approved `OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE`
+    (`CUSTOM_FIRST` or `PLAN_FIRST`, fail-closed if unapproved or invalid).
+  * All rates validated in `[0, 100]` using `Decimal`, rounded strictly under approved `OPEN_18`,
+    and persisted with a traceable audit calculation snapshot before any quota consumption.
 - Visit cancellation requires explicit `'visits:cancel'` permission (`ADMIN` / `SUPER_ADMIN`),
   executes an atomic conditional transition (`WHERE status='COMPLETED'`), and restores quota
   at most once (`T18-AC4`).
 - Visit read & listing enforce strict IDOR ownership + `mask_national_code` + redaction of
   `private_notes` from unauthorized / non-owning / support viewers.
-- Atomic `FOR UPDATE` row locking preserves `AC-07` zero-overselling under parallel bursts,
-  and exact `Decimal` arithmetic enforces `OPEN_18_CURRENCY_AND_ROUNDING`.
+- Atomic `FOR UPDATE` row locking preserves `AC-07` zero-overselling under parallel bursts.
 """
 
 import json
 import uuid
 from datetime import datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Dict, List, Set
 
 import asyncpg
@@ -28,6 +34,10 @@ import asyncpg
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.common.pii import mask_national_code
 from src.core.policy import require_approved_policy
+
+ALLOWED_DISCOUNT_PRECEDENCE_MODES = {"CUSTOM_FIRST", "PLAN_FIRST"}
+ALLOWED_ROUNDING_MODES = {"FLOOR", "CEIL", "HALF_UP"}
+MAX_TOMAN_AMOUNT = 10_000_000_000_000
 
 
 class VisitError(Exception):
@@ -67,13 +77,31 @@ def _resolve_actor_role_label(roles: Set[str]) -> str:
     return "USER"
 
 
+def _parse_validated_rate(value: Any, label: str) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise VisitError(f"Invalid boolean type for {label}.")
+    try:
+        dec = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise VisitError(f"Malformed {label} value.") from exc
+    if not dec.is_finite():
+        raise VisitError(f"{label} must be finite.")
+    if dec < Decimal("0") or dec > Decimal("100"):
+        raise VisitError(f"{label} must be between 0 and 100.")
+    return dec.quantize(Decimal("0.01"))
+
+
 def _round_percent_toman(
     total_amount_toman: int,
-    discount_percent: float | Decimal | int,
+    discount_percent: Decimal,
     rounding_policy: Dict[str, Any] | None = None,
 ) -> int:
-    raw = (Decimal(int(total_amount_toman)) * Decimal(str(discount_percent))) / Decimal("100")
-    mode = (rounding_policy or {}).get("rounding_mode", "FLOOR").strip().upper()
+    raw = (Decimal(int(total_amount_toman)) * discount_percent) / Decimal("100")
+    mode = str((rounding_policy or {}).get("rounding_mode", "")).strip().upper()
+    if mode not in ALLOWED_ROUNDING_MODES:
+        raise VisitError(f"Unsupported OPEN_18 rounding_mode '{mode}'.")
     if mode == "FLOOR":
         return int(raw.to_integral_value(rounding=ROUND_FLOOR))
     if mode == "CEIL":
@@ -92,14 +120,16 @@ class VisitService:
         membership_id: uuid.UUID,
         service_title: str,
         total_amount_toman: int,
-        discount_percent: float,
+        discount_percent: float | None = None,
         actor_user_id: uuid.UUID | None = None,
         doctor_id: uuid.UUID | None = None,
         private_notes: str | None = None,
     ) -> Dict[str, Any]:
         """
         Records a medical visit with strict service-boundary actor/doctor authorization,
-        exact Decimal discount calculation, and atomic quota decrement (`AC-07`, `T18-AC1/AC2/AC5`).
+        server-derived Decimal discount calculation (`OPEN_02` + `OPEN_18`), and atomic
+        quota decrement (`AC-07`, `T18-AC1/AC2/AC5`, `T25-AC1..AC4`).
+        Any caller-supplied `discount_percent` is strictly non-authoritative and ignored.
         """
         if actor_user_id is None:
             raise VisitAuthorizationError("Authenticated actor_user_id is required to record visits.")
@@ -107,10 +137,10 @@ class VisitService:
         title_clean = (service_title or "").strip()
         if not title_clean:
             raise VisitError("Service title cannot be empty.")
-        if total_amount_toman < 0:
-            raise VisitError("Total amount cannot be negative.")
-        if discount_percent < 0 or discount_percent > 100:
-            raise VisitError("Discount percent must be between 0 and 100.")
+        if isinstance(total_amount_toman, bool) or not isinstance(total_amount_toman, int):
+            raise VisitError("Total amount must be an integer Toman value.")
+        if total_amount_toman < 0 or total_amount_toman > MAX_TOMAN_AMOUNT:
+            raise VisitError("Total amount is negative or out of bounds.")
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -128,7 +158,7 @@ class VisitService:
 
                 # Resolve and bind target doctor identity authoritatively
                 actor_doc = await conn.fetchrow(
-                    "SELECT id, user_id, verification_status FROM doctors WHERE user_id = $1",
+                    "SELECT id, user_id, verification_status, custom_discount_percent FROM doctors WHERE user_id = $1",
                     actor_user_id,
                 )
 
@@ -137,7 +167,7 @@ class VisitService:
                     if lookup_doc_id is None:
                         raise VisitError("Target doctor_id is required when recording as admin.")
                     target_doc = await conn.fetchrow(
-                        "SELECT id, user_id, verification_status FROM doctors WHERE id = $1",
+                        "SELECT id, user_id, verification_status, custom_discount_percent FROM doctors WHERE id = $1",
                         lookup_doc_id,
                     )
                     if not target_doc:
@@ -147,6 +177,7 @@ class VisitService:
                             f"Target doctor account is in '{target_doc['verification_status']}' status; must be APPROVED."
                         )
                     resolved_doctor_id = target_doc["id"]
+                    doctor_custom_rate_raw = target_doc["custom_discount_percent"]
                     admin_override = target_doc["user_id"] != actor_user_id
                 else:
                     if not actor_doc:
@@ -160,9 +191,13 @@ class VisitService:
                             "Forbidden: Doctor cannot record visits impersonating another doctor_id."
                         )
                     resolved_doctor_id = actor_doc["id"]
+                    doctor_custom_rate_raw = actor_doc["custom_discount_percent"]
                     admin_override = False
 
-                # Policy checks (fail-closed)
+                # Fail-closed policy checks BEFORE any membership lock or quota mutation (T25-AC3)
+                precedence_policy = await require_approved_policy(
+                    conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE"
+                )
                 rounding_policy = await require_approved_policy(
                     conn, "OPEN_18_CURRENCY_AND_ROUNDING"
                 )
@@ -174,19 +209,26 @@ class VisitService:
                         "Private clinical notes are disabled by OPEN-16 policy."
                     )
 
-                # Exact Decimal breakdown per OPEN-18 policy
-                discount_amount = _round_percent_toman(
-                    total_amount_toman, discount_percent, rounding_policy
-                )
-                patient_paid_amount = int(total_amount_toman) - discount_amount
+                precedence = str((precedence_policy or {}).get("precedence") or "").strip().upper()
+                if precedence not in ALLOWED_DISCOUNT_PRECEDENCE_MODES:
+                    raise VisitError(
+                        f"Unsupported OPEN_02 precedence policy '{precedence}'."
+                    )
+                rounding_mode = str((rounding_policy or {}).get("rounding_mode") or "").strip().upper()
+                if rounding_mode not in ALLOWED_ROUNDING_MODES:
+                    raise VisitError(
+                        f"Unsupported OPEN_18 rounding_mode '{rounding_mode}'."
+                    )
 
-                # 1. Lock membership row to verify active status & holder match
+                # 1. Lock membership row and fetch trusted DB discount_plan rate
                 mem = await conn.fetchrow(
                     """
-                    SELECT id, status, end_date, max_visits, remaining_visits, used_visits
-                    FROM memberships
-                    WHERE id = $1 AND holder_id = $2
-                    FOR UPDATE
+                    SELECT m.id, m.status, m.end_date, m.max_visits, m.remaining_visits, m.used_visits,
+                           m.plan_id, dp.discount_percent AS plan_discount_percent
+                    FROM memberships m
+                    JOIN discount_plans dp ON m.plan_id = dp.id
+                    WHERE m.id = $1 AND m.holder_id = $2
+                    FOR UPDATE OF m
                     """,
                     membership_id,
                     holder_id,
@@ -205,6 +247,41 @@ class VisitService:
                         membership_id,
                     )
                     raise MembershipInactiveError("Membership has expired.")
+
+                # Validate DB rates & derive authoritative effective discount BEFORE decrementing quota
+                plan_rate = _parse_validated_rate(
+                    mem["plan_discount_percent"], "plan discount_percent"
+                )
+                doctor_rate = _parse_validated_rate(
+                    doctor_custom_rate_raw, "doctor custom_discount_percent"
+                )
+
+                if precedence == "CUSTOM_FIRST":
+                    if doctor_rate is not None:
+                        effective_rate = doctor_rate
+                        applied_source = "DOCTOR_CUSTOM"
+                    elif plan_rate is not None:
+                        effective_rate = plan_rate
+                        applied_source = "PLAN_DEFAULT"
+                    else:
+                        raise VisitError("No valid server discount rate found for visit.")
+                else:  # PLAN_FIRST
+                    if plan_rate is not None:
+                        effective_rate = plan_rate
+                        applied_source = "PLAN_DEFAULT"
+                    elif doctor_rate is not None:
+                        effective_rate = doctor_rate
+                        applied_source = "DOCTOR_CUSTOM"
+                    else:
+                        raise VisitError("No valid server discount rate found for visit.")
+
+                # Exact Decimal breakdown per OPEN-18 policy (zero float math!)
+                discount_amount = _round_percent_toman(
+                    total_amount_toman, effective_rate, rounding_policy
+                )
+                if discount_amount < 0 or discount_amount > total_amount_toman:
+                    raise VisitError("Calculated discount amount is out of valid bounds.")
+                patient_paid_amount = int(total_amount_toman) - discount_amount
 
                 # 2. Atomic Quota Decrement (AC-07)
                 if mem["max_visits"] is not None:
@@ -235,7 +312,7 @@ class VisitService:
                         membership_id,
                     )
 
-                # 3. Create Visit Record
+                # 3. Create Visit Record using authoritative server-derived effective_rate
                 visit_row = await conn.fetchrow(
                     """
                     INSERT INTO visits (
@@ -253,13 +330,13 @@ class VisitService:
                     membership_id,
                     title_clean,
                     total_amount_toman,
-                    discount_percent,
+                    effective_rate,
                     discount_amount,
                     patient_paid_amount,
                     private_notes,
                 )
 
-                # 4. Authoritative Audit Log (no clinical notes or patient national code!)
+                # 4. Authoritative Audit Log with traceable pricing snapshot (no clinical notes or patient national code!)
                 actor_role = _resolve_actor_role_label(actor_roles)
                 await conn.execute(
                     """
@@ -276,15 +353,28 @@ class VisitService:
                         {
                             "doctor_id": str(resolved_doctor_id),
                             "holder_id": str(holder_id),
+                            "membership_id": str(membership_id),
+                            "plan_id": str(mem["plan_id"]),
                             "total_toman": int(total_amount_toman),
+                            "plan_discount_percent": str(plan_rate) if plan_rate is not None else None,
+                            "doctor_custom_discount_percent": str(doctor_rate) if doctor_rate is not None else None,
+                            "precedence_policy": precedence,
+                            "rounding_mode": rounding_mode,
+                            "applied_source": applied_source,
+                            "effective_discount_percent": str(effective_rate),
                             "discount_toman": int(discount_amount),
+                            "patient_paid_amount_toman": int(patient_paid_amount),
+                            "client_discount_ignored": discount_percent is not None,
                             "admin_override": admin_override,
                         },
                         ensure_ascii=False,
                     ),
                 )
 
-                return dict(visit_row)
+                visit_dict = dict(visit_row)
+                visit_dict["applied_discount_source"] = applied_source
+                visit_dict["discount_precedence_policy"] = precedence
+                return visit_dict
 
     async def cancel_visit(
         self,

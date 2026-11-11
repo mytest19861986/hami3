@@ -1,17 +1,33 @@
 """
 Doctors Network & Public Directory API Endpoints (DOC-001..014, AC-02)
+REMEDIATION: HC-T25 (DOC-012 P0 admin-exclusive custom discount endpoint)
 """
 
 import uuid
+from decimal import Decimal
+from typing import Any, Dict
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
-from src.api.deps import get_db_pool
-from src.doctors.service import DoctorNotFoundError, DoctorService
+from src.api.deps import get_current_user, get_db_pool
+from src.doctors.service import (
+    DoctorAuthorizationError,
+    DoctorError,
+    DoctorNotFoundError,
+    DoctorService,
+)
 from src.reviews.service import DoctorReviewService
 
 router = APIRouter(prefix="/doctors", tags=["Doctors Network"])
+
+
+class UpdateDoctorCustomDiscountSchema(BaseModel):
+    custom_discount_percent: Decimal | None = Field(
+        None, ge=Decimal("0"), le=Decimal("100"), example="35.00"
+    )
+    reason: str = Field(..., min_length=3, max_length=500, example="توافق قرارداد تخفیف اختصاصی مطب")
 
 
 @router.get("")
@@ -50,6 +66,34 @@ async def get_doctor_profile(
         return await doc_svc.get_doctor_by_id(doctor_id)
     except DoctorNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.put("/{doctor_id}/custom-discount")
+async def update_doctor_custom_discount(
+    doctor_id: uuid.UUID,
+    payload: UpdateDoctorCustomDiscountSchema,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Sets or clears a doctor's custom discount percentage strictly for ADMIN / SUPER_ADMIN (`DOC-012 P0`).
+    Doctors, clinic staff, and regular users are rejected with 403 Forbidden.
+    """
+    doc_svc = DoctorService(pool)
+    try:
+        updated = await doc_svc.set_custom_discount_percent(
+            doctor_id=doctor_id,
+            custom_discount_percent=payload.custom_discount_percent,
+            actor_user_id=current_user["id"],
+            reason=payload.reason,
+        )
+        return {"success": True, "doctor": updated}
+    except DoctorAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DoctorNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DoctorError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.get("/{doctor_id}/reviews")
