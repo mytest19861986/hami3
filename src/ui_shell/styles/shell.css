@@ -45,6 +45,18 @@ html, body {
   outline-offset: 2px;
 }
 
+.hc-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Synthetic Demo & OPEN-15 Governance Top Notice Bar */
 .hc-governance-bar {
   background: var(--hc-status-warn-bg);
@@ -180,6 +192,15 @@ html, body {
   gap: 0.35rem;
 }
 
+.hc-drawer-close {
+  align-self: flex-end;
+  border: 1px solid var(--hc-border-subtle);
+  background: var(--hc-surface-bg);
+  color: var(--hc-text-primary);
+  font-family: inherit;
+  cursor: pointer;
+}
+
 /* Interactive Control Bar (State & Role Simulator) */
 .hc-simulator-strip {
   background: var(--hc-surface-card);
@@ -211,19 +232,24 @@ html, body {
 }
 
 .hc-pill-btn {
-  min-height: 36px;
-  padding: 0.3rem 0.7rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0.45rem 0.85rem;
   border-radius: var(--hc-radius-pill);
   border: 1px solid var(--hc-border-subtle);
   background: var(--hc-surface-bg);
   color: var(--hc-text-secondary);
   font-family: inherit;
-  font-size: 0.78rem;
+  font-size: 0.8rem;
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
 }
 
+.hc-pill-btn[aria-checked="true"],
 .hc-pill-btn[aria-pressed="true"] {
   background: var(--hc-brand-primary-strong);
   color: var(--hc-text-inverse);

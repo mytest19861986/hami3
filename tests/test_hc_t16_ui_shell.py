@@ -115,6 +115,36 @@ def test_t16_ac1_ac2_ac3_rtl_responsive_states_and_screenshots(ui_server_url: st
 
                 page.goto(ui_server_url, wait_until="networkidle")
 
+                # Verify D-1 (44px touch targets on .hc-pill-btn), D-2 (narrow aria-live), D-5 (radiogroup/radio)
+                a11y_meta = page.evaluate(
+                    """() => {
+                        const root = document.getElementById('app-root');
+                        const live = document.getElementById('hc-live-status');
+                        const pills = [...document.querySelectorAll('.hc-pill-btn')];
+                        const groups = [...document.querySelectorAll('.hc-pill-group')];
+                        return {
+                            appRootAriaLive: root ? root.getAttribute('aria-live') : null,
+                            liveStatusRole: live ? live.getAttribute('role') : null,
+                            liveStatusPolite: live ? live.getAttribute('aria-live') : null,
+                            groupRoles: groups.map((g) => g.getAttribute('role')),
+                            pillRoles: pills.map((b) => b.getAttribute('role')),
+                            pillHeights: pills.map((b) => b.getBoundingClientRect().height),
+                            pillWidths: pills.map((b) => b.getBoundingClientRect().width),
+                        };
+                    }"""
+                )
+                assert a11y_meta["appRootAriaLive"] is None, "D-2: #app-root must not carry aria-live"
+                assert a11y_meta["liveStatusRole"] == "status"
+                assert a11y_meta["liveStatusPolite"] == "polite"
+                assert a11y_meta["groupRoles"] == ["radiogroup", "radiogroup"]
+                assert len(a11y_meta["pillRoles"]) == 11 and all(r == "radio" for r in a11y_meta["pillRoles"])
+                assert all(h >= 44.0 for h in a11y_meta["pillHeights"]), (
+                    f"D-1 violation: pill touch target < 44px on {vp_name}: {a11y_meta['pillHeights']}"
+                )
+                assert all(w >= 44.0 for w in a11y_meta["pillWidths"]), (
+                    f"D-1 violation: pill width < 44px on {vp_name}: {a11y_meta['pillWidths']}"
+                )
+
                 # Verify RTL & Persian language
                 doc_meta = page.evaluate(
                     """() => ({
@@ -162,13 +192,44 @@ def test_t16_ac1_ac2_ac3_rtl_responsive_states_and_screenshots(ui_server_url: st
                     page.screenshot(path=str(SHOTS_DIR / "tablet_doctors.png"), full_page=True)
 
                 elif vp_name == "mobile":
-                    # Test mobile hamburger menu accessibility & Escape key close
+                    # Test mobile hamburger menu accessibility, focus move, focus trap (D-3), and Escape key close
                     toggle = page.locator("#hc-menu-toggle")
                     assert toggle.is_visible()
                     toggle.click()
                     assert toggle.get_attribute("aria-expanded") == "true"
+                    inside_on_open = page.evaluate(
+                        "() => Boolean(document.activeElement && document.activeElement.closest('#hc-mobile-drawer'))"
+                    )
+                    assert inside_on_open, "D-3: focus must move into #hc-mobile-drawer on open"
+                    for _ in range(15):
+                        page.keyboard.press("Tab")
+                        still_inside = page.evaluate(
+                            "() => Boolean(document.activeElement && document.activeElement.closest('#hc-mobile-drawer'))"
+                        )
+                        assert still_inside, "D-3: Tab escaped mobile drawer focus trap!"
+                    page.keyboard.press("Shift+Tab")
+                    still_inside_shift = page.evaluate(
+                        "() => Boolean(document.activeElement && document.activeElement.closest('#hc-mobile-drawer'))"
+                    )
+                    assert still_inside_shift, "D-3: Shift+Tab escaped mobile drawer focus trap!"
                     page.keyboard.press("Escape")
                     assert toggle.get_attribute("aria-expanded") == "false"
+                    focused_toggle = page.evaluate(
+                        "() => document.activeElement && document.activeElement.id === 'hc-menu-toggle'"
+                    )
+                    assert focused_toggle, "D-3: Escape must restore focus to #hc-menu-toggle"
+
+                    toggle.click()
+                    drawer_close_h = page.evaluate(
+                        "() => document.getElementById('hc-drawer-close').getBoundingClientRect().height"
+                    )
+                    assert drawer_close_h >= 44.0, f"D-1: #hc-drawer-close height {drawer_close_h} < 44"
+                    page.click("#hc-drawer-close")
+                    assert toggle.get_attribute("aria-expanded") == "false"
+                    focused_after_btn = page.evaluate(
+                        "() => document.activeElement && document.activeElement.id === 'hc-menu-toggle'"
+                    )
+                    assert focused_after_btn, "D-3: #hc-drawer-close click must restore focus to #hc-menu-toggle"
 
                     page.evaluate("window.location.hash = '#/home';")
                     page.wait_for_timeout(80)
@@ -178,9 +239,31 @@ def test_t16_ac1_ac2_ac3_rtl_responsive_states_and_screenshots(ui_server_url: st
                     page.wait_for_timeout(80)
                     page.screenshot(path=str(SHOTS_DIR / "mobile_panel_support.png"), full_page=True)
 
-                # Test interactive Doctors filter & detail drawer + Empty filter fallback
+                # Test interactive Doctors filter, detail focus management & restoration (D-4), & Empty filter fallback
                 page.evaluate("window.location.hash = '#/doctors';")
                 page.wait_for_timeout(60)
+                page.click('[data-select-doctor="demo-doc-1"]')
+                page.wait_for_timeout(40)
+                detail_focus_ok = page.evaluate(
+                    "() => Boolean(document.activeElement && (document.activeElement.id === 'hc-doc-detail-heading' || document.activeElement.closest('#hc-doc-detail')))"
+                )
+                assert detail_focus_ok, "D-4: opening doctor detail must move focus into detail region"
+                page.click("#hc-close-doc-detail")
+                page.wait_for_timeout(40)
+                restored_doc_btn = page.evaluate(
+                    "() => document.activeElement && document.activeElement.getAttribute('data-select-doctor') === 'demo-doc-1'"
+                )
+                assert restored_doc_btn, "D-4: closing doctor detail must restore focus to triggering button"
+
+                page.click('[data-select-doctor="demo-doc-1"]')
+                page.wait_for_timeout(40)
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(40)
+                restored_doc_esc = page.evaluate(
+                    "() => document.activeElement && document.activeElement.getAttribute('data-select-doctor') === 'demo-doc-1'"
+                )
+                assert restored_doc_esc, "D-4: Escape in doctor detail must close and restore focus to triggering button"
+
                 page.fill("#hc-doc-search", "دندان")
                 assert "کلینیک آزمایشی سلامت قلب" not in page.locator("#app-root").inner_text()
                 assert "درمانگاه دندانپزشکی نمونه" in page.locator("#app-root").inner_text()
@@ -189,12 +272,20 @@ def test_t16_ac1_ac2_ac3_rtl_responsive_states_and_screenshots(ui_server_url: st
                 page.click("#hc-clear-doc-filter")
                 assert "دکتر الف" in page.locator("#app-root").inner_text()
 
-                # Test all 5 UI state buttons on /panel/user
+                # Test radiogroup arrow-key navigation (D-5) + all 5 UI state buttons on /panel/user
                 page.evaluate("window.location.hash = '#/panel/user';")
                 page.wait_for_timeout(60)
+                page.locator('[data-ui-state="NORMAL"]').focus()
+                page.keyboard.press("ArrowLeft")
+                page.wait_for_timeout(40)
+                assert page.locator('[data-ui-state="LOADING"]').get_attribute("aria-checked") == "true"
+                page.keyboard.press("ArrowRight")
+                page.wait_for_timeout(40)
+                assert page.locator('[data-ui-state="NORMAL"]').get_attribute("aria-checked") == "true"
                 for st in states:
                     page.click(f'[data-ui-state="{st}"]')
                     page.wait_for_timeout(50)
+                    assert page.locator(f'[data-ui-state="{st}"]').get_attribute("aria-checked") == "true"
                     ov = page.evaluate(
                         "() => ({ sw: document.documentElement.scrollWidth, iw: window.innerWidth })"
                     )

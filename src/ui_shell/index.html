@@ -51,7 +51,8 @@
       </button>
     </div>
 
-    <nav id="hc-mobile-drawer" class="hc-mobile-drawer" aria-label="منوی موبایل">
+    <nav id="hc-mobile-drawer" class="hc-mobile-drawer" aria-label="منوی موبایل" aria-hidden="true">
+      <button type="button" id="hc-drawer-close" class="hc-nav-link hc-drawer-close" aria-label="بستن منوی موبایل">بستن منو ✕</button>
       <a href="#/home" class="hc-nav-link" data-nav-route="#/home">صفحه اصلی</a>
       <a href="#/doctors" class="hc-nav-link" data-nav-route="#/doctors">شبکه پزشکان (داده مصنوعی)</a>
       <a href="#/plans" class="hc-nav-link" data-nav-route="#/plans">طرح‌های تخفیف (تومان)</a>
@@ -68,30 +69,32 @@
   <!-- Interactive UI State & 6-Role Panel Switcher (Inspection Only, No Auth Claims) -->
   <section class="hc-simulator-strip" aria-label="ابزار بازبینی وضعیت‌های UI و پنل‌های ۶گانه">
     <div class="hc-container hc-simulator-grid">
-      <div class="hc-pill-group" role="group" aria-label="انتخاب پنل نقش بخش ۲۷">
-        <span class="hc-pill-label">پنل نقش (نمایشی):</span>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/user" aria-pressed="false">USER</button>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/doctor" aria-pressed="false">DOCTOR</button>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/agent" aria-pressed="false">AGENT</button>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/support" aria-pressed="false">SUPPORT</button>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/admin" aria-pressed="false">ADMIN</button>
-        <button type="button" class="hc-pill-btn" data-role-route="#/panel/super-admin" aria-pressed="false">SUPER_ADMIN</button>
+      <div class="hc-pill-group" role="radiogroup" aria-labelledby="hc-role-group-label">
+        <span id="hc-role-group-label" class="hc-pill-label">پنل نقش (نمایشی):</span>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/user" aria-checked="false" tabindex="0">USER</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/doctor" aria-checked="false" tabindex="-1">DOCTOR</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/agent" aria-checked="false" tabindex="-1">AGENT</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/support" aria-checked="false" tabindex="-1">SUPPORT</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/admin" aria-checked="false" tabindex="-1">ADMIN</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/super-admin" aria-checked="false" tabindex="-1">SUPER_ADMIN</button>
       </div>
 
-      <div class="hc-pill-group" role="group" aria-label="پیش‌نمایش وضعیت‌های صفحه">
-        <span class="hc-pill-label">وضعیت UI:</span>
-        <button type="button" class="hc-pill-btn" data-ui-state="NORMAL" aria-pressed="true">عادی</button>
-        <button type="button" class="hc-pill-btn" data-ui-state="LOADING" aria-pressed="false">بارگذاری</button>
-        <button type="button" class="hc-pill-btn" data-ui-state="EMPTY" aria-pressed="false">داده خالی</button>
-        <button type="button" class="hc-pill-btn" data-ui-state="ERROR" aria-pressed="false">خطا</button>
-        <button type="button" class="hc-pill-btn" data-ui-state="DISABLED_GATE" aria-pressed="false">غیرفعال/قفل</button>
+      <div class="hc-pill-group" role="radiogroup" aria-labelledby="hc-state-group-label">
+        <span id="hc-state-group-label" class="hc-pill-label">وضعیت UI:</span>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="NORMAL" aria-checked="true" tabindex="0">عادی</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="LOADING" aria-checked="false" tabindex="-1">بارگذاری</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="EMPTY" aria-checked="false" tabindex="-1">داده خالی</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="ERROR" aria-checked="false" tabindex="-1">خطا</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="DISABLED_GATE" aria-checked="false" tabindex="-1">غیرفعال/قفل</button>
       </div>
     </div>
   </section>
 
+  <div id="hc-live-status" class="hc-sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
   <!-- Main Workspace -->
   <main id="main-content" class="hc-main" tabindex="-1">
-    <div class="hc-container" id="app-root" aria-live="polite">
+    <div class="hc-container" id="app-root">
       <noscript>
         <div class="hc-card">برای مشاهده تعاملی اسکلت فاز ۳، لطفاً جاوااسکریپت مرورگر را فعال نمایید.</div>
       </noscript>

@@ -218,9 +218,9 @@ function renderDoctorsView() {
 
       ${
         detailDoc
-          ? `<div class="hc-card" role="region" aria-label="جزئیات پزشک انتخاب‌شده">
+          ? `<div id="hc-doc-detail" class="hc-card" role="region" aria-labelledby="hc-doc-detail-heading" tabindex="-1">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
-                <h2 style="margin:0;font-size:1.1rem;">جزئیات مرکز: ${escapeHtml(detailDoc.clinic)}</h2>
+                <h2 id="hc-doc-detail-heading" tabindex="-1" style="margin:0;font-size:1.1rem;">جزئیات مرکز: ${escapeHtml(detailDoc.clinic)}</h2>
                 <button type="button" class="hc-btn hc-btn--secondary" id="hc-close-doc-detail">بستن</button>
               </div>
               <p style="color:var(--hc-text-secondary);margin-top:0.5rem;">تخصص: ${escapeHtml(detailDoc.specialty)} | تخفیف نمونه: ${toPersianDigits(detailDoc.discountPercent)}٪ (قاعده نهایی تابع OPEN-02) | تاریخ عضویت شمسی: ${formatJalaliDate(detailDoc.joinedIso)}</p>
@@ -394,6 +394,13 @@ function renderRolePanel(roleKey) {
   `;
 }
 
+function announceStatus(message) {
+  const statusEl = document.getElementById('hc-live-status');
+  if (statusEl) {
+    statusEl.textContent = message;
+  }
+}
+
 function updateActiveNavIndicators() {
   const currentHash = getParsedHash();
   document.querySelectorAll('[data-nav-route]').forEach((el) => {
@@ -406,11 +413,17 @@ function updateActiveNavIndicators() {
   });
 
   document.querySelectorAll('[data-ui-state]').forEach((btn) => {
-    btn.setAttribute('aria-pressed', btn.getAttribute('data-ui-state') === APP_STATE.uiState ? 'true' : 'false');
+    const isChecked = btn.getAttribute('data-ui-state') === APP_STATE.uiState;
+    btn.setAttribute('aria-checked', isChecked ? 'true' : 'false');
+    btn.setAttribute('tabindex', isChecked ? '0' : '-1');
   });
 
-  document.querySelectorAll('[data-role-route]').forEach((btn) => {
-    btn.setAttribute('aria-pressed', btn.getAttribute('data-role-route') === currentHash ? 'true' : 'false');
+  const roleBtns = [...document.querySelectorAll('[data-role-route]')];
+  const anyRoleActive = roleBtns.some((btn) => btn.getAttribute('data-role-route') === currentHash);
+  roleBtns.forEach((btn, idx) => {
+    const isChecked = btn.getAttribute('data-role-route') === currentHash;
+    btn.setAttribute('aria-checked', isChecked ? 'true' : 'false');
+    btn.setAttribute('tabindex', isChecked || (!anyRoleActive && idx === 0) ? '0' : '-1');
   });
 }
 
@@ -425,6 +438,7 @@ function bindViewEvents() {
         restored.focus();
         restored.setSelectionRange(restored.value.length, restored.value.length);
       }
+      announceStatus('فهرست پزشکان بر اساس متن جست‌وجو به‌روزرسانی شد.');
     });
   }
 
@@ -433,6 +447,9 @@ function bindViewEvents() {
     provEl.addEventListener('change', (e) => {
       APP_STATE.docProvince = e.target.value;
       render();
+      const restoredProv = document.getElementById('hc-doc-province');
+      if (restoredProv) restoredProv.focus();
+      announceStatus('فیلتر استان پزشکان به‌روزرسانی شد.');
     });
   }
 
@@ -441,6 +458,9 @@ function bindViewEvents() {
     specEl.addEventListener('change', (e) => {
       APP_STATE.docSpecialty = e.target.value;
       render();
+      const restoredSpec = document.getElementById('hc-doc-specialty');
+      if (restoredSpec) restoredSpec.focus();
+      announceStatus('فیلتر تخصص پزشکان به‌روزرسانی شد.');
     });
   }
 
@@ -451,21 +471,51 @@ function bindViewEvents() {
       APP_STATE.docProvince = '';
       APP_STATE.docSpecialty = '';
       render();
+      const restoredSearch = document.getElementById('hc-doc-search');
+      if (restoredSearch) restoredSearch.focus();
+      announceStatus('فیلترهای پزشکان پاک شدند.');
     });
   }
 
   document.querySelectorAll('[data-select-doctor]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      APP_STATE.selectedDoctorId = btn.getAttribute('data-select-doctor');
+      const docId = btn.getAttribute('data-select-doctor');
+      APP_STATE.selectedDoctorId = docId;
       render();
+      const heading = document.getElementById('hc-doc-detail-heading');
+      const region = document.getElementById('hc-doc-detail');
+      if (heading) {
+        heading.focus();
+        announceStatus(`${heading.textContent} باز شد.`);
+      } else if (region) {
+        region.focus();
+      }
     });
   });
 
+  const closeDetailAndRestore = () => {
+    const prevId = APP_STATE.selectedDoctorId;
+    APP_STATE.selectedDoctorId = null;
+    render();
+    if (prevId) {
+      const trigger = document.querySelector(`[data-select-doctor="${prevId}"]`);
+      if (trigger) trigger.focus();
+    }
+    announceStatus('نمای جزئیات پزشک بسته شد.');
+  };
+
   const closeDocBtn = document.getElementById('hc-close-doc-detail');
   if (closeDocBtn) {
-    closeDocBtn.addEventListener('click', () => {
-      APP_STATE.selectedDoctorId = null;
-      render();
+    closeDocBtn.addEventListener('click', closeDetailAndRestore);
+  }
+
+  const detailRegion = document.getElementById('hc-doc-detail');
+  if (detailRegion) {
+    detailRegion.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeDetailAndRestore();
+      }
     });
   }
 
@@ -473,6 +523,7 @@ function bindViewEvents() {
     btn.addEventListener('click', () => {
       APP_STATE.uiState = btn.getAttribute('data-reset-state') || 'NORMAL';
       render();
+      announceStatus('وضعیت نمایش به حالت عادی بازگشت.');
     });
   });
 }
@@ -517,56 +568,133 @@ export function render() {
   bindViewEvents();
 }
 
+function wireRadiogroup(radios, onActivate) {
+  if (!radios.length) return;
+  radios.forEach((btn, idx) => {
+    btn.addEventListener('click', () => {
+      onActivate(btn);
+    });
+    btn.addEventListener('keydown', (e) => {
+      let nextIdx = null;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+        nextIdx = (idx + 1) % radios.length;
+      } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+        nextIdx = (idx - 1 + radios.length) % radios.length;
+      } else if (e.key === 'Home') {
+        nextIdx = 0;
+      } else if (e.key === 'End') {
+        nextIdx = radios.length - 1;
+      }
+      if (nextIdx !== null) {
+        e.preventDefault();
+        const target = radios[nextIdx];
+        target.focus();
+        onActivate(target);
+      }
+    });
+  });
+}
+
 function initShell() {
   const menuBtn = document.getElementById('hc-menu-toggle');
   const drawer = document.getElementById('hc-mobile-drawer');
+  const drawerCloseBtn = document.getElementById('hc-drawer-close');
+
+  const getDrawerFocusables = () => {
+    if (!drawer) return [];
+    return [...drawer.querySelectorAll('a[href], button:not([disabled])')];
+  };
+
+  const openMobileDrawer = () => {
+    if (!menuBtn || !drawer) return;
+    APP_STATE.mobileMenuOpen = true;
+    drawer.classList.add('is-open');
+    drawer.setAttribute('aria-hidden', 'false');
+    menuBtn.setAttribute('aria-expanded', 'true');
+    const items = getDrawerFocusables();
+    const firstLink = drawer.querySelector('a[href]') || items[0];
+    if (firstLink) firstLink.focus();
+    announceStatus('منوی موبایل باز شد.');
+  };
+
+  const closeMobileDrawer = (restoreFocus = false) => {
+    if (!menuBtn || !drawer) return;
+    APP_STATE.mobileMenuOpen = false;
+    drawer.classList.remove('is-open');
+    drawer.setAttribute('aria-hidden', 'true');
+    menuBtn.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) menuBtn.focus();
+    announceStatus('منوی موبایل بسته شد.');
+  };
 
   if (menuBtn && drawer) {
     menuBtn.addEventListener('click', () => {
-      APP_STATE.mobileMenuOpen = !APP_STATE.mobileMenuOpen;
-      drawer.classList.toggle('is-open', APP_STATE.mobileMenuOpen);
-      menuBtn.setAttribute('aria-expanded', APP_STATE.mobileMenuOpen ? 'true' : 'false');
+      if (APP_STATE.mobileMenuOpen) {
+        closeMobileDrawer(true);
+      } else {
+        openMobileDrawer();
+      }
     });
+
+    if (drawerCloseBtn) {
+      drawerCloseBtn.addEventListener('click', () => {
+        closeMobileDrawer(true);
+      });
+    }
 
     drawer.addEventListener('click', (e) => {
       if (e.target.closest('a')) {
-        APP_STATE.mobileMenuOpen = false;
-        drawer.classList.remove('is-open');
-        menuBtn.setAttribute('aria-expanded', 'false');
+        closeMobileDrawer(false);
       }
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && APP_STATE.mobileMenuOpen) {
-        APP_STATE.mobileMenuOpen = false;
-        drawer.classList.remove('is-open');
-        menuBtn.setAttribute('aria-expanded', 'false');
-        menuBtn.focus();
+      if (!APP_STATE.mobileMenuOpen) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMobileDrawer(true);
+        return;
+      }
+      if (e.key === 'Tab') {
+        const focusables = getDrawerFocusables();
+        if (!focusables.length) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const activeIdx = focusables.indexOf(document.activeElement);
+        e.preventDefault();
+        if (activeIdx === -1) {
+          first.focus();
+        } else if (e.shiftKey) {
+          (activeIdx === 0 ? last : focusables[activeIdx - 1]).focus();
+        } else {
+          (activeIdx === focusables.length - 1 ? first : focusables[activeIdx + 1]).focus();
+        }
       }
     });
   }
 
-  document.querySelectorAll('[data-ui-state]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const next = btn.getAttribute('data-ui-state');
-      if (VALID_STATES.includes(next)) {
-        APP_STATE.uiState = next;
-        render();
-      }
-    });
+  wireRadiogroup([...document.querySelectorAll('[data-ui-state]')], (btn) => {
+    const next = btn.getAttribute('data-ui-state');
+    if (VALID_STATES.includes(next)) {
+      APP_STATE.uiState = next;
+      render();
+      announceStatus(`وضعیت پیش‌نمایش روی «${btn.textContent.trim()}» تنظیم شد.`);
+    }
   });
 
-  document.querySelectorAll('[data-role-route]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const nextRoute = btn.getAttribute('data-role-route');
-      if (nextRoute) {
-        APP_STATE.uiState = 'NORMAL';
-        setRoute(nextRoute);
-      }
-    });
+  wireRadiogroup([...document.querySelectorAll('[data-role-route]')], (btn) => {
+    const nextRoute = btn.getAttribute('data-role-route');
+    if (nextRoute) {
+      APP_STATE.uiState = 'NORMAL';
+      setRoute(nextRoute);
+      announceStatus(`پنل نقش ${btn.textContent.trim()} نمایش داده شد.`);
+    }
   });
 
-  window.addEventListener('hashchange', render);
+  window.addEventListener('hashchange', () => {
+    render();
+    announceStatus(`مسیر صفحه به ${getParsedHash()} تغییر یافت.`);
+  });
   render();
 }
 
