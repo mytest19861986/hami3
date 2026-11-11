@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncpg  # noqa: E402
 
+from src.adapters.payment import MockPaymentGateway  # noqa: E402
 from src.core.policy import PolicyNotApprovedError, set_policy_approval  # noqa: E402
+from src.payments.service import PaymentService  # noqa: E402
 from src.sales.service import (  # noqa: E402
     AgentNotApprovedError,
     InvalidStateTransitionError,
@@ -252,7 +254,41 @@ async def test_financial_finalization_and_commission_credit(pool: asyncpg.Pool):
         await set_policy_approval(conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER", "APPROVED")
         await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
 
-    # 2. Finalize financial status
+    # 1c. Even with OPEN-03 & OPEN-18 approved, UNPAID sales case MUST NOT finalize (D-1 / SALE-009)
+    unpaid_blocked = False
+    try:
+        await sales_svc.finalize_financial_status(case_id=case_id, actor_user_id=admin_user_id)
+    except InvalidStateTransitionError:
+        unpaid_blocked = True
+    assert unpaid_blocked, "UNPAID sales case was allowed to finalize without payment!"
+    print("  ✓ Guard PASS: UNPAID sales case rejected even with approved policies (D-1).")
+
+    # 1d. Record verified payment via trusted gateway (UNPAID -> PAYMENT_RECORDED)
+    pay_svc = PaymentService(pool)
+    gateway = MockPaymentGateway(require_explicit_confirmation=True)
+    order = await pay_svc.create_order(
+        buyer_user_id=agent_user_id,
+        holder_id=holder["id"],
+        plan_id=plan["id"],
+        idempotency_key=f"SALES-T24-{uuid.uuid4().hex}",
+        sales_case_id=case_id,
+    )
+    init_res = await pay_svc.initiate_gateway_payment(
+        order_id=order["id"],
+        actor_user_id=agent_user_id,
+        callback_url="https://hamicard.local/cb",
+        gateway=gateway,
+    )
+    gateway.confirm_payment(init_res["authority"])
+    verify_res = await pay_svc.verify_and_fulfill_payment(
+        order_id=order["id"],
+        actor_user_id=agent_user_id,
+        gateway=gateway,
+        authority=init_res["authority"],
+    )
+    assert verify_res["sales_case"]["financial_status"] == "PAYMENT_RECORDED"
+
+    # 2. Finalize financial status after verified payment
     final_res = await sales_svc.finalize_financial_status(case_id=case_id, actor_user_id=admin_user_id)
     assert final_res["case"]["financial_status"] == "FINALIZED"
     assert final_res["commission_amount_toman"] == 400000
