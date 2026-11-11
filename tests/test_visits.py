@@ -338,6 +338,7 @@ async def main():
         assert blocked_visit, "record_visit must fail closed while OPEN-18/OPEN-16 are PROPOSED"
 
         async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE", "APPROVED")
             await set_policy_approval(conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY", "APPROVED")
             await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "APPROVED")
             await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
@@ -349,6 +350,7 @@ async def main():
         print("\nALL 4 MEDICAL VISITS & QUOTA TESTS PASSED!")
     finally:
         async with pool.acquire() as conn:
+            await set_policy_approval(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE", "PROPOSED")
             await set_policy_approval(conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY", "PROPOSED")
             await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "PROPOSED")
             await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "PROPOSED")

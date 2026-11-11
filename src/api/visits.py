@@ -1,9 +1,11 @@
 """
 Visits API Endpoints (VISIT-001..013, AC-07, AC-08)
-REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5)
+REMEDIATION: HC-T18 (F-08, F-09, F-10 HIGH, T18-AC1..AC5), HC-T25 (D-2 VISIT-009, OPEN-02)
 
 Guarantees:
 - Derives/validates doctor identity from authenticated actor (`doctor_id` spoofing -> 403).
+- Derives effective discount percentage on the server from DB plan/doctor rates & OPEN-02 precedence;
+  client-supplied `discount_percent` is non-authoritative and ignored.
 - Visit cancellation requires explicit `visits:cancel` RBAC permission at API & service boundaries.
 - Detail & doctor listing endpoints enforce strict ownership / privacy filtering and PII masking.
 """
@@ -36,7 +38,11 @@ class RecordVisitSchema(BaseModel):
     membership_id: uuid.UUID = Field(..., example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
     service_title: str = Field(..., min_length=2, max_length=255, example="ویزیت تخصصی قلب و عروق")
     total_amount_toman: int = Field(..., ge=0, example=450000)
-    discount_percent: float = Field(..., ge=0, le=100, example=30.0)
+    discount_percent: float | None = Field(
+        None,
+        description="Deprecated client-side hint ignored by server-derived discount engine (VISIT-009).",
+        example=30.0,
+    )
     private_notes: str | None = Field(None, example="معاینه و نوار قلب انجام شد")
 
 

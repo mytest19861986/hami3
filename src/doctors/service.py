@@ -1,18 +1,30 @@
 """
 Doctor Domain Service (DOC-001..014, AC-02)
+REMEDIATION: HC-T25 (DOC-012 P0 admin-exclusive custom discount control)
+
 Handles doctor profile registration, admin approval lifecycle,
-fail-closed operational status, public directory search, and contracts.
+fail-closed operational status, public directory search, contracts,
+and strictly admin-controlled custom discount percent overrides.
 """
 
+import json
 import uuid
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List
 
 import asyncpg
 
+from src.auth.rbac import RbacAccessDeniedError, RbacEngine
+
 
 class DoctorError(Exception):
     """Base exception for doctor domain errors."""
+    pass
+
+
+class DoctorAuthorizationError(DoctorError):
+    """Raised when actor lacks ADMIN / SUPER_ADMIN authorization for doctor mutations."""
     pass
 
 
@@ -34,6 +46,7 @@ class DoctorVerificationError(DoctorError):
 class DoctorService:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
+        self.rbac = RbacEngine(pool)
 
     async def register_doctor(
         self,
@@ -74,13 +87,15 @@ class DoctorService:
             if not city_row or city_row["province_id"] != province_id:
                 raise DoctorError(f"City {city_id} does not belong to province {province_id}.")
 
+            # DOC-012 P0: Self-registration never grants an unapproved custom discount rate;
+            # custom_discount_percent may only be assigned by authorized administrators.
             row = await conn.fetchrow(
                 """
                 INSERT INTO doctors (
                     user_id, medical_council_code, specialty, clinic_name,
                     province_id, city_id, clinic_address, clinic_phone,
                     custom_discount_percent, verification_status, is_public_listed
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING', FALSE)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, 'PENDING', FALSE)
                 RETURNING id, user_id, medical_council_code, specialty, clinic_name,
                           province_id, city_id, clinic_address, clinic_phone,
                           custom_discount_percent, verification_status, is_public_listed,
@@ -88,7 +103,6 @@ class DoctorService:
                 """,
                 user_id, code_clean, specialty.strip(), clinic_name.strip(),
                 province_id, city_id, clinic_address.strip(), clinic_phone.strip(),
-                custom_discount_percent
             )
             return dict(row)
 
@@ -312,6 +326,108 @@ class DoctorService:
                 "offset": offset,
                 "items": [dict(r) for r in items]
             }
+
+    async def set_custom_discount_percent(
+        self,
+        doctor_id: uuid.UUID,
+        custom_discount_percent: Decimal | float | int | str | None,
+        actor_user_id: uuid.UUID | None,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """
+        Sets or clears a doctor's `custom_discount_percent` strictly for ADMIN / SUPER_ADMIN (`DOC-012 P0`).
+        Enforces exact Decimal range [0, 100] and records old/new audit trail.
+        """
+        if actor_user_id is None:
+            raise DoctorAuthorizationError("Authenticated actor_user_id is required.")
+
+        reason_clean = (reason or "").strip()
+        if len(reason_clean) < 3:
+            raise DoctorError("Reason for updating custom discount percent must be at least 3 characters.")
+
+        parsed_rate: Decimal | None
+        if custom_discount_percent is None:
+            parsed_rate = None
+        else:
+            if isinstance(custom_discount_percent, bool):
+                raise DoctorError("Invalid custom_discount_percent type.")
+            try:
+                parsed_rate = Decimal(str(custom_discount_percent))
+            except (InvalidOperation, ValueError) as exc:
+                raise DoctorError("custom_discount_percent must be a valid decimal number.") from exc
+            if not parsed_rate.is_finite():
+                raise DoctorError("custom_discount_percent must be finite.")
+            if parsed_rate < Decimal("0") or parsed_rate > Decimal("100"):
+                raise DoctorError("custom_discount_percent must be within 0 to 100.")
+            parsed_rate = parsed_rate.quantize(Decimal("0.01"))
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+                except RbacAccessDeniedError as exc:
+                    raise DoctorAuthorizationError(str(exc)) from exc
+
+                if not (actor_roles & {"ADMIN", "SUPER_ADMIN"}):
+                    raise DoctorAuthorizationError(
+                        "Only ADMIN or SUPER_ADMIN may modify doctor custom discount rates (DOC-012)."
+                    )
+
+                existing = await conn.fetchrow(
+                    "SELECT id, custom_discount_percent FROM doctors WHERE id = $1 FOR UPDATE",
+                    doctor_id,
+                )
+                if not existing:
+                    raise DoctorNotFoundError(f"Doctor {doctor_id} not found.")
+
+                old_val = existing["custom_discount_percent"]
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE doctors
+                    SET custom_discount_percent = $1,
+                        updated_at = NOW()
+                    WHERE id = $2
+                    RETURNING id, user_id, medical_council_code, specialty, clinic_name,
+                              custom_discount_percent, verification_status, is_public_listed,
+                              updated_at
+                    """,
+                    parsed_rate,
+                    doctor_id,
+                )
+
+                actor_role = "SUPER_ADMIN" if "SUPER_ADMIN" in actor_roles else "ADMIN"
+                await conn.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        actor_user_id, actor_role, action, entity_name, entity_id,
+                        old_values, new_values
+                    ) VALUES (
+                        $1, $2, 'DOCTOR_CUSTOM_DISCOUNT_UPDATED', 'doctors', $3::varchar,
+                        $4::jsonb, $5::jsonb
+                    )
+                    """,
+                    actor_user_id,
+                    actor_role,
+                    str(doctor_id),
+                    json.dumps(
+                        {
+                            "custom_discount_percent": str(old_val)
+                            if old_val is not None
+                            else None
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "custom_discount_percent": str(parsed_rate)
+                            if parsed_rate is not None
+                            else None,
+                            "reason": reason_clean,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+                return dict(updated)
 
     async def create_service_contract(
         self,

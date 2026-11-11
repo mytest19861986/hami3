@@ -29,6 +29,10 @@ from src.auth.session_service import SessionService  # noqa: E402
 from src.core.policy import set_policy_approval  # noqa: E402
 
 DEFAULT_POLICIES = {
+    "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE": {
+        "precedence": "CUSTOM_FIRST",
+        "description": "در صورت وجود تخفیف اختصاصی پزشک، آن اعمال میشود؛ در غیر این صورت درصد طرح",
+    },
     "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY": {"restore_quota": True, "refund_requires_reason": True},
     "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT": {"store_diagnosis": False, "store_full_emr": False, "allow_private_notes": True},
     "OPEN_18_CURRENCY_AND_ROUNDING": {"currency_stored": "TOMAN", "currency_display": "TOMAN", "rounding_mode": "FLOOR"},
@@ -139,6 +143,7 @@ async def _create_patient_membership(pool: asyncpg.Pool, buyer_user_id: uuid.UUI
 @pytest.mark.asyncio
 async def test_t18_ac1_ac2_doctor_impersonation_and_unapproved_status_blocked(db_pool: asyncpg.Pool):
     async with db_pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE", "APPROVED")
         await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "APPROVED")
         await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
 
@@ -150,6 +155,7 @@ async def test_t18_ac1_ac2_doctor_impersonation_and_unapproved_status_blocked(db
 
     async with db_pool.acquire() as conn:
         doc_a_id = await _create_doctor_row(conn, doc_a_uid, "APPROVED")
+        await conn.execute("UPDATE doctors SET custom_discount_percent = 29.00 WHERE id = $1;", doc_a_id)
         doc_b_id = await _create_doctor_row(conn, doc_b_uid, "APPROVED")
         doc_susp_id = await _create_doctor_row(conn, doc_susp_uid, "SUSPENDED")
 
@@ -254,6 +260,7 @@ async def test_t18_ac1_ac2_doctor_impersonation_and_unapproved_status_blocked(db
 @pytest.mark.asyncio
 async def test_t18_ac3_ac4_visit_idor_privacy_and_idempotent_cancellation(db_pool: asyncpg.Pool):
     async with db_pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE", "APPROVED")
         await set_policy_approval(conn, "OPEN_07_VISIT_CANCELLATION_REFUND_POLICY", "APPROVED")
         await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "APPROVED")
         await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
@@ -361,6 +368,7 @@ async def test_t18_ac3_ac4_visit_idor_privacy_and_idempotent_cancellation(db_poo
 @pytest.mark.asyncio
 async def test_t18_ac5_parallel_quota_consumption_preserves_ac07_invariant(db_pool: asyncpg.Pool):
     async with db_pool.acquire() as conn:
+        await set_policy_approval(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE", "APPROVED")
         await set_policy_approval(conn, "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT", "APPROVED")
         await set_policy_approval(conn, "OPEN_18_CURRENCY_AND_ROUNDING", "APPROVED")
 
