@@ -11,7 +11,20 @@ from typing import Any, Dict
 
 import httpx
 
+from src.core.env import (
+    EnvironmentConfigurationError,
+    is_restricted_environment,
+    resolve_runtime_environment,
+)
+
 logger = logging.getLogger("hamicard.adapters.sms")
+
+
+def _is_restricted_sms_env() -> bool:
+    try:
+        return is_restricted_environment()
+    except EnvironmentConfigurationError as exc:
+        raise SmsAdapterError(str(exc)) from exc
 
 
 class SmsAdapterError(Exception):
@@ -43,9 +56,11 @@ class MockSmsAdapter(BaseSmsAdapter):
         self.sent_messages: list[Dict[str, Any]] = []
 
     async def send_otp(self, mobile: str, code: str, template: str | None = None) -> bool:
-        env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").lower().strip()
-        if env == "production":
-            raise SmsAdapterError("Fail-Closed: MockSmsAdapter cannot be used in production.")
+        if _is_restricted_sms_env():
+            env_name = resolve_runtime_environment()
+            raise SmsAdapterError(
+                f"Fail-Closed: MockSmsAdapter cannot be used in restricted {env_name} (production/staging) environment."
+            )
         record = {
             "type": "OTP",
             "mobile": mobile,
@@ -169,16 +184,23 @@ class GhasedakSmsAdapter(BaseSmsAdapter):
 
 
 def get_sms_adapter(provider_name: str | None = None) -> BaseSmsAdapter:
-    """Factory resolver for configured SMS provider (fail-closed in production)."""
+    """Factory resolver for configured SMS provider (fail-closed in production/staging)."""
+    is_restricted = _is_restricted_sms_env()
     provider = (provider_name or os.getenv("SMS_PROVIDER", "mock")).lower().strip()
-    env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").lower().strip()
     if provider == "kavenegar":
-        return KavenegarSmsAdapter()
+        adapter = KavenegarSmsAdapter()
+        if is_restricted and not adapter.api_key:
+            raise SmsAdapterError("KAVENEGAR_API_KEY must be configured in production/staging.")
+        return adapter
     elif provider == "ghasedak":
-        return GhasedakSmsAdapter()
-    elif env == "production":
+        adapter = GhasedakSmsAdapter()
+        if is_restricted and not adapter.api_key:
+            raise SmsAdapterError("GHASEDAK_API_KEY must be configured in production/staging.")
+        return adapter
+    elif is_restricted:
+        env_name = resolve_runtime_environment()
         raise SmsAdapterError(
-            f"Fail-Closed: Unconfigured or mock SMS provider '{provider}' prohibited in production."
+            f"Fail-Closed: Unconfigured or mock SMS provider '{provider}' prohibited in restricted {env_name} (production/staging) environment."
         )
     else:
         return MockSmsAdapter()

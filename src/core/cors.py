@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import PlainTextResponse, Response
 
+from src.core.env import EnvironmentConfigurationError, is_restricted_environment
+
 DEV_DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -38,11 +40,10 @@ class CorsConfigurationError(ValueError):
 
 
 def is_production_environment() -> bool:
-    for var in ("APP_ENV", "ENVIRONMENT", "NODE_ENV"):
-        val = os.getenv(var, "").strip().lower()
-        if val in ("production", "prod", "staging"):
-            return True
-    return False
+    try:
+        return is_restricted_environment()
+    except EnvironmentConfigurationError as exc:
+        raise CorsConfigurationError(str(exc)) from exc
 
 
 def _parse_bool_env(var_name: str, default: bool) -> bool:

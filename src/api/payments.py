@@ -40,7 +40,13 @@ router = APIRouter(prefix="/payments", tags=["Payments & Orders"])
 
 def get_payment_gateway_dep() -> BasePaymentGateway:
     """FastAPI dependency returning active fail-closed payment gateway adapter."""
-    return get_runtime_payment_gateway()
+    try:
+        return get_runtime_payment_gateway()
+    except PaymentGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 class CreateOrderSchema(BaseModel):

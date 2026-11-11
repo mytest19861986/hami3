@@ -13,13 +13,16 @@ Guarantees:
 - Zero test-only OTP backdoors in production code; zero plaintext OTP/secrets in logs
 """
 
-import os
 import re
 from typing import Tuple
 
 import redis
 
 from src.adapters.sms import BaseSmsAdapter, MockSmsAdapter, SmsAdapterError, get_sms_adapter
+from src.core.env import (
+    EnvironmentConfigurationError,
+    is_restricted_environment,
+)
 from src.core.security import generate_otp_code
 
 
@@ -87,8 +90,10 @@ def normalize_iranian_mobile(mobile: str) -> str:
 
 
 def _is_production_env() -> bool:
-    env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").lower().strip()
-    return env == "production"
+    try:
+        return is_restricted_environment()
+    except EnvironmentConfigurationError as exc:
+        raise SmsDeliveryError(str(exc)) from exc
 
 
 class OtpService:
@@ -99,7 +104,13 @@ class OtpService:
         sms_provider_healthy: bool = True,
     ):
         self.r = redis_client
-        self.sms_adapter = sms_adapter or get_sms_adapter()
+        if sms_adapter is not None:
+            self.sms_adapter = sms_adapter
+        else:
+            try:
+                self.sms_adapter = get_sms_adapter()
+            except SmsAdapterError as exc:
+                raise SmsDeliveryError(str(exc)) from exc
         self.sms_healthy = sms_provider_healthy
         self._verify_script = self.r.register_script(_ATOMIC_OTP_VERIFY_LUA)
 

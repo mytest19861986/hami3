@@ -6,10 +6,12 @@ Baseline: BL-HAMICARD-PRD-V1
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from src.adapters.payment import PaymentGatewayError
+from src.adapters.sms import SmsAdapterError
 from src.api.auth import router as auth_router
 from src.api.cards import router as cards_router
 from src.api.content import router as content_router
@@ -26,7 +28,9 @@ from src.api.sales import router as sales_router
 from src.api.visits import router as visits_router
 from src.api.wallets import router as wallets_router
 from src.core.cors import StrictCORSMiddleware, resolve_cors_settings
+from src.core.env import EnvironmentConfigurationError
 from src.core.settings import load_and_validate_settings
+from src.wallets.service import PayoutAdapterConfigurationError
 
 
 @asynccontextmanager
@@ -57,6 +61,13 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    @application.exception_handler(EnvironmentConfigurationError)
+    @application.exception_handler(PaymentGatewayError)
+    @application.exception_handler(PayoutAdapterConfigurationError)
+    @application.exception_handler(SmsAdapterError)
+    async def fail_closed_runtime_config_handler(request: Request, exc: Exception):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     # Environment-controlled fail-closed CORS configuration (M-1 / HC-T26)
     application.add_middleware(

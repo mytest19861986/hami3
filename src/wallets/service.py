@@ -17,7 +17,6 @@ Guarantees:
 
 import hashlib
 import json
-import os
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ import asyncpg
 
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.common.pii import mask_card_number, mask_shaba
+from src.core.env import EnvironmentConfigurationError, is_restricted_environment
 from src.core.policy import PolicyNotApprovedError, require_approved_policy  # noqa: F401
 
 VALID_SETTLEMENT_STATUSES = (
@@ -41,9 +41,10 @@ VALID_SETTLEMENT_STATUSES = (
 
 
 def _is_production_env() -> bool:
-    app_env = os.getenv("APP_ENV", "").strip().lower()
-    node_env = os.getenv("NODE_ENV", "").strip().lower()
-    return app_env == "production" or node_env == "production"
+    try:
+        return is_restricted_environment()
+    except EnvironmentConfigurationError as exc:
+        raise PayoutAdapterConfigurationError(str(exc)) from exc
 
 
 def _resolve_actor_role_label(roles: Set[str]) -> str:
@@ -183,7 +184,7 @@ class SandboxPayoutProofVerifier(BasePayoutProofVerifier):
     def __init__(self) -> None:
         if _is_production_env():
             raise PayoutAdapterConfigurationError(
-                "SandboxPayoutProofVerifier is strictly forbidden in production."
+                "SandboxPayoutProofVerifier is strictly forbidden in production/staging."
             )
         self._verified_payouts: Dict[str, Dict[str, Any]] = {}
 
@@ -199,7 +200,7 @@ class SandboxPayoutProofVerifier(BasePayoutProofVerifier):
     ) -> Dict[str, Any]:
         if _is_production_env():
             raise PayoutAdapterConfigurationError(
-                "Sandbox payout registration is strictly forbidden in production."
+                "Sandbox payout registration is strictly forbidden in production/staging."
             )
         ref_clean = (external_payment_ref or "").strip()
         if len(ref_clean) < 6:
@@ -231,7 +232,7 @@ class SandboxPayoutProofVerifier(BasePayoutProofVerifier):
     ) -> PayoutVerificationResult:
         if _is_production_env():
             raise PayoutAdapterConfigurationError(
-                "SandboxPayoutProofVerifier cannot verify payouts in production."
+                "SandboxPayoutProofVerifier cannot verify payouts in production/staging."
             )
         ref_clean = (external_payment_ref or "").strip()
         sheba_clean = (destination_sheba or "").replace(" ", "").strip().upper()
@@ -333,7 +334,7 @@ def get_runtime_payout_verifier() -> BasePayoutProofVerifier:
     global _sandbox_payout_verifier
     if _is_production_env():
         raise PayoutAdapterConfigurationError(
-            "Sandbox payout verifier is disabled in production; configure an authoritative bank reconciliation verifier."
+            "Sandbox payout verifier is disabled in production/staging; configure an authoritative bank reconciliation verifier."
         )
     if _sandbox_payout_verifier is None:
         _sandbox_payout_verifier = SandboxPayoutProofVerifier()

@@ -31,7 +31,11 @@ import asyncpg
 
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.common.pii import mask_national_code, mask_phone
-from src.core.policy import require_approved_policy
+from src.core.policy import (
+    InvalidPolicyConfigurationError,
+    parse_open03_agent_sale_policy,
+    require_approved_policy,
+)
 from src.wallets.service import WalletService
 
 ALLOWED_LOGISTIC_TRANSITIONS: Dict[str, Set[str]] = {
@@ -387,6 +391,10 @@ class SalesCaseService:
                 open03 = await require_approved_policy(
                     conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
                 )
+                try:
+                    _trigger, auto_activate_membership = parse_open03_agent_sale_policy(open03)
+                except InvalidPolicyConfigurationError as exc:
+                    raise InvalidStateTransitionError(str(exc)) from exc
 
                 allowed_roles = (
                     set(perm_policy.get("record_sale_payment", ["ADMIN", "SUPER_ADMIN"]))
@@ -487,7 +495,7 @@ class SalesCaseService:
                     ) from exc
 
                 mem_row = None
-                if bool(open03.get("auto_activate_membership", True)):
+                if auto_activate_membership:
                     start_date = datetime.now(UTC)
                     end_date = start_date + timedelta(days=int(case["validity_days"]))
                     mem_row = await conn.fetchrow(
@@ -591,6 +599,10 @@ class SalesCaseService:
                 open03 = await require_approved_policy(
                     conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
                 )
+                try:
+                    trigger, _auto_activate_membership = parse_open03_agent_sale_policy(open03)
+                except InvalidPolicyConfigurationError as exc:
+                    raise InvalidStateTransitionError(str(exc)) from exc
                 rounding_policy = await require_approved_policy(
                     conn, "OPEN_18_CURRENCY_AND_ROUNDING"
                 )
@@ -665,7 +677,6 @@ class SalesCaseService:
                         "Linked payment order lacks verified payment proof or verifier metadata."
                     )
 
-                trigger = str(open03.get("trigger") or "").strip().upper()
                 allowed_logistics = ALLOWED_FINALIZATION_TRIGGERS.get(trigger)
                 if allowed_logistics is None:
                     raise InvalidStateTransitionError(

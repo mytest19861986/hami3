@@ -26,6 +26,56 @@ class PolicyError(Exception):
     pass
 
 
+class InvalidPolicyConfigurationError(PolicyError):
+    """Raised when an approved policy payload omits required fields or violates schema types."""
+    pass
+
+
+VALID_OPEN03_FINALIZATION_TRIGGERS = (
+    "PAYMENT_RECORDED_AND_CASE_APPROVED",
+    "PAYMENT_RECORDED_AND_CARD_ISSUED",
+    "PAYMENT_RECORDED_AND_DELIVERED",
+)
+
+
+def parse_open03_agent_sale_policy(policy_payload: Dict[str, Any] | None) -> tuple[str, bool]:
+    """
+    Strictly parses `OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER` without implicit boolean defaults.
+    Requires:
+    - dict payload
+    - recognized non-empty string `trigger` in `VALID_OPEN03_FINALIZATION_TRIGGERS`
+    - explicit strict boolean `auto_activate_membership` (`True` or `False`; rejects missing/None/str/int)
+    """
+    if not isinstance(policy_payload, dict):
+        raise InvalidPolicyConfigurationError(
+            "Invalid OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER configuration: expected JSON object."
+        )
+
+    raw_trigger = policy_payload.get("trigger")
+    if not isinstance(raw_trigger, str) or not raw_trigger.strip():
+        raise InvalidPolicyConfigurationError(
+            "Invalid OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER configuration: missing or invalid 'trigger'."
+        )
+    trigger_clean = raw_trigger.strip().upper()
+    if trigger_clean not in VALID_OPEN03_FINALIZATION_TRIGGERS:
+        raise InvalidPolicyConfigurationError(
+            f"Unsupported OPEN_03 finalization trigger '{trigger_clean}'."
+        )
+
+    if "auto_activate_membership" not in policy_payload:
+        raise InvalidPolicyConfigurationError(
+            "Invalid OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER configuration: explicit boolean 'auto_activate_membership' is required."
+        )
+
+    auto_activate = policy_payload["auto_activate_membership"]
+    if type(auto_activate) is not bool:
+        raise InvalidPolicyConfigurationError(
+            f"Invalid OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER configuration: 'auto_activate_membership' must be a strict boolean, got {type(auto_activate).__name__}."
+        )
+
+    return trigger_clean, auto_activate
+
+
 class PolicyNotApprovedError(PolicyError):
     """Raised when an operation depends on an OPEN-* policy not yet APPROVED."""
 

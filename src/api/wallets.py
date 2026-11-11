@@ -51,9 +51,15 @@ router = APIRouter(prefix="/wallet", tags=["Wallet & Settlements"])
 
 def get_payout_verifier_dep() -> BasePayoutProofVerifier | None:
     """FastAPI dependency returning active fail-closed external payout proof verifier."""
-    if _is_production_env():
-        return None
-    return get_runtime_payout_verifier()
+    try:
+        if _is_production_env():
+            return None
+        return get_runtime_payout_verifier()
+    except PayoutAdapterConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 class SettlementRequestSchema(BaseModel):

@@ -33,7 +33,11 @@ import asyncpg
 from src.adapters.payment import BasePaymentGateway, PaymentGatewayError
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.common.pii import mask_national_code, mask_phone
-from src.core.policy import require_approved_policy
+from src.core.policy import (
+    InvalidPolicyConfigurationError,
+    parse_open03_agent_sale_policy,
+    require_approved_policy,
+)
 from src.wallets.service import WalletService
 
 ALLOWED_PAYMENT_METHODS = ("GATEWAY", "MANUAL_CARD", "ADMIN_GRANT", "WALLET")
@@ -435,12 +439,19 @@ class PaymentService:
                 "Payment transaction or tracking reference has already been used for another order."
             )
 
+        should_activate_membership = True
         locked_sales_case = None
         if sales_case_id is not None:
             if open03_policy is None:
                 open03_policy = await require_approved_policy(
                     conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
                 )
+            try:
+                _trigger, should_activate_membership = parse_open03_agent_sale_policy(
+                    open03_policy
+                )
+            except InvalidPolicyConfigurationError as exc:
+                raise InvalidPaymentStateError(str(exc)) from exc
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1));",
                 f"sale_pay:{sales_case_id}",
@@ -505,10 +516,6 @@ class PaymentService:
         )
         if not updated_order:
             raise InvalidPaymentStateError("Order status changed concurrently; cannot fulfill.")
-
-        should_activate_membership = True
-        if sales_case_id is not None and open03_policy is not None:
-            should_activate_membership = bool(open03_policy.get("auto_activate_membership", True))
 
         mem_dict = None
         if should_activate_membership:
@@ -771,6 +778,12 @@ class PaymentService:
                         f"Payment method '{order['payment_method']}' requires manual/authorized flow instead of gateway verify."
                     )
 
+                if open03_policy is not None:
+                    try:
+                        parse_open03_agent_sale_policy(open03_policy)
+                    except InvalidPolicyConfigurationError as exc:
+                        raise InvalidPaymentStateError(str(exc)) from exc
+
                 auth_clean = (authority or "").strip()
                 if not auth_clean:
                     raise UnverifiedPaymentError(
@@ -910,6 +923,12 @@ class PaymentService:
                     raise InvalidPaymentStateError(
                         "Manual confirmation is permitted only for MANUAL_CARD or ADMIN_GRANT orders."
                     )
+
+                if open03_policy is not None:
+                    try:
+                        parse_open03_agent_sale_policy(open03_policy)
+                    except InvalidPolicyConfigurationError as exc:
+                        raise InvalidPaymentStateError(str(exc)) from exc
 
                 role_label = _resolve_actor_role_label(actor_roles)
                 return await self._fulfill_locked_order(

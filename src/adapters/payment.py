@@ -23,13 +23,31 @@ from typing import Any
 
 import httpx
 
+from src.core.env import (
+    EnvironmentConfigurationError,
+    is_restricted_environment,
+    resolve_runtime_environment,
+)
+
 logger = logging.getLogger("hamicard.adapters.payment")
 
 
 def _is_production_env() -> bool:
-    app_env = os.getenv("APP_ENV", "").strip().lower()
-    node_env = os.getenv("NODE_ENV", "").strip().lower()
-    return app_env == "production" or node_env == "production"
+    try:
+        return is_restricted_environment()
+    except EnvironmentConfigurationError as exc:
+        raise PaymentGatewayError(str(exc)) from exc
+
+
+def _require_non_restricted_payment_env(context: str) -> None:
+    try:
+        if is_restricted_environment():
+            env_name = resolve_runtime_environment()
+            raise PaymentGatewayError(
+                f"{context} is strictly disabled in restricted {env_name} (production/staging) environment."
+            )
+    except EnvironmentConfigurationError as exc:
+        raise PaymentGatewayError(str(exc)) from exc
 
 
 class PaymentGatewayError(Exception):
@@ -86,10 +104,7 @@ class MockPaymentGateway(BasePaymentGateway):
     """
 
     def __init__(self, require_explicit_confirmation: bool = False):
-        if _is_production_env():
-            raise PaymentGatewayError(
-                "MockPaymentGateway is strictly disabled in production (APP_ENV/NODE_ENV=production)."
-            )
+        _require_non_restricted_payment_env("MockPaymentGateway")
         self.require_explicit_confirmation = require_explicit_confirmation
         self.pending_authorities: dict[str, int] = {}
         self.pending_requests: dict[str, dict[str, Any]] = {}
@@ -102,8 +117,7 @@ class MockPaymentGateway(BasePaymentGateway):
         mobile: str | None = None,
         order_id: str | None = None,
     ) -> PaymentRequestResult:
-        if _is_production_env():
-            raise PaymentGatewayError("MockPaymentGateway request_payment blocked in production.")
+        _require_non_restricted_payment_env("MockPaymentGateway.request_payment")
         if amount_toman <= 0:
             raise PaymentGatewayError("Payment amount must be strictly positive.")
 
@@ -127,10 +141,9 @@ class MockPaymentGateway(BasePaymentGateway):
     def confirm_payment(self, authority: str, card_pan: str = "603799******1234") -> str:
         """
         Isolated test-harness hook simulating bank-side customer checkout completion.
-        Forbidden in production.
+        Forbidden in production/staging.
         """
-        if _is_production_env():
-            raise PaymentGatewayError("MockPaymentGateway.confirm_payment is forbidden in production.")
+        _require_non_restricted_payment_env("MockPaymentGateway.confirm_payment")
         req_info = self.pending_requests.get(authority)
         if not req_info:
             raise PaymentGatewayError(f"Unknown payment authority '{authority}'.")
@@ -146,8 +159,7 @@ class MockPaymentGateway(BasePaymentGateway):
         amount_toman: int,
         expected_order_id: str | None = None,
     ) -> PaymentVerificationResult:
-        if _is_production_env():
-            raise PaymentGatewayError("MockPaymentGateway verify_payment blocked in production.")
+        _require_non_restricted_payment_env("MockPaymentGateway.verify_payment")
 
         auth_clean = (authority or "").strip()
         req_info = self.pending_requests.get(auth_clean)
@@ -316,41 +328,42 @@ def reset_runtime_sandbox_gateway() -> None:
 def get_payment_gateway(provider_name: str | None = None) -> BasePaymentGateway:
     """
     Factory resolver for Payment Gateway.
-    - Production: fails closed unless a configured real gateway (`zarinpal`) is selected.
+    - Production / Staging: fails closed unless a configured real gateway (`zarinpal`) is selected.
+    - Conflicting / invalid runtime environment vars: always fail closed.
     - Non-production unit usage: returns `MockPaymentGateway()` when mock/fallback requested.
     """
+    is_restricted = _is_production_env()
     provider = (provider_name or os.getenv("PAYMENT_PROVIDER", "mock")).lower().strip()
     if provider == "zarinpal":
         gw = ZarinpalGateway()
-        if _is_production_env() and not gw.merchant_id:
-            raise PaymentGatewayError("ZARINPAL_MERCHANT_ID must be configured in production.")
+        if is_restricted and not gw.merchant_id:
+            raise PaymentGatewayError("ZARINPAL_MERCHANT_ID must be configured in production/staging.")
         return gw
 
-    if _is_production_env():
-        raise PaymentGatewayError(
-            f"Unsupported or mock payment gateway '{provider}' is strictly forbidden in production."
-        )
+    _require_non_restricted_payment_env(
+        f"Unsupported or mock payment gateway '{provider}'"
+    )
     return MockPaymentGateway()
 
 
 def get_runtime_payment_gateway(provider_name: str | None = None) -> BasePaymentGateway:
     """
     HTTP runtime gateway resolver used by FastAPI payment endpoints.
-    Uses Zarinpal in production (fail-closed) or a strict process-scoped
+    Uses Zarinpal in production/staging (fail-closed) or a strict process-scoped
     MockPaymentGateway(require_explicit_confirmation=True) in non-production sandbox.
     """
     global _sandbox_runtime_gateway
+    is_restricted = _is_production_env()
     provider = (provider_name or os.getenv("PAYMENT_PROVIDER", "mock")).lower().strip()
     if provider == "zarinpal":
         gw = ZarinpalGateway()
-        if _is_production_env() and not gw.merchant_id:
-            raise PaymentGatewayError("ZARINPAL_MERCHANT_ID must be configured in production.")
+        if is_restricted and not gw.merchant_id:
+            raise PaymentGatewayError("ZARINPAL_MERCHANT_ID must be configured in production/staging.")
         return gw
 
-    if _is_production_env():
-        raise PaymentGatewayError(
-            f"Unsupported or mock payment gateway '{provider}' is strictly forbidden in production."
-        )
+    _require_non_restricted_payment_env(
+        f"Unsupported or mock payment gateway '{provider}'"
+    )
 
     if _sandbox_runtime_gateway is None:
         _sandbox_runtime_gateway = MockPaymentGateway(require_explicit_confirmation=True)
