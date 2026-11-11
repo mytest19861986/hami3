@@ -1,14 +1,18 @@
 """
 Orders & Payments Domain Service (PAY-001..011, AC-06, BR-15)
-REMEDIATION: HC-T17 (F-11 CRITICAL, F-12 HIGH, T17-AC1..AC5)
+REMEDIATION: HC-T17 (F-11 CRITICAL, F-12 HIGH, T17-AC1..AC5), HC-T24 (D-1 SALE-008/009/010)
 
 Security & Financial Guarantees:
 - Order creation enforces actor permissions (ADMIN_GRANT restricted to ADMIN/SUPER_ADMIN),
-  validates linked sales_case ownership/consistency, and guards idempotency key cross-user
+  validates linked sales_case ownership/consistency/state, and guards idempotency key cross-user
   collisions or parameter tampering (`DuplicateOrderError` -> 409).
 - Ordinary users CANNOT self-confirm payments using fabricated transaction/tracking strings.
   Gateway verification MUST pass trusted provider verification (`BasePaymentGateway.verify_payment`)
   against persisted gateway authority, exact order ID, and exact Toman amount.
+- When an order is linked to a `sales_cases` row (`sales_case_id IS NOT NULL`), payment fulfillment
+  atomically locks and synchronizes `sales_cases.order_id` and `sales_cases.financial_status` to
+  `PAYMENT_RECORDED` under `OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER`, preventing duplicate payments
+  or finalization of unpaid sales cases (`D-1`).
 - Manual card/transfer confirmation is restricted to explicit audited ADMIN/SUPER_ADMIN flow
   governed by approved `OPEN_04_FINANCIAL_PERMISSIONS_MATRIX` & `OPEN_18_CURRENCY_AND_ROUNDING`.
 - Duplicate payment references across orders return `DuplicatePaymentProofError` (409).
@@ -18,6 +22,7 @@ Security & Financial Guarantees:
 """
 
 import inspect
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
@@ -142,6 +147,29 @@ class PaymentService:
                     "Only ADMIN or SUPER_ADMIN can initiate ADMIN_GRANT orders."
                 )
 
+            if method_clean == "ADMIN_GRANT" and sales_case_id is not None:
+                raise InvalidPaymentStateError(
+                    "ADMIN_GRANT orders cannot be linked to commissionable sales cases."
+                )
+
+            existing = await conn.fetchrow(
+                "SELECT * FROM orders_payments WHERE idempotency_key = $1",
+                idem_clean,
+            )
+            if existing:
+                if existing["buyer_user_id"] != buyer_user_id:
+                    raise DuplicateOrderError("Order idempotency key conflict.")
+                if (
+                    existing["holder_id"] != holder_id
+                    or existing["plan_id"] != plan_id
+                    or existing["payment_method"] != method_clean
+                    or existing["sales_case_id"] != sales_case_id
+                ):
+                    raise DuplicateOrderError(
+                        "Idempotency key reused with conflicting order payload."
+                    )
+                return dict(existing)
+
             plan = await conn.fetchrow(
                 "SELECT id, price_toman, is_active FROM discount_plans WHERE id = $1",
                 plan_id,
@@ -159,7 +187,9 @@ class PaymentService:
             if sales_case_id is not None:
                 sc = await conn.fetchrow(
                     """
-                    SELECT sc.id, sc.holder_id, sc.plan_id, a.user_id AS agent_user_id
+                    SELECT sc.id, sc.holder_id, sc.plan_id, sc.order_id,
+                           sc.logistic_status, sc.financial_status,
+                           a.user_id AS agent_user_id
                     FROM sales_cases sc
                     JOIN agents a ON sc.agent_id = a.id
                     WHERE sc.id = $1
@@ -176,6 +206,22 @@ class PaymentService:
                 if sc["holder_id"] != holder_id or sc["plan_id"] != plan_id:
                     raise PaymentError(
                         "Order holder_id and plan_id must match the linked sales case."
+                    )
+                if sc["logistic_status"] == "RETURNED":
+                    raise InvalidPaymentStateError(
+                        "Cannot create payment order for a RETURNED sales case."
+                    )
+                if sc["financial_status"] != "UNPAID" or sc["order_id"] is not None:
+                    raise InvalidPaymentStateError(
+                        f"Sales case is already in financial_status '{sc['financial_status']}'."
+                    )
+                paid_for_case = await conn.fetchrow(
+                    "SELECT id FROM orders_payments WHERE sales_case_id = $1 AND status = 'SUCCESS' LIMIT 1",
+                    sales_case_id,
+                )
+                if paid_for_case:
+                    raise InvalidPaymentStateError(
+                        "Linked sales case already has a fulfilled payment order."
                     )
 
             gw_clean = (
@@ -333,8 +379,15 @@ class PaymentService:
         referral_code: str | None = None,
         audit_action: str = "ORDER_FULFILLED",
         extra_audit: Dict[str, Any] | None = None,
+        open03_policy: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         order_id = order["id"]
+        sales_case_id = order["sales_case_id"]
+
+        if sales_case_id is not None and order["payment_method"] == "ADMIN_GRANT":
+            raise InvalidPaymentStateError(
+                "ADMIN_GRANT orders cannot be fulfilled for a commissionable sales case."
+            )
 
         # Guard against duplicate membership creation on retry or inconsistent DB state (T17-AC3)
         existing_mem = await conn.fetchrow(
@@ -382,6 +435,57 @@ class PaymentService:
                 "Payment transaction or tracking reference has already been used for another order."
             )
 
+        locked_sales_case = None
+        if sales_case_id is not None:
+            if open03_policy is None:
+                open03_policy = await require_approved_policy(
+                    conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
+                )
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1));",
+                f"sale_pay:{sales_case_id}",
+            )
+            locked_sales_case = await conn.fetchrow(
+                "SELECT * FROM sales_cases WHERE id = $1 FOR UPDATE",
+                sales_case_id,
+            )
+            if not locked_sales_case:
+                raise InvalidPaymentStateError(
+                    f"Linked sales case {sales_case_id} no longer exists."
+                )
+            if (
+                locked_sales_case["holder_id"] != order["holder_id"]
+                or locked_sales_case["plan_id"] != order["plan_id"]
+            ):
+                raise InvalidPaymentStateError(
+                    "Order holder_id/plan_id mismatch with linked sales case."
+                )
+            if locked_sales_case["logistic_status"] == "RETURNED":
+                raise InvalidPaymentStateError(
+                    "Cannot record payment for a RETURNED sales case."
+                )
+            if locked_sales_case["financial_status"] != "UNPAID" or (
+                locked_sales_case["order_id"] is not None
+                and locked_sales_case["order_id"] != order_id
+            ):
+                raise InvalidPaymentStateError(
+                    f"Linked sales case is in financial_status '{locked_sales_case['financial_status']}' "
+                    "and cannot accept another payment."
+                )
+            other_case_order = await conn.fetchrow(
+                """
+                SELECT id FROM orders_payments
+                WHERE sales_case_id = $1 AND id <> $2 AND status = 'SUCCESS'
+                LIMIT 1
+                """,
+                sales_case_id,
+                order_id,
+            )
+            if other_case_order:
+                raise InvalidPaymentStateError(
+                    "Another payment order has already been verified for this sales case."
+                )
+
         updated_order = await conn.fetchrow(
             """
             UPDATE orders_payments
@@ -402,32 +506,85 @@ class PaymentService:
         if not updated_order:
             raise InvalidPaymentStateError("Order status changed concurrently; cannot fulfill.")
 
-        validity_days = int(order["validity_days"])
-        max_visits = order["max_visits"]
-        start_date = datetime.now(UTC)
-        end_date = start_date + timedelta(days=validity_days)
-        origin_type = "ADMIN_GRANT" if order["payment_method"] == "ADMIN_GRANT" else (
-            "AGENT_SALE" if order["sales_case_id"] is not None else "DIRECT_PURCHASE"
-        )
+        should_activate_membership = True
+        if sales_case_id is not None and open03_policy is not None:
+            should_activate_membership = bool(open03_policy.get("auto_activate_membership", True))
 
-        mem_row = await conn.fetchrow(
-            """
-            INSERT INTO memberships (
-                holder_id, plan_id, order_id, origin_type,
-                granted_by, start_date, end_date, max_visits, remaining_visits,
-                used_visits, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 0, 'ACTIVE')
-            RETURNING id, holder_id, plan_id, status, start_date, end_date, max_visits, remaining_visits
-            """,
-            order["holder_id"],
-            order["plan_id"],
-            order_id,
-            origin_type,
-            actor_user_id if origin_type == "ADMIN_GRANT" else None,
-            start_date,
-            end_date,
-            max_visits,
-        )
+        mem_dict = None
+        if should_activate_membership:
+            validity_days = int(order["validity_days"])
+            max_visits = order["max_visits"]
+            start_date = datetime.now(UTC)
+            end_date = start_date + timedelta(days=validity_days)
+            origin_type = (
+                "ADMIN_GRANT"
+                if order["payment_method"] == "ADMIN_GRANT"
+                else ("AGENT_SALE" if sales_case_id is not None else "DIRECT_PURCHASE")
+            )
+
+            mem_row = await conn.fetchrow(
+                """
+                INSERT INTO memberships (
+                    holder_id, plan_id, order_id, origin_type,
+                    granted_by, start_date, end_date, max_visits, remaining_visits,
+                    used_visits, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 0, 'ACTIVE')
+                RETURNING id, holder_id, plan_id, status, start_date, end_date, max_visits, remaining_visits
+                """,
+                order["holder_id"],
+                order["plan_id"],
+                order_id,
+                origin_type,
+                actor_user_id if origin_type == "ADMIN_GRANT" else None,
+                start_date,
+                end_date,
+                max_visits,
+            )
+            mem_dict = dict(mem_row)
+
+        updated_sales_case = None
+        if locked_sales_case is not None:
+            updated_sc_row = await conn.fetchrow(
+                """
+                UPDATE sales_cases
+                SET financial_status = 'PAYMENT_RECORDED',
+                    order_id = $1,
+                    updated_at = NOW()
+                WHERE id = $2 AND financial_status = 'UNPAID' AND order_id IS NULL
+                RETURNING id, agent_id, holder_id, plan_id, order_id, logistic_status, financial_status, updated_at
+                """,
+                order_id,
+                sales_case_id,
+            )
+            if not updated_sc_row:
+                raise InvalidPaymentStateError(
+                    "Linked sales case state changed concurrently; cannot synchronize PAYMENT_RECORDED."
+                )
+            updated_sales_case = dict(updated_sc_row)
+
+            await conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    actor_user_id, actor_role, action, entity_name, entity_id, new_values
+                ) VALUES (
+                    $1, $2, 'SALE_PAYMENT_RECORDED', 'sales_cases', $3::varchar, $4::jsonb
+                )
+                """,
+                actor_user_id,
+                actor_role_label,
+                str(sales_case_id),
+                json.dumps(
+                    {
+                        "order_id": str(order_id),
+                        "amount_toman": int(order["amount_toman"]),
+                        "payment_method": order["payment_method"],
+                        "tracking_reference": trk_clean,
+                        "membership_activated": mem_dict is not None,
+                        "verification_source": (extra_audit or {}).get("verification_source", "GATEWAY"),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
 
         commission_info = None
         if referral_code:
@@ -451,7 +608,7 @@ class PaymentService:
                 ref_user_id = ref_record["referrer_user_id"]
                 if ref_user_id != order["buyer_user_id"]:
                     can_credit_ref = True
-                    if order["sales_case_id"] is not None and not allow_combined:
+                    if sales_case_id is not None and not allow_combined:
                         can_credit_ref = False
                     if can_credit_ref:
                         effective_rate = min(rate, max_total_pct)
@@ -503,13 +660,12 @@ class PaymentService:
         audit_meta = {
             "status": "SUCCESS",
             "amount_toman": int(order["amount_toman"]),
-            "membership_id": str(mem_row["id"]),
+            "membership_id": str(mem_dict["id"]) if mem_dict else None,
             "payment_method": order["payment_method"],
+            "sales_case_id": str(sales_case_id) if sales_case_id else None,
         }
         if extra_audit:
             audit_meta.update(extra_audit)
-
-        import json
 
         await conn.execute(
             """
@@ -526,11 +682,14 @@ class PaymentService:
             json.dumps(audit_meta, ensure_ascii=False),
         )
 
-        return {
+        result_payload: Dict[str, Any] = {
             "order": dict(updated_order),
-            "membership": dict(mem_row),
+            "membership": mem_dict,
             "referral_commission": commission_info,
         }
+        if updated_sales_case is not None:
+            result_payload["sales_case"] = updated_sales_case
+        return result_payload
 
     async def verify_and_fulfill_payment(
         self,
@@ -578,6 +737,11 @@ class PaymentService:
                 rounding_policy = await require_approved_policy(
                     conn, "OPEN_18_CURRENCY_AND_ROUNDING"
                 )
+                open03_policy = None
+                if order["sales_case_id"] is not None:
+                    open03_policy = await require_approved_policy(
+                        conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
+                    )
                 if referral_code:
                     await require_approved_policy(conn, "OPEN_05_COMBINED_COMMISSION_POLICY")
 
@@ -649,6 +813,7 @@ class PaymentService:
                     referral_code=referral_code,
                     audit_action="ORDER_FULFILLED",
                     extra_audit={"verification_source": "GATEWAY"},
+                    open03_policy=open03_policy,
                 )
 
     async def manual_confirm_payment(
@@ -689,8 +854,9 @@ class PaymentService:
                 if referral_code:
                     await require_approved_policy(conn, "OPEN_05_COMBINED_COMMISSION_POLICY")
 
-                allowed_roles = set(
-                    perm_policy.get("record_sale_payment", ["ADMIN", "SUPER_ADMIN"])
+                allowed_roles = (
+                    set(perm_policy.get("record_sale_payment", ["ADMIN", "SUPER_ADMIN"]))
+                    & {"ADMIN", "SUPER_ADMIN"}
                 )
                 if not (actor_roles & allowed_roles):
                     raise PaymentAuthorizationError(
@@ -708,6 +874,12 @@ class PaymentService:
                 )
                 if not order:
                     raise OrderNotFoundError(f"Order {order_id} not found.")
+
+                open03_policy = None
+                if order["sales_case_id"] is not None:
+                    open03_policy = await require_approved_policy(
+                        conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
+                    )
 
                 if order["status"] == "SUCCESS":
                     if (order["gateway_tracking_code"] or "").strip() != proof_clean:
@@ -754,6 +926,7 @@ class PaymentService:
                         "verification_source": "MANUAL_ADMIN",
                         "reason": reason_clean,
                     },
+                    open03_policy=open03_policy,
                 )
 
     async def get_order_by_id(

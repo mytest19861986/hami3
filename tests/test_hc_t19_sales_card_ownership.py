@@ -23,6 +23,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 
+from src.adapters.payment import get_runtime_payment_gateway, reset_runtime_sandbox_gateway  # noqa: E402
 from src.api.deps import close_pool, close_redis, init_pool, init_redis  # noqa: E402
 from src.api.main import app  # noqa: E402
 from src.auth.session_service import SessionService  # noqa: E402
@@ -297,6 +298,41 @@ async def test_t19_ac1_ac2_ac5_sales_agent_binding_logistics_rbac_and_pii_maskin
         assert (
             await client.post(f"/api/v1/sales/cases/{case_a_id}/finalize", headers=support_hdrs)
         ).status_code == 403
+
+        # ADMIN cannot finalize UNPAID sales case -> 400 (D-1)
+        assert (
+            await client.post(f"/api/v1/sales/cases/{case_a_id}/finalize", headers=admin_hdrs)
+        ).status_code == 400
+
+        # Record verified gateway payment linked to case_a_id -> PAYMENT_RECORDED
+        reset_runtime_sandbox_gateway()
+        r_ord = await client.post(
+            "/api/v1/payments/orders",
+            json={
+                "holder_id": str(holder_id),
+                "plan_id": str(plan_id),
+                "sales_case_id": case_a_id,
+                "idempotency_key": f"T19-PAY-{uuid.uuid4().hex}",
+            },
+            headers=agent_a_hdrs,
+        )
+        assert r_ord.status_code == 200, r_ord.text
+        sc_order_id = r_ord.json()["order"]["id"]
+        r_init = await client.post(
+            f"/api/v1/payments/orders/{sc_order_id}/initiate",
+            json={"callback_url": "https://hamicard.local/cb"},
+            headers=agent_a_hdrs,
+        )
+        assert r_init.status_code == 200, r_init.text
+        authority = r_init.json()["authority"]
+        get_runtime_payment_gateway().confirm_payment(authority)
+        r_ver = await client.post(
+            f"/api/v1/payments/orders/{sc_order_id}/verify",
+            json={"authority": authority},
+            headers=agent_a_hdrs,
+        )
+        assert r_ver.status_code == 200, r_ver.text
+        assert r_ver.json()["sales_case"]["financial_status"] == "PAYMENT_RECORDED"
 
         # ADMIN finalizes -> exact Decimal floor 333,333 * 15% = 49,999.95 -> 49,999
         r_fin = await client.post(f"/api/v1/sales/cases/{case_a_id}/finalize", headers=admin_hdrs)

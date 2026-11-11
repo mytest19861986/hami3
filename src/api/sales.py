@@ -1,12 +1,13 @@
 """
 Sales Cases & Logistics API Endpoints (SALE-001..013, AC-09, AC-10)
-REMEDIATION: HC-T19 (F-12 HIGH, T19-AC1, T19-AC2, T19-AC5)
+REMEDIATION: HC-T19 (F-12 HIGH, T19-AC1, T19-AC2, T19-AC5), HC-T24 (D-1 SALE-008/009/010)
 
-Enforces ownership, authoritative agent identity binding, admin-only logistics & financial
-state transitions, and PII masking for non-admin readers.
+Enforces ownership, authoritative agent identity binding, admin-only logistics, audited
+sale payment recording (`OPEN-04`), and verified financial finalization (`OPEN-03`).
 """
 
 import uuid
+from datetime import datetime
 from typing import Any, Dict
 
 import asyncpg
@@ -17,11 +18,13 @@ from src.api.deps import get_current_user, get_db_pool, require_permission
 from src.core.policy import PolicyNotApprovedError
 from src.sales.service import (
     AgentNotApprovedError,
+    DuplicateSalePaymentProofError,
     InvalidStateTransitionError,
     SalesAuthorizationError,
     SalesCaseError,
     SalesCaseNotFoundError,
     SalesCaseService,
+    SalesPaymentValidationError,
 )
 
 router = APIRouter(prefix="/sales", tags=["Sales Cases & Logistics"])
@@ -37,6 +40,13 @@ class CreateSalesCaseSchema(BaseModel):
 class UpdateLogisticStatusSchema(BaseModel):
     status: str = Field(..., example="SHIPPED")
     shipping_tracking_code: str | None = Field(None, example="123456789012345678901234")
+
+
+class RecordSalePaymentSchema(BaseModel):
+    amount_toman: int = Field(..., gt=0, example=350000)
+    payment_date: datetime = Field(..., example="2026-11-11T09:00:00Z")
+    payment_proof_reference: str = Field(..., min_length=6, max_length=100, example="BANK-RCPT-998877")
+    notes: str = Field(..., min_length=5, max_length=500, example="واریز وجه نقدی/کارت‌به‌کارت تاییدشده توسط واحد مالی")
 
 
 @router.post("/cases")
@@ -91,6 +101,40 @@ async def update_logistic_status(
     except SalesCaseNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except SalesCaseError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/cases/{case_id}/record-payment")
+async def record_sale_payment(
+    case_id: uuid.UUID,
+    payload: RecordSalePaymentSchema,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Audited administrative sale payment recording (`SALE-008`, `OPEN-04`):
+    Transitions `UNPAID -> PAYMENT_RECORDED` without finalizing or crediting commission.
+    """
+    sales_svc = SalesCaseService(pool)
+    try:
+        result = await sales_svc.record_manual_payment(
+            case_id=case_id,
+            actor_user_id=current_user["id"],
+            amount_toman=payload.amount_toman,
+            payment_proof_reference=payload.payment_proof_reference,
+            payment_date=payload.payment_date,
+            notes=payload.notes,
+        )
+        return {"success": True, **result}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except SalesAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DuplicateSalePaymentProofError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except SalesCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (InvalidStateTransitionError, SalesPaymentValidationError, SalesCaseError) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 

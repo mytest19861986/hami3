@@ -1,6 +1,6 @@
 """
 Sales Cases & Agent Logistics Domain Service (SALE-001..013, AC-09, AC-10)
-REMEDIATION: HC-T19 (F-12 HIGH, T19-AC1, T19-AC2, T19-AC5)
+REMEDIATION: HC-T19 (F-12 HIGH, T19-AC1, T19-AC2, T19-AC5), HC-T24 (D-1 SALE-008/009/010)
 
 Security & State Machine Guarantees:
 - Agent Binding: Ordinary agents CANNOT create sales cases under another agent's `agent_id`
@@ -8,16 +8,22 @@ Security & State Machine Guarantees:
   (`PENDING`, `REJECTED`, `SUSPENDED`) agents fail closed (`403`).
 - Logistics Authorization: Only `ADMIN` / `SUPER_ADMIN` may advance logistics states,
   enforcing strict forward state transitions and postal tracking invariants (`AC-09`).
-- Financial Finalization: Strictly gated on `commissions:approve` (`ADMIN`/`SUPER_ADMIN`),
-  non-returned/approved logistics status, `OPEN_03` + `OPEN_18` approved policies, and exact
-  `Decimal` commission math credited atomically via `WalletService`.
+- Verified Payment Synchronization & Audited Manual Payment (`SALE-008/009`):
+  - Only verified gateway fulfillment or explicitly authorized ADMIN/SUPER_ADMIN manual
+    payment recording (`OPEN_04` `record_sale_payment`) may advance `UNPAID -> PAYMENT_RECORDED`.
+  - Unpaid or unverified sales cases (`financial_status != 'PAYMENT_RECORDED'` or missing
+    verified `orders_payments`) can NEVER be finalized or credit agent commissions (`T24-AC1`).
+- Financial Finalization (`SALE-010`): Strictly gated on `commissions:approve` (`ADMIN`/`SUPER_ADMIN`),
+  verified `PAYMENT_RECORDED` payment, dynamic `OPEN_03` trigger & `OPEN_18` rounding,
+  non-returned logistics, single idempotent `AGENT_SALE` membership ensure, and single
+  `Decimal` commission credit via `WalletService`.
 - Ownership & PII Filtering: Case retrieval restricted to owning APPROVED agent, `ADMIN`,
   `SUPER_ADMIN`, or `SUPPORT`, masking holder `national_code` and `mobile` for non-admin viewers.
 """
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any, Dict, Set
 
@@ -35,6 +41,12 @@ ALLOWED_LOGISTIC_TRANSITIONS: Dict[str, Set[str]] = {
     "SHIPPED": {"DELIVERED", "RETURNED"},
     "DELIVERED": {"RETURNED"},
     "RETURNED": set(),
+}
+
+ALLOWED_FINALIZATION_TRIGGERS: Dict[str, Set[str]] = {
+    "PAYMENT_RECORDED_AND_CASE_APPROVED": {"APPROVED", "CARD_ISSUED", "SHIPPED", "DELIVERED"},
+    "PAYMENT_RECORDED_AND_CARD_ISSUED": {"CARD_ISSUED", "SHIPPED", "DELIVERED"},
+    "PAYMENT_RECORDED_AND_DELIVERED": {"DELIVERED"},
 }
 
 
@@ -55,6 +67,16 @@ class SalesCaseNotFoundError(SalesCaseError):
 
 class InvalidStateTransitionError(SalesCaseError):
     """Raised on invalid state transitions in the dual state machine."""
+    pass
+
+
+class DuplicateSalePaymentProofError(SalesCaseError):
+    """Raised when a sales payment tracking/proof reference has already been consumed."""
+    pass
+
+
+class SalesPaymentValidationError(SalesCaseError):
+    """Raised when recorded sale payment payload violates amount, date, or proof invariants."""
     pass
 
 
@@ -309,6 +331,237 @@ class SalesCaseService:
 
                 return dict(updated)
 
+    async def record_manual_payment(
+        self,
+        case_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+        amount_toman: int,
+        payment_proof_reference: str,
+        payment_date: datetime,
+        notes: str,
+    ) -> Dict[str, Any]:
+        """
+        Records audited offline/manual payment for a sales case (`SALE-008`, `T24-AC2`):
+        - Strictly gated on approved `OPEN_04_FINANCIAL_PERMISSIONS_MATRIX`, `OPEN_18`, `OPEN_03`.
+        - Strictly restricted to authorized ADMIN/SUPER_ADMIN roles (ordinary users/agents 403).
+        - Validates exact plan price, non-future payment_date, unique tracking/proof ref (`409`).
+        - Advances sales case `UNPAID -> PAYMENT_RECORDED` without finalizing or crediting commission (`SALE-009`).
+        """
+        if actor_user_id is None:
+            raise SalesAuthorizationError("Authenticated actor_user_id is required.")
+
+        if int(amount_toman) <= 0:
+            raise SalesPaymentValidationError("Recorded payment amount must be positive.")
+
+        proof_clean = (payment_proof_reference or "").strip()
+        if len(proof_clean) < 6:
+            raise SalesPaymentValidationError(
+                "payment_proof_reference must be at least 6 characters."
+            )
+
+        notes_clean = (notes or "").strip()
+        if len(notes_clean) < 5:
+            raise SalesPaymentValidationError("Payment notes/reason must be at least 5 characters.")
+
+        if payment_date is None:
+            raise SalesPaymentValidationError("payment_date is required.")
+        payment_date_utc = (
+            payment_date.replace(tzinfo=UTC)
+            if payment_date.tzinfo is None
+            else payment_date.astimezone(UTC)
+        )
+        if payment_date_utc > datetime.now(UTC) + timedelta(minutes=5):
+            raise SalesPaymentValidationError("payment_date cannot be in the future.")
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+                except RbacAccessDeniedError as exc:
+                    raise SalesAuthorizationError(str(exc)) from exc
+
+                perm_policy = await require_approved_policy(
+                    conn, "OPEN_04_FINANCIAL_PERMISSIONS_MATRIX"
+                )
+                await require_approved_policy(conn, "OPEN_18_CURRENCY_AND_ROUNDING")
+                open03 = await require_approved_policy(
+                    conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
+                )
+
+                allowed_roles = (
+                    set(perm_policy.get("record_sale_payment", ["ADMIN", "SUPER_ADMIN"]))
+                    & {"ADMIN", "SUPER_ADMIN"}
+                )
+                if not (actor_roles & allowed_roles):
+                    raise SalesAuthorizationError(
+                        "Only authorized financial administrators (OPEN-04) may record sale payments."
+                    )
+
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1));",
+                    f"pay_proof:{proof_clean}",
+                )
+
+                case = await conn.fetchrow(
+                    """
+                    SELECT sc.*, dp.price_toman, dp.validity_days, dp.max_visits
+                    FROM sales_cases sc
+                    JOIN discount_plans dp ON sc.plan_id = dp.id
+                    WHERE sc.id = $1 FOR UPDATE OF sc
+                    """,
+                    case_id,
+                )
+                if not case:
+                    raise SalesCaseNotFoundError(f"Sales case {case_id} not found.")
+
+                if case["logistic_status"] == "RETURNED":
+                    raise InvalidStateTransitionError(
+                        "Cannot record payment for a RETURNED sales case."
+                    )
+                if case["financial_status"] != "UNPAID" or case["order_id"] is not None:
+                    raise InvalidStateTransitionError(
+                        f"Sales case is already in financial_status '{case['financial_status']}'."
+                    )
+
+                if int(amount_toman) != int(case["price_toman"]):
+                    raise SalesPaymentValidationError(
+                        f"Recorded payment amount ({amount_toman}) does not match plan price ({case['price_toman']})."
+                    )
+
+                existing_case_order = await conn.fetchrow(
+                    """
+                    SELECT id FROM orders_payments
+                    WHERE sales_case_id = $1 AND status = 'SUCCESS'
+                    LIMIT 1
+                    """,
+                    case_id,
+                )
+                if existing_case_order:
+                    raise InvalidStateTransitionError(
+                        "A verified payment order already exists for this sales case."
+                    )
+
+                dup_proof = await conn.fetchrow(
+                    """
+                    SELECT id FROM orders_payments
+                    WHERE gateway_tracking_code = $1 OR gateway_transaction_id = $1
+                    LIMIT 1
+                    """,
+                    proof_clean,
+                )
+                if dup_proof:
+                    raise DuplicateSalePaymentProofError(
+                        "Payment proof reference has already been used for another payment."
+                    )
+
+                idem_key = f"MANUAL-SALE-{case_id}"
+                try:
+                    order_row = await conn.fetchrow(
+                        """
+                        INSERT INTO orders_payments (
+                            buyer_user_id, holder_id, plan_id, sales_case_id,
+                            amount_toman, status, payment_method, idempotency_key,
+                            gateway_name, gateway_transaction_id, gateway_tracking_code,
+                            verified_by, verified_at
+                        ) VALUES (
+                            $1, $2, $3, $4,
+                            $5, 'SUCCESS', 'MANUAL_CARD', $6,
+                            'MANUAL_BANK_RECEIPT', $6, $7,
+                            $8, $9
+                        )
+                        RETURNING *
+                        """,
+                        actor_user_id,
+                        case["holder_id"],
+                        case["plan_id"],
+                        case_id,
+                        int(amount_toman),
+                        idem_key,
+                        proof_clean,
+                        actor_user_id,
+                        payment_date_utc,
+                    )
+                except asyncpg.UniqueViolationError as exc:
+                    raise InvalidStateTransitionError(
+                        "Payment has already been recorded for this sales case."
+                    ) from exc
+
+                mem_row = None
+                if bool(open03.get("auto_activate_membership", True)):
+                    start_date = datetime.now(UTC)
+                    end_date = start_date + timedelta(days=int(case["validity_days"]))
+                    mem_row = await conn.fetchrow(
+                        """
+                        INSERT INTO memberships (
+                            holder_id, plan_id, order_id, origin_type,
+                            granted_by, start_date, end_date, max_visits, remaining_visits,
+                            used_visits, status
+                        ) VALUES (
+                            $1, $2, $3, 'AGENT_SALE',
+                            NULL, $4, $5, $6, $6, 0, 'ACTIVE'
+                        )
+                        RETURNING id, holder_id, plan_id, status, start_date, end_date, max_visits, remaining_visits
+                        """,
+                        case["holder_id"],
+                        case["plan_id"],
+                        order_row["id"],
+                        start_date,
+                        end_date,
+                        case["max_visits"],
+                    )
+
+                updated_case = await conn.fetchrow(
+                    """
+                    UPDATE sales_cases
+                    SET financial_status = 'PAYMENT_RECORDED',
+                        order_id = $1,
+                        reviewed_by = $2,
+                        reviewed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $3 AND financial_status = 'UNPAID' AND order_id IS NULL
+                    RETURNING *
+                    """,
+                    order_row["id"],
+                    actor_user_id,
+                    case_id,
+                )
+                if not updated_case:
+                    raise InvalidStateTransitionError(
+                        "Sales case state changed concurrently; cannot record payment."
+                    )
+
+                actor_role = _resolve_actor_role_label(actor_roles)
+                await conn.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        actor_user_id, actor_role, action, entity_name, entity_id, new_values
+                    ) VALUES (
+                        $1, $2, 'SALE_PAYMENT_RECORDED', 'sales_cases', $3::varchar, $4::jsonb
+                    )
+                    """,
+                    actor_user_id,
+                    actor_role,
+                    str(case_id),
+                    json.dumps(
+                        {
+                            "order_id": str(order_row["id"]),
+                            "amount_toman": int(amount_toman),
+                            "payment_date": payment_date_utc.isoformat(),
+                            "payment_proof_reference": proof_clean,
+                            "notes": notes_clean,
+                            "membership_id": str(mem_row["id"]) if mem_row else None,
+                            "verification_source": "MANUAL_ADMIN",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+                return {
+                    "case": dict(updated_case),
+                    "order": dict(order_row),
+                    "membership": dict(mem_row) if mem_row else None,
+                }
+
     async def finalize_financial_status(
         self,
         case_id: uuid.UUID,
@@ -316,7 +569,8 @@ class SalesCaseService:
     ) -> Dict[str, Any]:
         """
         Finalizes financial state of an approved sales case (`commissions:approve` / ADMIN),
-        computes exact Decimal agent commission per `OPEN_18`, and credits wallet atomically (AC-10).
+        enforces verified PAYMENT_RECORDED payment + dynamic OPEN_03 trigger + OPEN_18 rounding,
+        ensures at most one AGENT_SALE membership, and credits agent wallet atomically (AC-10, D-1).
         """
         if actor_user_id is None:
             raise SalesAuthorizationError("Authenticated actor_user_id is required.")
@@ -334,14 +588,17 @@ class SalesCaseService:
                         "Permission denied: 'commissions:approve' permission required."
                     )
 
-                await require_approved_policy(conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER")
+                open03 = await require_approved_policy(
+                    conn, "OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER"
+                )
                 rounding_policy = await require_approved_policy(
                     conn, "OPEN_18_CURRENCY_AND_ROUNDING"
                 )
 
                 case = await conn.fetchrow(
                     """
-                    SELECT sc.*, dp.price_toman, dp.agent_commission_percent, a.user_id AS agent_user_id
+                    SELECT sc.*, dp.price_toman, dp.validity_days, dp.max_visits,
+                           dp.agent_commission_percent, a.user_id AS agent_user_id
                     FROM sales_cases sc
                     JOIN discount_plans dp ON sc.plan_id = dp.id
                     JOIN agents a ON sc.agent_id = a.id
@@ -356,9 +613,99 @@ class SalesCaseService:
                     raise InvalidStateTransitionError("Sales case is already finalized.")
                 if case["financial_status"] == "CANCELLED":
                     raise InvalidStateTransitionError("Cancelled sales case cannot be finalized.")
-                if case["logistic_status"] in ("PENDING_REVIEW", "RETURNED"):
+                if case["financial_status"] != "PAYMENT_RECORDED":
                     raise InvalidStateTransitionError(
-                        f"Cannot finalize sales case in logistic_status '{case['logistic_status']}'."
+                        f"Cannot finalize sales case in financial_status '{case['financial_status']}': verified payment must be recorded first."
+                    )
+                if case["logistic_status"] == "RETURNED":
+                    raise InvalidStateTransitionError(
+                        "Cannot finalize sales case in logistic_status 'RETURNED'."
+                    )
+
+                order_id = case["order_id"]
+                if order_id is None:
+                    raise InvalidStateTransitionError(
+                        "Cannot finalize sales case without a verified linked payment order."
+                    )
+
+                ord_row = await conn.fetchrow(
+                    "SELECT * FROM orders_payments WHERE id = $1 FOR UPDATE",
+                    order_id,
+                )
+                if not ord_row:
+                    raise InvalidStateTransitionError(
+                        "Linked payment order does not exist; cannot finalize sales case."
+                    )
+                if ord_row["status"] != "SUCCESS":
+                    raise InvalidStateTransitionError(
+                        f"Linked payment order is in status '{ord_row['status']}', expected 'SUCCESS'."
+                    )
+                if (
+                    ord_row["holder_id"] != case["holder_id"]
+                    or ord_row["plan_id"] != case["plan_id"]
+                    or ord_row["sales_case_id"] != case_id
+                ):
+                    raise InvalidStateTransitionError(
+                        "Linked payment order does not match this sales case."
+                    )
+                if ord_row["payment_method"] == "ADMIN_GRANT":
+                    raise InvalidStateTransitionError(
+                        "ADMIN_GRANT orders cannot finalize a commissionable sales case."
+                    )
+                if int(ord_row["amount_toman"]) != int(case["price_toman"]):
+                    raise InvalidStateTransitionError(
+                        "Verified payment amount does not match sales case plan price."
+                    )
+                if (
+                    not (ord_row["gateway_tracking_code"] or "").strip()
+                    or ord_row["verified_by"] is None
+                    or ord_row["verified_at"] is None
+                ):
+                    raise InvalidStateTransitionError(
+                        "Linked payment order lacks verified payment proof or verifier metadata."
+                    )
+
+                trigger = str(open03.get("trigger") or "").strip().upper()
+                allowed_logistics = ALLOWED_FINALIZATION_TRIGGERS.get(trigger)
+                if allowed_logistics is None:
+                    raise InvalidStateTransitionError(
+                        f"Unsupported OPEN_03 finalization trigger '{trigger}'."
+                    )
+                if case["logistic_status"] not in allowed_logistics:
+                    raise InvalidStateTransitionError(
+                        f"Cannot finalize sales case in logistic_status '{case['logistic_status']}' under OPEN_03 trigger '{trigger}'."
+                    )
+
+                mem_row = await conn.fetchrow(
+                    """
+                    SELECT id, holder_id, plan_id, status, start_date, end_date, max_visits, remaining_visits
+                    FROM memberships
+                    WHERE order_id = $1
+                    LIMIT 1
+                    """,
+                    order_id,
+                )
+                if not mem_row:
+                    start_date = datetime.now(UTC)
+                    end_date = start_date + timedelta(days=int(case["validity_days"]))
+                    mem_row = await conn.fetchrow(
+                        """
+                        INSERT INTO memberships (
+                            holder_id, plan_id, order_id, origin_type,
+                            granted_by, start_date, end_date, max_visits, remaining_visits,
+                            used_visits, status
+                        ) VALUES (
+                            $1, $2, $3, 'AGENT_SALE',
+                            NULL, $4, $5, $6, $6, 0, 'ACTIVE'
+                        )
+                        RETURNING id, holder_id, plan_id, status, start_date, end_date, max_visits, remaining_visits
+                        """,
+                        case["holder_id"],
+                        case["plan_id"],
+                        order_id,
+                        start_date,
+                        end_date,
+                        case["max_visits"],
                     )
 
                 rate = Decimal(str(case["agent_commission_percent"]))
@@ -374,41 +721,52 @@ class SalesCaseService:
                         reviewed_by = $1,
                         reviewed_at = NOW(),
                         updated_at = NOW()
-                    WHERE id = $2
+                    WHERE id = $2 AND financial_status = 'PAYMENT_RECORDED'
                     RETURNING *
                     """,
                     actor_user_id,
                     case_id,
                 )
-
-                comm_row = await conn.fetchrow(
-                    """
-                    INSERT INTO commissions (
-                        beneficiary_user_id, commission_type, source_sales_case_id,
-                        rate_percent, amount_toman, status, idempotency_key,
-                        approved_by, approved_at
-                    ) VALUES ($1, 'AGENT_SALE', $2, $3, $4, 'APPROVED', $5, $6, NOW())
-                    ON CONFLICT (idempotency_key) DO UPDATE SET updated_at = NOW()
-                    RETURNING id
-                    """,
-                    agent_user_id,
-                    case_id,
-                    float(rate),
-                    commission_amount,
-                    idem_key,
-                    actor_user_id,
-                )
-
-                if commission_amount > 0:
-                    await self.wallet_svc.credit_commission(
-                        user_id=agent_user_id,
-                        amount_toman=commission_amount,
-                        reference_id=str(case_id),
-                        idempotency_key=idem_key,
-                        description=f"پورسانت پرونده فروش {case_id}",
-                        created_by=actor_user_id,
-                        conn=conn,
+                if not updated_case:
+                    raise InvalidStateTransitionError(
+                        "Sales case financial status changed concurrently; cannot finalize."
                     )
+
+                existing_comm = await conn.fetchrow(
+                    "SELECT id FROM commissions WHERE idempotency_key = $1 FOR UPDATE",
+                    idem_key,
+                )
+                if existing_comm:
+                    comm_row = existing_comm
+                else:
+                    comm_row = await conn.fetchrow(
+                        """
+                        INSERT INTO commissions (
+                            beneficiary_user_id, commission_type, source_order_id, source_sales_case_id,
+                            rate_percent, amount_toman, status, idempotency_key,
+                            approved_by, approved_at
+                        ) VALUES ($1, 'AGENT_SALE', $2, $3, $4, $5, 'APPROVED', $6, $7, NOW())
+                        RETURNING id
+                        """,
+                        agent_user_id,
+                        order_id,
+                        case_id,
+                        float(rate),
+                        commission_amount,
+                        idem_key,
+                        actor_user_id,
+                    )
+
+                    if commission_amount > 0:
+                        await self.wallet_svc.credit_commission(
+                            user_id=agent_user_id,
+                            amount_toman=commission_amount,
+                            reference_id=str(case_id),
+                            idempotency_key=idem_key,
+                            description=f"پورسانت پرونده فروش {case_id}",
+                            created_by=actor_user_id,
+                            conn=conn,
+                        )
 
                 actor_role = _resolve_actor_role_label(actor_roles)
                 await conn.execute(
@@ -424,14 +782,19 @@ class SalesCaseService:
                     str(case_id),
                     json.dumps(
                         {
+                            "order_id": str(order_id),
+                            "membership_id": str(mem_row["id"]),
                             "commission_id": str(comm_row["id"]),
                             "commission_amount_toman": commission_amount,
+                            "trigger": trigger,
                         }
                     ),
                 )
 
                 return {
                     "case": dict(updated_case),
+                    "order_id": order_id,
+                    "membership_id": mem_row["id"],
                     "commission_id": comm_row["id"],
                     "commission_amount_toman": commission_amount,
                 }
