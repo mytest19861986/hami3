@@ -15,6 +15,7 @@ import asyncio
 import os
 import sys
 import uuid
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 
 os.environ.setdefault(
@@ -34,6 +35,7 @@ from src.auth.session_service import SessionService  # noqa: E402
 from src.core.policy import set_policy_approval  # noqa: E402
 
 _TEMP_E2E_POLICIES = (
+    "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE",
     "OPEN_05_COMBINED_COMMISSION_POLICY",
     "OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN",
     "OPEN_16_VISIT_MEDICAL_RECORD_LIMIT",
@@ -276,20 +278,30 @@ async def test_api_suite():
                 doc_sess = await session_svc.create_session(user_id=doc_user["id"], device_info="test-agent", ip_address="127.0.0.1")
                 doc_headers = {"Authorization": f"Bearer {doc_sess['refresh_token']}"}
 
+            expected_rate = Decimal(str(selected_plan["discount_percent"]))
+            expected_discount = int(
+                ((Decimal(500000) * expected_rate) / Decimal("100")).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+            )
+            expected_paid = 500000 - expected_discount
+
             visit_payload = {
                 "doctor_id": doc_id,
                 "holder_id": holder_id,
                 "membership_id": str(membership_id),
                 "service_title": "ویزیت تخصصی چکاپ",
                 "total_amount_toman": 500000,
+                # Forged lower rate intentionally supplied; server MUST derive from DB plan & policy
                 "discount_percent": 25.0,
             }
             r_visit = await client.post("/api/v1/visits/record", json=visit_payload, headers=doc_headers)
             assert r_visit.status_code == 200, r_visit.text
             visit_res = r_visit.json()
             assert visit_res["success"] is True
-            assert visit_res["visit"]["discount_amount_toman"] == 125000
-            assert visit_res["visit"]["patient_paid_amount_toman"] == 375000
+            assert Decimal(str(visit_res["visit"]["discount_percent"])) == expected_rate
+            assert visit_res["visit"]["discount_amount_toman"] == expected_discount
+            assert visit_res["visit"]["patient_paid_amount_toman"] == expected_paid
             print(f"  ✓ Record Visit PASS: visit_id={visit_res['visit']['id']}, total={visit_res['visit']['total_amount_toman']}.")
 
             # 15. Wallet Settlement Request API
