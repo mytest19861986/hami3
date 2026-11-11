@@ -1,0 +1,100 @@
+{
+  "schema": "hamicard.owner_preview_manifest.v1",
+  "task_id": "HC-T28",
+  "command_id": "HC-CMD-029",
+  "baseline": "BL-HAMICARD-PRD-V1",
+  "branch": "fix/hc-t28-ui-a11y-polish",
+  "base_ui_commit_sha": "1ea969558380234a3166f2cf85256f4f52be4d51",
+  "ui_source_commit_sha": "af9534cf4d1f005eaa67233fdbda0f7f6fb7e38c",
+  "ui_source_tree_sha": "6e90ce76db234067b3c4d9264a40dd08e1b3478b",
+  "governance": {
+    "open_15_status": "PROPOSED",
+    "open_01_18_status": "PROPOSED",
+    "owner_visual_acceptance": "PENDING_OWNER_REVIEW",
+    "synthetic_demo_data_only": true,
+    "live_auth_connected": false,
+    "live_payments_connected": false
+  },
+  "remediated_a11y_defects": {
+    "D-1": "All .hc-pill-btn (11 items) and #hc-drawer-close satisfy min-height >= 44px and min-width >= 44px.",
+    "D-2": "Removed aria-live='polite' from #app-root; added narrow #hc-live-status (role='status', aria-live='polite', aria-atomic='true').",
+    "D-3": "Mobile drawer moves focus inside on open, traps Tab/Shift+Tab, provides #hc-drawer-close, and restores focus to #hc-menu-toggle on close/Escape.",
+    "D-4": "Doctor detail panel focuses #hc-doc-detail-heading when opened and restores focus to [data-select-doctor] on close or Escape.",
+    "D-5": "Simulator groups use role='radiogroup' and buttons use role='radio' with aria-checked, roving tabindex, and RTL arrow key navigation."
+  },
+  "verification": {
+    "command": "pytest -v tests/test_hc_t16_ui_shell.py",
+    "result": "2 passed in 14.64s",
+    "console_errors": 0,
+    "page_errors": 0,
+    "unexpected_external_or_api_calls": 0
+  },
+  "files_sha256": {
+    "src/ui_shell/index.html": {
+      "bytes": 7692,
+      "sha256": "855ee1b194ccf7f617f35935459f7890c5bc73e7e8a93450bc5ee6da676a4d70"
+    },
+    "src/ui_shell/styles/tokens.css": {
+      "bytes": 2189,
+      "sha256": "b205f5643179b50a3ffd9d9b719fdc77121b9bdc54d0b9f74cf6610ccb9e7d81"
+    },
+    "src/ui_shell/styles/shell.css": {
+      "bytes": 12035,
+      "sha256": "1a55351bd856d400b31af4132d68020ebc04a4952d7e1f2378c4ffd4e3be195d"
+    },
+    "src/ui_shell/js/app.js": {
+      "bytes": 31232,
+      "sha256": "da3682d7f23201e1032a99a4782e311585b630be4662498b370f1e749a3fd092"
+    },
+    "src/ui_shell/js/demo_data.js": {
+      "bytes": 15376,
+      "sha256": "79937ef1a4d9acf7ad2b0dd055eb86946440847eccf0cc73da63a2cdef161dae"
+    },
+    "src/ui_shell/js/jalali.js": {
+      "bytes": 1849,
+      "sha256": "4237b34b258d728afd77eb8720f097c3aae100ba892e2e27ce78a19ff1cb0222"
+    },
+    "tests/test_hc_t16_ui_shell.py": {
+      "bytes": 16664,
+      "sha256": "c48be68feb301ab7ddd6fe604a9a4710757f6dc608a93e8edae065a623d6d241"
+    },
+    "docs/PHASE_3_DESIGN_SYSTEM.md": {
+      "bytes": 5371,
+      "sha256": "357ccccf35f731cce340c91e11fbbcb61f5ce50d06637324b7fab713efc52823"
+    },
+    "docs/PHASE_3_UI_VERIFICATION_REPORT_T16.md": {
+      "bytes": 4942,
+      "sha256": "d5ace6210f2c63a982946ce1ea02b0c598f645ed015ae823dcac223656cefc3b"
+    }
+  },
+  "screenshots_sha256": {
+    "docs/screenshots/phase3/desktop_home.png": {
+      "bytes": 111152,
+      "sha256": "430e4f462545e3cb428b1e26a956712d8c4db77752c5a73b62e28164edc35945"
+    },
+    "docs/screenshots/phase3/desktop_panel_agent.png": {
+      "bytes": 94029,
+      "sha256": "d0fa5cd7e0bfbc06af142460fb8f31ba7c7539328a9e1388271f74e11140c0b0"
+    },
+    "docs/screenshots/phase3/desktop_plans.png": {
+      "bytes": 67249,
+      "sha256": "85db410bde96618a99c382921e7ae24edec6db006bbea2d6481a6ff6926c4c31"
+    },
+    "docs/screenshots/phase3/desktop_state_disabled.png": {
+      "bytes": 59443,
+      "sha256": "15892bd27f97904bf928336dd5adeca721d3ff2960f6965e0d75f4df50e2513e"
+    },
+    "docs/screenshots/phase3/mobile_home.png": {
+      "bytes": 115157,
+      "sha256": "ba21a5966c20ecca3cb2320d5b15165f471b4e2f3dda9ac27ab6ca5434dfa13b"
+    },
+    "docs/screenshots/phase3/mobile_panel_support.png": {
+      "bytes": 83337,
+      "sha256": "1dcca1cac9a043babd521e604f91a8fae12eb03980710ff968a1edf3fd58f600"
+    },
+    "docs/screenshots/phase3/tablet_doctors.png": {
+      "bytes": 78103,
+      "sha256": "704817f66aa5df2e80ec525bb7e5912ff5dc16affb4d5e2cc701d8842e61df46"
+    }
+  }
+}
