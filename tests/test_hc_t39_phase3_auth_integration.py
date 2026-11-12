@@ -64,7 +64,10 @@ async def _launch_headless_chromium(p):
     for candidate in BROWSER_CANDIDATES:
         if candidate.exists():
             return await p.chromium.launch(headless=True, executable_path=str(candidate))
-    return await p.chromium.launch(headless=True)
+    return await p.chromium.launch(
+        headless=True,
+        args=["--disable-dev-shm-usage", "--no-sandbox"],
+    )
 
 
 def _find_free_port() -> int:
@@ -519,19 +522,19 @@ async def test_t39_playwright_e2e_full_integration_and_screenshots(monkeypatch):
             # 5. Open Tab B & Tab C; wait 2.3s for natural 2s access token expiry -> 3-Tab reload coalesces to 1 /refresh!
             tab_b = await context.new_page()
             _attach_listeners(tab_b)
-            await tab_b.goto(f"{base_url}/phase3/#/panel/user", wait_until="networkidle")
+            await tab_b.goto(f"{base_url}/phase3/#/panel/user", wait_until="load")
             await _wait_selector_count(tab_b, "#hc-panel-authorized-badge")
 
             tab_c = await context.new_page()
             _attach_listeners(tab_c)
-            await tab_c.goto(f"{base_url}/phase3/#/panel/user", wait_until="networkidle")
+            await tab_c.goto(f"{base_url}/phase3/#/panel/user", wait_until="load")
             await _wait_selector_count(tab_c, "#hc-panel-authorized-badge")
 
             refresh_posts.clear()
             await asyncio.gather(
-                tab_a.reload(wait_until="networkidle"),
-                tab_b.reload(wait_until="networkidle"),
-                tab_c.reload(wait_until="networkidle"),
+                tab_a.reload(wait_until="load"),
+                tab_b.reload(wait_until="load"),
+                tab_c.reload(wait_until="load"),
             )
             # Navigate tab_a back to #/panel/user (it was on #/panel/admin -> test user on tab_b & tab_c)
             await asyncio.gather(
