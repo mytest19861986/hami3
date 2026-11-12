@@ -20,12 +20,35 @@ const activeControllers = new Set();
 let refreshCallsThisTab = 0;
 let pendingSyncResolvers = [];
 let sessionVersion = 0;
+let authEpoch = 0;
+let logoutBarrierActive = false;
+let canRetryLogout = false;
 
 let cachedProfile = null;
-let authStatusLabel = 'UNAUTHENTICATED'; // UNAUTHENTICATED | AUTHENTICATED | EXPIRED
+let authStatusLabel = 'UNAUTHENTICATED'; // UNAUTHENTICATED | AUTHENTICATED | EXPIRED | REMOTE_REVOKE_FAILED
 let lastEventMessage = 'آماده — بدون ذخیره توکن در مرورگر (RAM + HttpOnly Cookie).';
 let lastErrorMessage = '';
 let stateChangeListener = null;
+
+function drainSyncResolvers(value = null) {
+  if (!pendingSyncResolvers.length) return;
+  const waiters = pendingSyncResolvers.slice();
+  pendingSyncResolvers = [];
+  for (let i = 0; i < waiters.length; i += 1) {
+    try {
+      waiters[i](value);
+    } catch {
+      // Ignore waiter errors during state scrub
+    }
+  }
+}
+
+function abortActiveControllers() {
+  if (activeControllers.size > 0) {
+    activeControllers.forEach((ctrl) => ctrl.abort());
+    activeControllers.clear();
+  }
+}
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,6 +106,8 @@ export function getAuthSnapshot() {
     refreshCallsThisTab,
     visibleCookieNames: listVisibleCookieNames(),
     hasSessionHintCookie: hasSessionHintCookie(),
+    canRetryLogout,
+    logoutBarrierActive,
     profile: cachedProfile ? { ...cachedProfile, roles: [...(cachedProfile.roles || [])] } : null,
     lastEventMessage,
     lastErrorMessage,
@@ -91,29 +116,51 @@ export function getAuthSnapshot() {
 }
 
 export function clearPrivateState(reasonMessage, options = {}) {
-  const { broadcastLogout = false, statusLabel = 'UNAUTHENTICATED', errorText = '' } = options;
+  const {
+    broadcastLogout = false,
+    statusLabel = 'UNAUTHENTICATED',
+    errorText = '',
+    logoutBarrier,
+    retryableLogout = false,
+  } = options;
+  authEpoch += 1;
+  if (typeof logoutBarrier === 'boolean') {
+    logoutBarrierActive = logoutBarrier;
+  }
+  canRetryLogout = Boolean(retryableLogout);
   accessToken = null;
   accessExpiresAtMs = 0;
   accessTtlMs = 300000;
   cachedProfile = null;
+  inFlightRefresh = null;
   authStatusLabel = statusLabel;
   sessionVersion += 1;
 
-  if (activeControllers.size > 0) {
-    activeControllers.forEach((ctrl) => ctrl.abort());
-    activeControllers.clear();
-  }
+  abortActiveControllers();
+  drainSyncResolvers(null);
 
   lastEventMessage = reasonMessage || 'نشست پاک‌سازی شد.';
   lastErrorMessage = errorText;
 
   if (broadcastLogout && authChannel) {
-    authChannel.postMessage({ type: 'LOGOUT', reason: reasonMessage || 'LOGOUT' });
+    authChannel.postMessage({
+      type: 'LOGOUT',
+      reason: reasonMessage || 'LOGOUT',
+      authEpoch,
+    });
   }
   notifyChange();
 }
 
-function setActiveAccessToken(token, ttlSeconds, sourceNote) {
+function setActiveAccessToken(token, ttlSeconds, sourceNote, options = {}) {
+  const { explicitLogin = false } = options;
+  if (explicitLogin) {
+    logoutBarrierActive = false;
+    canRetryLogout = false;
+    authEpoch += 1;
+  } else if (logoutBarrierActive) {
+    return false;
+  }
   accessToken = token || null;
   accessTtlMs = Math.max(1000, Number(ttlSeconds || 300) * 1000);
   accessExpiresAtMs = Date.now() + accessTtlMs;
@@ -124,9 +171,13 @@ function setActiveAccessToken(token, ttlSeconds, sourceNote) {
   if (sourceNote) {
     lastEventMessage = sourceNote;
   }
+  return Boolean(accessToken);
 }
 
 async function executeCookieRefreshRequest() {
+  if (logoutBarrierActive) {
+    return null;
+  }
   const csrf = getCookieValue('hc_csrf');
   if (!csrf) {
     clearPrivateState('کوکی CSRF برای تازه‌سازی نشست یافت نشد.', {
@@ -136,16 +187,32 @@ async function executeCookieRefreshRequest() {
     return null;
   }
 
+  const startedEpoch = authEpoch;
+  const ctrl = new AbortController();
+  activeControllers.add(ctrl);
   refreshCallsThisTab += 1;
-  const resp = await fetch('/api/v1/auth/refresh', {
-    method: 'POST',
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: {
-      'X-Auth-Mode': 'cookie',
-      'X-CSRF-Token': csrf,
-    },
-  });
+
+  let resp;
+  try {
+    resp = await fetch('/api/v1/auth/refresh', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: ctrl.signal,
+      headers: {
+        'X-Auth-Mode': 'cookie',
+        'X-CSRF-Token': csrf,
+      },
+    });
+  } catch {
+    return null;
+  } finally {
+    activeControllers.delete(ctrl);
+  }
+
+  if (logoutBarrierActive || authEpoch !== startedEpoch) {
+    return null;
+  }
 
   if (!resp.ok) {
     let detail = '';
@@ -154,6 +221,9 @@ async function executeCookieRefreshRequest() {
       detail = errData.detail || '';
     } catch {
       detail = '';
+    }
+    if (logoutBarrierActive || authEpoch !== startedEpoch) {
+      return null;
     }
     if (resp.status === 401 || resp.status === 403) {
       clearPrivateState(`نشست منقضی یا لغو شده است (HTTP ${resp.status}).`, {
@@ -169,12 +239,25 @@ async function executeCookieRefreshRequest() {
     return null;
   }
 
-  const data = await resp.json();
-  setActiveAccessToken(
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch {
+    return null;
+  }
+
+  if (logoutBarrierActive || authEpoch !== startedEpoch) {
+    return null;
+  }
+
+  const applied = setActiveAccessToken(
     data.access_token || null,
     data.expires_in || 300,
     'نشست از طریق کوکی HttpOnly در حافظه RAM تازه‌سازی شد.'
   );
+  if (!applied || logoutBarrierActive || authEpoch !== startedEpoch) {
+    return null;
+  }
 
   if (authChannel && accessToken) {
     authChannel.postMessage({
@@ -182,20 +265,32 @@ async function executeCookieRefreshRequest() {
       accessToken,
       accessExpiresAtMs,
       accessTtlMs,
+      explicitLogin: false,
+      authEpoch,
     });
     await delay(30);
   }
 
-  await hydrateProfileInternal();
-  notifyChange();
+  if (logoutBarrierActive || authEpoch !== startedEpoch) {
+    return null;
+  }
+
+  await hydrateProfileInternal(startedEpoch);
+  if (!logoutBarrierActive && authEpoch === startedEpoch) {
+    notifyChange();
+  }
   return accessToken;
 }
 
 export async function refreshSessionCoordinated(options = {}) {
+  if (logoutBarrierActive) {
+    return null;
+  }
   const opts = typeof options === 'boolean' ? { force: options } : options || {};
   const forceRefresh = Boolean(opts.force);
   const failedToken = opts.failedToken || null;
   const startedAt = Date.now();
+  const startedEpoch = authEpoch;
 
   if (failedToken && accessToken && accessToken !== failedToken && hasFreshAccessToken()) {
     return accessToken;
@@ -211,6 +306,9 @@ export async function refreshSessionCoordinated(options = {}) {
     try {
       if (navigator.locks && typeof navigator.locks.request === 'function') {
         return await navigator.locks.request(LOCK_NAME, { mode: 'exclusive' }, async () => {
+          if (logoutBarrierActive || authEpoch !== startedEpoch) {
+            return null;
+          }
           if (failedToken && accessToken && accessToken !== failedToken && hasFreshAccessToken()) {
             lastEventMessage = 'توکن جدید هم‌زمان بین تب‌ها استفاده مجدد شد.';
             notifyChange();
@@ -240,11 +338,19 @@ export async function refreshSessionCoordinated(options = {}) {
                 }
               }, 35);
             });
+            if (logoutBarrierActive || authEpoch !== startedEpoch) {
+              return null;
+            }
             if (synced) {
-              await hydrateProfileInternal();
-              notifyChange();
+              await hydrateProfileInternal(authEpoch);
+              if (!logoutBarrierActive && accessToken) {
+                notifyChange();
+              }
               return synced;
             }
+          }
+          if (logoutBarrierActive || authEpoch !== startedEpoch) {
+            return null;
           }
           return executeCookieRefreshRequest();
         });
@@ -259,8 +365,12 @@ export async function refreshSessionCoordinated(options = {}) {
 }
 
 export async function authenticatedFetch(url, options = {}) {
+  if (logoutBarrierActive) {
+    throw new Error('UNAUTHENTICATED');
+  }
+  const startedEpoch = authEpoch;
   let token = hasFreshAccessToken() ? accessToken : await refreshSessionCoordinated({ force: false });
-  if (!token) {
+  if (!token || logoutBarrierActive || authEpoch !== startedEpoch) {
     throw new Error('UNAUTHENTICATED');
   }
 
@@ -282,8 +392,15 @@ export async function authenticatedFetch(url, options = {}) {
       signal: ctrl.signal,
     });
 
+    if (logoutBarrierActive || authEpoch !== startedEpoch) {
+      return resp;
+    }
+
     if (resp.status === 401) {
       const retriedToken = await refreshSessionCoordinated({ force: true, failedToken: token });
+      if (logoutBarrierActive || authEpoch !== startedEpoch) {
+        return resp;
+      }
       if (!retriedToken) {
         clearPrivateState('نشست شما منقضی شده است؛ لطفاً مجدداً وارد شوید.', {
           broadcastLogout: false,
@@ -299,6 +416,9 @@ export async function authenticatedFetch(url, options = {}) {
         body: options.body,
         signal: ctrl.signal,
       });
+      if (logoutBarrierActive || authEpoch !== startedEpoch) {
+        return resp;
+      }
       if (resp.status === 401) {
         clearPrivateState('اعتبار توکن پس از تلاش مجدد منقضی/لغو شده است.', {
           broadcastLogout: false,
@@ -313,22 +433,33 @@ export async function authenticatedFetch(url, options = {}) {
   }
 }
 
-async function hydrateProfileInternal() {
-  if (!accessToken) {
-    cachedProfile = null;
+async function hydrateProfileInternal(expectedEpoch = authEpoch) {
+  if (logoutBarrierActive || !accessToken || authEpoch !== expectedEpoch) {
+    if (logoutBarrierActive || !accessToken) {
+      cachedProfile = null;
+    }
     return null;
   }
+  const ctrl = new AbortController();
+  activeControllers.add(ctrl);
   try {
     const resp = await fetch('/api/v1/profile/me', {
       method: 'GET',
       credentials: 'same-origin',
       cache: 'no-store',
+      signal: ctrl.signal,
       headers: {
         Authorization: `${AUTH_HEADER_SCHEME} ${accessToken}`,
       },
     });
+    if (logoutBarrierActive || authEpoch !== expectedEpoch || !accessToken) {
+      return null;
+    }
     if (resp.ok) {
       const data = await resp.json();
+      if (logoutBarrierActive || authEpoch !== expectedEpoch || !accessToken) {
+        return null;
+      }
       cachedProfile = {
         user_id: data.user_id || data.id || null,
         mobile: data.mobile || '',
@@ -340,7 +471,9 @@ async function hydrateProfileInternal() {
       return cachedProfile;
     }
   } catch {
-    // Profile hydration errors leave cachedProfile unchanged or null cleanly
+    // Profile hydration errors or aborts leave state untouched cleanly
+  } finally {
+    activeControllers.delete(ctrl);
   }
   return cachedProfile;
 }
@@ -394,21 +527,27 @@ export async function verifyOtpCookie(mobile, code) {
     return { ok: false, status: resp.status, data };
   }
 
-  setActiveAccessToken(
+  const applied = setActiveAccessToken(
     data.access_token || null,
     data.expires_in || 300,
-    'ورود با کد OTP در حالت کوکی HttpOnly انجام شد.'
+    'ورود با کد OTP در حالت کوکی HttpOnly انجام شد.',
+    { explicitLogin: true }
   );
-  if (authChannel && accessToken) {
+  const loginEpoch = authEpoch;
+  if (applied && authChannel && accessToken) {
     authChannel.postMessage({
       type: 'TOKEN_REFRESHED',
       accessToken,
       accessExpiresAtMs,
       accessTtlMs,
+      explicitLogin: true,
+      authEpoch: loginEpoch,
     });
   }
-  await hydrateProfileInternal();
-  notifyChange();
+  await hydrateProfileInternal(loginEpoch);
+  if (!logoutBarrierActive && authEpoch === loginEpoch) {
+    notifyChange();
+  }
   return { ok: true, status: resp.status, data };
 }
 
@@ -436,31 +575,52 @@ export async function loginPasswordCookie(mobile, password) {
     return { ok: false, status: resp.status, data };
   }
 
-  setActiveAccessToken(
+  const applied = setActiveAccessToken(
     data.access_token || null,
     data.expires_in || 300,
-    'ورود با رمز عبور در حالت کوکی HttpOnly انجام شد.'
+    'ورود با رمز عبور در حالت کوکی HttpOnly انجام شد.',
+    { explicitLogin: true }
   );
-  if (authChannel && accessToken) {
+  const loginEpoch = authEpoch;
+  if (applied && authChannel && accessToken) {
     authChannel.postMessage({
       type: 'TOKEN_REFRESHED',
       accessToken,
       accessExpiresAtMs,
       accessTtlMs,
+      explicitLogin: true,
+      authEpoch: loginEpoch,
     });
   }
-  await hydrateProfileInternal();
-  notifyChange();
+  await hydrateProfileInternal(loginEpoch);
+  if (!logoutBarrierActive && authEpoch === loginEpoch) {
+    notifyChange();
+  }
   return { ok: true, status: resp.status, data };
 }
 
 export async function fetchMyProfile() {
-  const resp = await authenticatedFetch('/api/v1/profile/me');
+  const startedEpoch = authEpoch;
+  let resp;
+  try {
+    resp = await authenticatedFetch('/api/v1/profile/me');
+  } catch (err) {
+    if (logoutBarrierActive || authEpoch !== startedEpoch) {
+      return { ok: false, status: 0, data: {} };
+    }
+    throw err;
+  }
+  if (logoutBarrierActive || authEpoch !== startedEpoch || !accessToken) {
+    return { ok: false, status: resp.status, data: {} };
+  }
   let data = {};
   try {
     data = await resp.json();
   } catch {
     data = {};
+  }
+  if (logoutBarrierActive || authEpoch !== startedEpoch || !accessToken) {
+    return { ok: false, status: resp.status, data };
   }
   if (resp.ok) {
     cachedProfile = {
@@ -506,13 +666,30 @@ export async function fetchReadOnlyRoleExtras() {
 
 export async function logoutCookie() {
   const csrf = getCookieValue('hc_csrf') || '';
+  const bearerSnapshot = accessToken;
   const headers = {
     'X-Auth-Mode': 'cookie',
     'X-CSRF-Token': csrf,
   };
-  if (accessToken) {
-    headers.Authorization = `${AUTH_HEADER_SCHEME} ${accessToken}`;
+  if (bearerSnapshot) {
+    headers.Authorization = `${AUTH_HEADER_SCHEME} ${bearerSnapshot}`;
   }
+
+  // Engage pre-logout barrier immediately so concurrent in-flight refreshes, profile
+  // hydrations, or cross-tab BroadcastChannel syncs cannot resurrect auth state while
+  // POST /api/v1/auth/logout is in flight or after local scrub.
+  logoutBarrierActive = true;
+  canRetryLogout = false;
+  authEpoch += 1;
+  const logoutEpoch = authEpoch;
+  accessToken = null;
+  accessExpiresAtMs = 0;
+  accessTtlMs = 300000;
+  cachedProfile = null;
+  inFlightRefresh = null;
+  abortActiveControllers();
+  drainSyncResolvers(null);
+
   let status = 0;
   let detail = '';
   let revokedOnServer = false;
@@ -538,20 +715,53 @@ export async function logoutCookie() {
     revokedOnServer = false;
   }
 
+  if (authEpoch !== logoutEpoch) {
+    return {
+      ok: false,
+      revokedOnServer: false,
+      canRetryLogout: false,
+      status,
+      detail: detail || 'Superseded by newer authentication state.',
+    };
+  }
+
   if (revokedOnServer) {
     clearPrivateState(`خروج امن از نشست با تأیید سرور انجام شد (HTTP ${status}).`, {
       broadcastLogout: true,
+      logoutBarrier: true,
+      retryableLogout: false,
       statusLabel: 'UNAUTHENTICATED',
       errorText: '',
     });
-    return { ok: true, revokedOnServer: true, status, detail: '' };
+    return { ok: true, revokedOnServer: true, canRetryLogout: false, status, detail: '' };
   }
 
+  const credsStillPresent = Boolean(getCookieValue('hc_csrf')) && hasSessionHintCookie();
   const errCodeText = status ? `HTTP ${status}` : 'خطای شبکه';
-  const reasonMessage = `هشدار: خروج محلی انجام شد اما لغو نشست روی سرور تأیید نشد (${errCodeText}).`;
-  const errorText = `لغو نشست روی سرور تأیید نشد (${errCodeText}${detail ? ` - ${detail}` : ''}). نشست سروری ممکن است هنوز فعال باشد؛ لطفاً دوباره خروج سروری را بزنید.`;
+
+  if (!credsStillPresent && status === 401) {
+    clearPrivateState(`نشست پیش‌تر منقضی شده و کوکی‌های مرورگر پاک شدند (${errCodeText}).`, {
+      broadcastLogout: true,
+      logoutBarrier: true,
+      retryableLogout: false,
+      statusLabel: 'EXPIRED',
+      errorText: detail,
+    });
+    return { ok: false, revokedOnServer: false, canRetryLogout: false, status, detail };
+  }
+
+  const retryable = Boolean(credsStillPresent);
+  const reasonMessage = retryable
+    ? `هشدار: خروج محلی انجام شد اما لغو نشست روی سرور تأیید نشد (${errCodeText}).`
+    : `هشدار: کوکی‌های مرورگر و نشست دیتابیس پاک شدند اما لغو فوری کش سروری تأیید نشد (${errCodeText}).`;
+  const errorText = retryable
+    ? `لغو نشست روی سرور تأیید نشد (${errCodeText}${detail ? ` - ${detail}` : ''}). نشست سروری ممکن است هنوز فعال باشد؛ لطفاً دوباره خروج سروری را بزنید.`
+    : `سرور کوکی‌های نشست مرورگر را پاک کرد اما تأیید فوری سرویس ابطال در دسترس نبود (${errCodeText}${detail ? ` - ${detail}` : ''}). به دلیل پاک‌شدن کوکی‌ها امکان ارسال مجدد درخواست خروج وجود ندارد؛ در صورت نیاز دوباره وارد شوید.`;
+
   clearPrivateState(reasonMessage, {
     broadcastLogout: false,
+    logoutBarrier: true,
+    retryableLogout: retryable,
     statusLabel: 'REMOTE_REVOKE_FAILED',
     errorText,
   });
@@ -559,11 +769,13 @@ export async function logoutCookie() {
     authChannel.postMessage({
       type: 'LOGOUT_FAILED_LOCAL_SCRUB',
       status,
+      canRetryLogout: retryable,
       reason: reasonMessage,
       errorText,
+      authEpoch,
     });
   }
-  return { ok: false, revokedOnServer: false, status, detail };
+  return { ok: false, revokedOnServer: false, canRetryLogout: retryable, status, detail };
 }
 
 export function initAuthLifecycle(onStateChange) {
@@ -573,33 +785,44 @@ export function initAuthLifecycle(onStateChange) {
     authChannel.onmessage = (event) => {
       const msg = event.data || {};
       if (msg.type === 'TOKEN_REFRESHED' && msg.accessToken) {
-        accessToken = msg.accessToken;
+        const isExplicit = Boolean(msg.explicitLogin);
+        if (logoutBarrierActive && !isExplicit) {
+          return;
+        }
+        const applied = setActiveAccessToken(
+          msg.accessToken,
+          Math.max(1, Math.round(Number(msg.accessTtlMs || accessTtlMs || 300000) / 1000)),
+          'توکن کوتاه‌عمر از طریق BroadcastChannel همگام‌سازی شد.',
+          { explicitLogin: isExplicit }
+        );
+        if (!applied) {
+          return;
+        }
         accessTtlMs = Number(msg.accessTtlMs || accessTtlMs || 300000);
         accessExpiresAtMs = Number(msg.accessExpiresAtMs || Date.now() + accessTtlMs);
-        lastRefreshAtMs = Date.now();
-        authStatusLabel = 'AUTHENTICATED';
-        sessionVersion += 1;
-        lastEventMessage = 'توکن کوتاه‌عمر از طریق BroadcastChannel همگام‌سازی شد.';
-        lastErrorMessage = '';
-
-        const waiters = pendingSyncResolvers.slice();
-        pendingSyncResolvers = [];
-        for (let i = 0; i < waiters.length; i += 1) {
-          waiters[i](accessToken);
-        }
-        hydrateProfileInternal().finally(notifyChange);
+        const syncEpoch = authEpoch;
+        drainSyncResolvers(accessToken);
+        hydrateProfileInternal(syncEpoch).finally(() => {
+          if (!logoutBarrierActive && authEpoch === syncEpoch) {
+            notifyChange();
+          }
+        });
       } else if (msg.type === 'REQUEST_SYNC') {
-        if (hasFreshAccessToken()) {
+        if (!logoutBarrierActive && hasFreshAccessToken()) {
           authChannel.postMessage({
             type: 'TOKEN_REFRESHED',
             accessToken,
             accessExpiresAtMs,
             accessTtlMs,
+            explicitLogin: false,
+            authEpoch,
           });
         }
       } else if (msg.type === 'LOGOUT') {
         clearPrivateState('خروج هم‌زمان از تب دیگر دریافت و اعمال شد.', {
           broadcastLogout: false,
+          logoutBarrier: true,
+          retryableLogout: false,
           statusLabel: 'UNAUTHENTICATED',
         });
       } else if (msg.type === 'LOGOUT_FAILED_LOCAL_SCRUB') {
@@ -607,6 +830,8 @@ export function initAuthLifecycle(onStateChange) {
           msg.reason || 'هشدار: خروج هم‌زمان در تب دیگر روی سرور تأیید نشد؛ حافظه محلی پاک‌سازی شد.',
           {
             broadcastLogout: false,
+            logoutBarrier: true,
+            retryableLogout: Boolean(msg.canRetryLogout),
             statusLabel: 'REMOTE_REVOKE_FAILED',
             errorText: msg.errorText || '',
           }
@@ -617,11 +842,14 @@ export function initAuthLifecycle(onStateChange) {
 
   window.addEventListener('pageshow', (event) => {
     if (event.persisted) {
+      const hasCookieHint = hasSessionHintCookie();
       clearPrivateState('بازیابی از BFCache شناسایی و حافظه نشست پاک‌سازی شد.', {
         broadcastLogout: false,
+        logoutBarrier: !hasCookieHint,
+        retryableLogout: false,
         statusLabel: 'UNAUTHENTICATED',
       });
-      if (hasSessionHintCookie()) {
+      if (hasCookieHint) {
         refreshSessionCoordinated({ force: true }).catch(() => {});
       }
     }

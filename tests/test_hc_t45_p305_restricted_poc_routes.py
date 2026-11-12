@@ -29,6 +29,7 @@ import uuid
 import asyncpg
 import httpx
 import pytest
+import redis
 import uvicorn
 from playwright.async_api import async_playwright
 
@@ -39,6 +40,7 @@ from src.core.cors import CorsConfigurationError
 from src.core.env import EnvironmentConfigurationError
 from src.core.policy import get_all_open_policy_statuses
 from src.core.security import hash_password
+from src.profiles.service import ProfileService
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -530,6 +532,466 @@ async def test_t45_browser_logout_failure_preserves_honest_warning_and_allows_re
             assert "hc_refresh" not in post_jar
             assert "hc_csrf" not in post_jar
             assert "hc_has_session" not in post_jar
+
+            await context.close()
+            await browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        if uid is not None:
+            cleanup_conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                await cleanup_conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM user_roles WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM users WHERE id = $1;", uid)
+            finally:
+                await cleanup_conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logout_status", [403, 200])
+async def test_t45_single_tab_logout_barrier_prevents_inflight_resurrection(
+    monkeypatch, logout_status: int
+):
+    await deps.close_pool()
+    deps.close_redis()
+
+    port = _find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
+    monkeypatch.setenv(
+        "ACCESS_TOKEN_SECRET",
+        "t45-single-tab-race-signing-secret-material-64-chars-min-0001",
+    )
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", base_url)
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+
+    mobile = f"0919{uuid.uuid4().int % 10000000:07d}"
+    pwd = "RaceBarrier!901"
+    pwd_hash = hash_password(pwd)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    uid = None
+    try:
+        uid = await conn.fetchval(
+            """
+            INSERT INTO users (mobile, password_hash, status, is_mobile_verified)
+            VALUES ($1, $2, 'ACTIVE', TRUE)
+            RETURNING id;
+            """,
+            mobile,
+            pwd_hash,
+        )
+        await conn.execute("INSERT INTO user_roles (user_id, role_id) VALUES ($1, 'USER');", uid)
+        prof_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
+        try:
+            await ProfileService(prof_pool).upsert_profile(
+                user_id=uid,
+                first_name="نام‌نمایشی",
+                last_name="نبایدبماند",
+            )
+        finally:
+            await prof_pool.close()
+    finally:
+        await conn.close()
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as probe:
+            for _ in range(50):
+                try:
+                    resp = await probe.get("/api/v1/health")
+                    if resp.status_code == 200:
+                        break
+                except Exception:
+                    await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Live uvicorn failed to start for single-tab race test")
+
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            page = await context.new_page()
+
+            await page.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "UNAUTHENTICATED")
+
+            await page.fill("#hc-pwd-mobile", mobile)
+            await page.fill("#hc-pwd-input", pwd)
+            await page.click("#hc-pwd-login-btn")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "AUTHENTICATED")
+            assert "نام‌نمایشی" in await page.inner_text("#hc-auth-profile-box")
+
+            refresh_started = asyncio.Event()
+            release_refresh = asyncio.Event()
+            profile_started = asyncio.Event()
+            release_profile = asyncio.Event()
+
+            async def _delayed_refresh(route):
+                refresh_started.set()
+                await release_refresh.wait()
+                try:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body='{"access_token":"hc_at_v1.stale.resurrect","expires_in":300}',
+                    )
+                except Exception:
+                    pass
+
+            async def _delayed_profile(route):
+                profile_started.set()
+                await release_profile.wait()
+                try:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body='{"user_id":"stale","mobile":"09120000000","roles":["USER"],"first_name":"نام‌نمایشی","last_name":"نبایدبماند","has_profile":true}',
+                    )
+                except Exception:
+                    pass
+
+            async def _logout_handler(route):
+                if logout_status == 403:
+                    await route.fulfill(
+                        status=403,
+                        content_type="application/json",
+                        body='{"detail":"Simulated transient CSRF failure"}',
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/api/v1/auth/refresh", _delayed_refresh)
+            await page.route("**/api/v1/profile/me", _delayed_profile)
+            await page.route("**/api/v1/auth/logout", _logout_handler)
+
+            # Start both in-flight refresh and profile fetch, then log out before either resolves
+            await page.click("#hc-refresh-btn")
+            await page.click("#hc-fetch-profile-btn")
+            await asyncio.wait_for(refresh_started.wait(), timeout=5.0)
+            await asyncio.wait_for(profile_started.wait(), timeout=5.0)
+
+            await page.click("#hc-top-logout-btn")
+            expected_status = "REMOTE_REVOKE_FAILED" if logout_status == 403 else "UNAUTHENTICATED"
+            await _wait_selector_text(page, "#hc-auth-status-badge", expected_status)
+
+            # Release delayed responses -> barrier + epoch + AbortController MUST keep state scrubbed
+            release_refresh.set()
+            release_profile.set()
+            await page.wait_for_timeout(250)
+
+            assert (await page.inner_text("#hc-auth-status-badge")).strip() == expected_status
+            audit_json = await page.inner_text("#hc-auth-audit-box")
+            assert '"authenticated": false' in audit_json
+            assert '"hasAccessTokenInClosure": false' in audit_json
+            assert '"logoutBarrierActive": true' in audit_json
+            profile_text = await page.inner_text("#hc-auth-profile-box")
+            assert "نام‌نمایشی" not in profile_text
+            assert "نبایدبماند" not in profile_text
+            assert "هنوز پروفایلی بارگذاری نشده است." in profile_text
+
+            await context.close()
+            await browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        if uid is not None:
+            cleanup_conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                await cleanup_conn.execute("DELETE FROM profiles WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM user_roles WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM users WHERE id = $1;", uid)
+            finally:
+                await cleanup_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t45_cross_tab_stale_broadcast_cannot_resurrect_logged_out_tab(monkeypatch):
+    await deps.close_pool()
+    deps.close_redis()
+
+    port = _find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
+    monkeypatch.setenv(
+        "ACCESS_TOKEN_SECRET",
+        "t45-cross-tab-race-signing-secret-material-64-chars-min-0001",
+    )
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", base_url)
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+
+    mobile = f"0919{uuid.uuid4().int % 10000000:07d}"
+    pwd = "CrossTabBarrier!901"
+    pwd_hash = hash_password(pwd)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    uid = None
+    try:
+        uid = await conn.fetchval(
+            """
+            INSERT INTO users (mobile, password_hash, status, is_mobile_verified)
+            VALUES ($1, $2, 'ACTIVE', TRUE)
+            RETURNING id;
+            """,
+            mobile,
+            pwd_hash,
+        )
+        await conn.execute("INSERT INTO user_roles (user_id, role_id) VALUES ($1, 'USER');", uid)
+    finally:
+        await conn.close()
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as probe:
+            for _ in range(50):
+                try:
+                    resp = await probe.get("/api/v1/health")
+                    if resp.status_code == 200:
+                        break
+                except Exception:
+                    await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Live uvicorn failed to start for cross-tab race test")
+
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            tab_a = await context.new_page()
+            tab_b = await context.new_page()
+
+            await tab_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "UNAUTHENTICATED")
+
+            await tab_a.fill("#hc-pwd-mobile", mobile)
+            await tab_a.fill("#hc-pwd-input", pwd)
+            await tab_a.click("#hc-pwd-login-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            await tab_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await _wait_selector_text(tab_b, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            # Force 403 logout failure on tab_a -> REMOTE_REVOKE_FAILED with active logout barrier
+            async def _fail_logout_403(route):
+                await route.fulfill(
+                    status=403,
+                    content_type="application/json",
+                    body='{"detail":"Transient failure on logout"}',
+                )
+
+            await tab_a.route("**/api/v1/auth/logout", _fail_logout_403)
+            await tab_a.click("#hc-top-logout-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "REMOTE_REVOKE_FAILED")
+            await _wait_selector_text(tab_b, "#hc-auth-status-badge", "REMOTE_REVOKE_FAILED")
+
+            # Delayed background TOKEN_REFRESHED (explicitLogin: false) from tab_b MUST NOT resurrect tab_a
+            await tab_b.evaluate(
+                """() => {
+                  const ch = new BroadcastChannel('hamicard_phase3_auth');
+                  ch.postMessage({
+                    type: 'TOKEN_REFRESHED',
+                    accessToken: 'hc_at_v1.late_cross_tab_stale_token',
+                    accessExpiresAtMs: Date.now() + 300000,
+                    accessTtlMs: 300000,
+                    explicitLogin: false,
+                    authEpoch: 1,
+                  });
+                  ch.close();
+                }"""
+            )
+            await tab_a.wait_for_timeout(200)
+
+            assert (await tab_a.inner_text("#hc-auth-status-badge")).strip() == "REMOTE_REVOKE_FAILED"
+            audit_json = await tab_a.inner_text("#hc-auth-audit-box")
+            assert '"authenticated": false' in audit_json
+            assert '"hasAccessTokenInClosure": false' in audit_json
+            assert '"logoutBarrierActive": true' in audit_json
+
+            # Explicit new login on tab_b MUST break the barrier cleanly and sync tab_a to AUTHENTICATED
+            await tab_b.fill("#hc-pwd-mobile", mobile)
+            await tab_b.fill("#hc-pwd-input", pwd)
+            await tab_b.click("#hc-pwd-login-btn")
+            await _wait_selector_text(tab_b, "#hc-auth-status-badge", "AUTHENTICATED")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            await context.close()
+            await browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        if uid is not None:
+            cleanup_conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                await cleanup_conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM user_roles WHERE user_id = $1;", uid)
+                await cleanup_conn.execute("DELETE FROM users WHERE id = $1;", uid)
+            finally:
+                await cleanup_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t45_real_backend_redis_outage_503_logout_clears_cookies_without_broken_retry(
+    monkeypatch,
+):
+    await deps.close_pool()
+    deps.close_redis()
+
+    port = _find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
+    monkeypatch.setenv(
+        "ACCESS_TOKEN_SECRET",
+        "t45-real-503-logout-signing-secret-material-64-chars-min-0001",
+    )
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", base_url)
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+
+    mobile = f"0919{uuid.uuid4().int % 10000000:07d}"
+    pwd = "Real503RedisOutage!901"
+    pwd_hash = hash_password(pwd)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    uid = None
+    try:
+        uid = await conn.fetchval(
+            """
+            INSERT INTO users (mobile, password_hash, status, is_mobile_verified)
+            VALUES ($1, $2, 'ACTIVE', TRUE)
+            RETURNING id;
+            """,
+            mobile,
+            pwd_hash,
+        )
+        await conn.execute("INSERT INTO user_roles (user_id, role_id) VALUES ($1, 'USER');", uid)
+    finally:
+        await conn.close()
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    try:
+        async with httpx.AsyncClient(base_url=base_url) as probe:
+            for _ in range(50):
+                try:
+                    resp = await probe.get("/api/v1/health")
+                    if resp.status_code == 200:
+                        break
+                except Exception:
+                    await asyncio.sleep(0.1)
+            else:
+                pytest.fail("Live uvicorn failed to start for real Redis 503 logout test")
+
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            page = await context.new_page()
+
+            await page.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "UNAUTHENTICATED")
+
+            await page.fill("#hc-pwd-mobile", mobile)
+            await page.fill("#hc-pwd-input", pwd)
+            await page.click("#hc-pwd-login-btn")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            pre_jar = {c["name"]: c for c in await context.cookies()}
+            assert "hc_refresh" in pre_jar
+            assert "hc_csrf" in pre_jar
+            assert "hc_has_session" in pre_jar
+
+            # Inject real Redis outage for session family revocation on the live backend (no route mock!)
+            real_redis = deps.get_redis()
+            orig_set = real_redis.set
+
+            def _failing_revocation_set(name, value, *args, **kwargs):
+                if isinstance(name, str) and name.startswith("hc:revoked_family:"):
+                    raise redis.exceptions.ConnectionError("Simulated Redis outage on logout")
+                return orig_set(name, value, *args, **kwargs)
+
+            monkeypatch.setattr(real_redis, "set", _failing_revocation_set)
+
+            async with page.expect_response(
+                lambda r: r.url.endswith("/api/v1/auth/logout") and r.request.method == "POST"
+            ) as logout_resp_info:
+                await page.click("#hc-top-logout-btn")
+            logout_resp = await logout_resp_info.value
+            assert logout_resp.status == 503
+
+            await _wait_selector_text(page, "#hc-auth-status-badge", "REMOTE_REVOKE_FAILED")
+            session_badge_text = await page.inner_text("#hc-session-badge")
+            assert "تأیید نشد" in session_badge_text
+
+            # Because real backend 503 cleared browser cookies, broken retry buttons MUST NOT render
+            assert await page.locator("#hc-retry-logout-btn").count() == 0
+            assert await page.locator("#hc-auth-retry-logout-btn").count() == 0
+            assert await page.locator("#hc-relogin-after-logout-btn").count() == 1
+            assert await page.locator("#hc-auth-cookies-cleared-note").count() == 1
+            assert await page.locator("#hc-auth-error-msg").count() == 1
+
+            audit_json = await page.inner_text("#hc-auth-audit-box")
+            assert '"hasAccessTokenInClosure": false' in audit_json
+            assert '"canRetryLogout": false' in audit_json
+            assert '"logoutBarrierActive": true' in audit_json
+
+            # Browser cookies MUST be cleared by the real 503 Set-Cookie deletion headers
+            post_jar = {c["name"]: c for c in await context.cookies()}
+            assert "hc_refresh" not in post_jar
+            assert "hc_csrf" not in post_jar
+            assert "hc_has_session" not in post_jar
+
+            # DB SSOT refresh token family MUST already be revoked cleanly
+            verify_conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                active_rows = await verify_conn.fetchval(
+                    "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND status = 'ACTIVE';",
+                    uid,
+                )
+                revoked_rows = await verify_conn.fetchval(
+                    "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND status = 'REVOKED';",
+                    uid,
+                )
+                assert active_rows == 0
+                assert revoked_rows >= 1
+            finally:
+                await verify_conn.close()
+
+            # Reloading MUST stay logged out (never restores deleted cookie session)
+            await page.reload(wait_until="networkidle")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "UNAUTHENTICATED")
 
             await context.close()
             await browser.close()

@@ -101,6 +101,10 @@ function renderSessionBar() {
   const snap = getAuthSnapshot();
 
   if (snap.status === 'REMOTE_REVOKE_FAILED') {
+    const actionsHtml = snap.canRetryLogout
+      ? `<button type="button" id="hc-retry-logout-btn" class="hc-btn hc-btn--danger">تلاش مجدد خروج سروری</button>
+         <a href="#/auth/shell" class="hc-btn hc-btn--secondary">مرکز کنترل نشست</a>`
+      : `<a id="hc-relogin-after-logout-btn" href="#/auth/shell" class="hc-btn hc-btn--primary">ورود مجدد به نشست</a>`;
     return `
       <div id="hc-session-bar" class="hc-session-bar hc-session-bar--expired" role="alert" aria-label="هشدار عدم تأیید خروج سروری">
         <div class="hc-flex-wrap">
@@ -108,8 +112,7 @@ function renderSessionBar() {
           <span id="hc-logout-warning-banner" class="hc-text-err-sm">${escapeHtml(snap.lastErrorMessage || snap.lastEventMessage)}</span>
         </div>
         <div class="hc-flex-wrap">
-          <button type="button" id="hc-retry-logout-btn" class="hc-btn hc-btn--danger">تلاش مجدد خروج سروری</button>
-          <a href="#/auth/shell" class="hc-btn hc-btn--secondary">مرکز کنترل نشست</a>
+          ${actionsHtml}
         </div>
       </div>
     `;
@@ -424,6 +427,8 @@ function renderAuthShellView() {
     refreshCallsThisTab: snap.refreshCallsThisTab,
     visibleCookieNames: snap.visibleCookieNames,
     hasSessionHintCookie: snap.hasSessionHintCookie,
+    canRetryLogout: snap.canRetryLogout,
+    logoutBarrierActive: snap.logoutBarrierActive,
     persistentWebStorageUsed: false,
   };
 
@@ -451,8 +456,10 @@ function renderAuthShellView() {
             : ''
         }
         ${
-          snap.status === 'REMOTE_REVOKE_FAILED'
+          snap.status === 'REMOTE_REVOKE_FAILED' && snap.canRetryLogout
             ? `<div class="hc-mt-sm"><button type="button" id="hc-auth-retry-logout-btn" class="hc-btn hc-btn--danger">تلاش مجدد برای لغو نشست در سرور</button></div>`
+            : snap.status === 'REMOTE_REVOKE_FAILED'
+            ? `<div id="hc-auth-cookies-cleared-note" class="hc-mt-sm hc-text-sec-sm">کوکی‌های مرورگر پاک شده‌اند؛ برای ادامه می‌توانید از فرم‌های پایین دوباره وارد شوید.</div>`
             : ''
         }
       </div>
@@ -606,7 +613,8 @@ function renderRolePanel(roleKey) {
   if (overrideState) return overrideState;
 
   const snap = getAuthSnapshot();
-  const shouldVerifyWithServer = snap.authenticated || hasSessionHintCookie();
+  const shouldVerifyWithServer =
+    snap.authenticated || (!snap.logoutBarrierActive && hasSessionHintCookie());
 
   if (shouldVerifyWithServer) {
     const expectedKey = `${roleKey}:${getSessionVersion()}`;
@@ -850,11 +858,13 @@ function bindViewEvents() {
     APP_STATE.panelDecisionKey = null;
     APP_STATE.panelDecision = null;
     render();
-    announceStatus(
-      res && res.revokedOnServer
-        ? 'خروج امن با تأیید سرور انجام شد.'
-        : 'هشدار: لغو نشست روی سرور تأیید نشد؛ تلاش مجدد لازم است.'
-    );
+    if (res && res.revokedOnServer) {
+      announceStatus('خروج امن با تأیید سرور انجام شد.');
+    } else if (res && res.canRetryLogout) {
+      announceStatus('هشدار: لغو نشست روی سرور تأیید نشد؛ تلاش مجدد لازم است.');
+    } else {
+      announceStatus('هشدار: کوکی‌های نشست پاک شدند اما تأیید فوری سرویس ابطال در دسترس نبود.');
+    }
   };
 
   const topLogoutBtn = document.getElementById('hc-top-logout-btn');
@@ -960,17 +970,7 @@ function bindViewEvents() {
 
   const logoutBtn = document.getElementById('hc-logout-btn');
   if (logoutBtn) {
-    logoutBtn.addEventListener('click', async () => {
-      const res = await logoutCookie();
-      APP_STATE.panelDecisionKey = null;
-      APP_STATE.panelDecision = null;
-      render();
-      announceStatus(
-        res && res.revokedOnServer
-          ? 'خروج امن با تأیید سرور انجام شد.'
-          : 'هشدار: لغو نشست روی سرور تأیید نشد؛ تلاش مجدد لازم است.'
-      );
-    });
+    logoutBtn.addEventListener('click', handleLogoutAttempt);
   }
 
   const searchEl = document.getElementById('hc-doc-search');
