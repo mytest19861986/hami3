@@ -1,34 +1,40 @@
 """
 Pre-Implementation Deterministic Counterexample Suite for HC-T52 / HC-T53 (HC-CMD-053 / HC-CMD-054).
 Baseline: BL-HAMICARD-PRD-V1 | Base SHA: e7c2bb81f7278e1d9a0fe8ca75e56d06fec753fb
-Revision: HC-T52 Revision 1 (addresses R2-T52-V4-F01..F08 + Test Audit)
+Revision: HC-T52 Revision 2 (closes R2-T52-REV1-H01..H07, REV1-M01..M04, R2-T52-V4-F01..F08)
 
-RED_TEST_MATRIX (`CE-01..CE-13`):
+RED_TEST_MATRIX (`CE-01..CE-14`):
 - CE-01  (C2-H01): Delayed attempt cancellation `[B1]` never advances logout_seq or revokes newer `F3`.
-- CE-02  (C2-H02/H04/F01): Pre-logout server-started attempt racing `/logout` always leaves 0 active tokens & valid PG order.
-- CE-03a (C2-H02/F06): Partial PG outage mid-revocation fails 503, preserves ACTIVE rows, and heals on retry.
-- CE-03b (C2-H02/F06): Redis outage after PG commit leaves PENDING_REVOKE durable; concurrent dual reconcilers (SKIP LOCKED) promote 100%.
+- CE-02  (C2-H02/H04/REV1-H03): Deterministic Phase A->Phase B PG fence barrier racing `/logout` + reverse post-logout schedule.
+- CE-03a (C2-H02/F06/REV1-H02): PG outage mid-revocation fails 503, preserves ACTIVE rows; retry revokes F1 while separate device F2 stays ACTIVE.
+- CE-03b (C2-H02/F06/REV1-M01): Redis outage leaves PENDING_REVOKE durable; forced overlapping dual workers (`SKIP LOCKED`) partition disjoint batches.
 - CE-04  (C2-H03): Two fresh Playwright tabs concurrently clicking Login converge to 1 `hc_browser`; logout revokes all.
 - CE-05  (C2-H04): Every `hc_coord` write runs strictly inside `navigator.locks('hamicard_phase3_coord')`.
-- CE-06  (C2-M01/L01): Forged `Authorization: Bearer fake` cannot elevate `/login-attempts/cancel` quota above 20 reqs/60s.
+- CE-06  (C2-M01/L01): Forged `Authorization: Bearer fake` cannot elevate `/login-attempts/cancel` quota above 20 reqs/120s.
 - CE-07a (C2-M01/F02): Cross-user AND anonymous same-browser (no capability) cancel against bound session blocked (403); capability succeeds.
-- CE-07b (C2-M01): Anonymous `hc_browser` cookie gets unauth 20 req quota & <= 120s tombstone TTL.
-- CE-08  (C2-M02/F04/F05): Delayed 200 cookie overwrite rejects stale F1 (401) & rebinds F3 even when BroadcastChannel is blocked.
-- CE-08b (C2-M02/F04/F05): Adversarial `/session/rebind-cookie` matrix (expired, bad origin, wrong browser, old family, logout race, concurrent refresh).
+- CE-07b (C2-M01): Anonymous `hc_browser` cookie gets `:anon:` 20 req quota & <= 125s TTL.
+- CE-08  (C2-M02/REV1-H04): Unconditionally verified delayed F1 overwrite + all-page BroadcastChannel suppression -> `401 /refresh` auto-rebinds F3.
+- CE-08b (F04/F05/REV1-H04): Normal-TTL (120s) `/session/rebind-cookie` adversarial matrix (old family, bad origin, missing/wrong browser, refresh & logout race).
+- CE-08c (F04/F05/REV1-H04): Isolated expired-bearer JWT rejected 401 on `/session/rebind-cookie`.
 - CE-09  (C2-M03): Both 429 & 503 cancellation failures preserve `canRetryLogout`, `unresolvedAttemptCount >= 1`, and error copy.
 - CE-10  (C2-H01/AC-15): Browser A logout/cancel keeps multi-device Browser B and unrelated User B sessions ACTIVE.
-- CE-11  (F01/F03): Forged `started_server_logout_seq=999` bypass (pwd + OTP) rejected 409; concurrent duplicate `attempt_id` creates <= 1 family.
-- CE-12  (F08): Continuous Lua ZSET sliding-window boundary + 429 non-pollution + weighted IDs (64 cap) + Redis 503 fail-closed.
-- CE-13  (F07): Missing `navigator.locks` + forged `bi=1` hint fails closed rather than running unlocked cross-tab race.
+- CE-11a (F01/REV1-M04): Forged `started_server_logout_seq=999` bypass rejected 409 on `/password/login`.
+- CE-11b (F01/REV1-M04): Forged `started_server_logout_seq=999` bypass rejected 409 on `/otp/verify`.
+- CE-11c (F03/REV1-H05/M04): Concurrent duplicate `attempt_id` creates <= 1 family & rejects duplicate 409; PG FK rejects mismatched `(attempt_id, family_id)`.
+- CE-12a (F08/REV1-M04): Continuous Lua ZSET sliding-window boundary pruning & 429 non-pollution.
+- CE-12b (REV1-H06): Mixed `:anon:` (120s) and `:auth:` (300s) namespace isolation prevents anonymous pruning/shortening of authenticated entries.
+- CE-12c (F08/REV1-M04): Weighted attempt-ID quota (`64` unauth IDs) & Redis outage 503 fail-closed.
+- CE-13a (F07): Missing `navigator.locks` fails closed (`WEB_LOCKS_UNAVAILABLE`) with zero login traffic.
+- CE-13b (F07/REV1-M02): Forged `hc_coord.bi=1` WITH normal `navigator.locks` still triggers `/coord/session` & cannot bypass validation.
+- CE-14  (REV1-H07/H01): Pre-Phase-A delayed `/password/login` after `/login-attempts/start` rejected 409, unregistered `hc_browser` login rejected 409, & competing lock-order stress completes with 0 deadlocks.
 """
 
 import asyncio
 import os
 import pathlib
 import socket
-import subprocess
-import sys
 import threading
+import time
 import uuid
 
 import asyncpg
@@ -42,6 +48,7 @@ import src.api.auth as auth_mod
 import src.api.deps as deps
 from src.api.main import create_app
 from src.auth.otp_service import OtpService
+from src.auth.service import AuthService
 from src.auth.session_service import SessionService
 from src.core.security import hash_password
 from src.profiles.service import ProfileService
@@ -224,6 +231,21 @@ def _clear_rate_limit_keys() -> None:
         r.close()
 
 
+async def _register_attempt_if_supported(
+    client: httpx.AsyncClient, attempt_id: str, *, flow: str = "PASSWORD"
+) -> dict | None:
+    resp = await client.post(
+        "/api/v1/auth/login-attempts/start",
+        json={"attempt_id": attempt_id, "flow": flow},
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    assert resp.status_code == 404, (
+        f"Unexpected /login-attempts/start status={resp.status_code}: {resp.text}"
+    )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CE-01 (C2-H01): Delayed attempt cancellation [B1] must preserve newer F3
 # ---------------------------------------------------------------------------
@@ -246,6 +268,7 @@ async def test_ce01_delayed_attempt_cancel_preserves_newer_session(monkeypatch):
 
                 # 1. Tab B creates session F1 via attempt B1
                 b1 = f"hc_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client, b1)
                 r1 = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -265,6 +288,7 @@ async def test_ce01_delayed_attempt_cancel_preserves_newer_session(monkeypatch):
 
                 # 3. Tab A logs in again with new attempt B3 -> creates valid session F3
                 b3 = f"hc_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client, b3)
                 r3 = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -310,216 +334,143 @@ async def test_ce01_delayed_attempt_cancel_preserves_newer_session(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# CE-02 (C2-H02/H04/F01): Pre-logout attempt racing /logout NEVER survives
-# and always maintains strict PG causal ordering + REVOKED status
+# CE-02 (C2-H02/H04/F01/REV1-H03): Deterministic Phase A -> Phase B PG fence
+# racing /logout + post-logout fresh start commits legitimately
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ce02_pre_logout_attempt_racing_logout_never_survives_or_inverts_coord(monkeypatch):
     _clear_rate_limit_keys()
     uid, mobile = await _create_test_user(["USER"])
-    port2 = _find_free_port()
-    base_url2 = f"http://127.0.0.1:{port2}"
-    server1, thread1, base_url1 = await _start_test_server(
-        monkeypatch, thread_name="ce02-worker-logout"
-    )
-    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", f"{base_url1},{base_url2}")
-
-    worker2_env = os.environ.copy()
-    worker2_env.update(
-        {
-            "ENVIRONMENT": "test",
-            "DATABASE_URL": DATABASE_URL,
-            "REDIS_URL": REDIS_URL,
-            "ACCESS_TOKEN_SECRET": ACCESS_SECRET,
-            "ACCESS_TOKEN_TTL_SECONDS": "300",
-            "CORS_ALLOWED_ORIGINS": f"{base_url1},{base_url2}",
-        }
-    )
-    worker2_env.pop("COOKIE_SECURE", None)
-
-    worker2_proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "src.api.main:create_app",
-            "--factory",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port2),
-            "--log-level",
-            "warning",
-        ],
-        cwd=str(ROOT_DIR),
-        env=worker2_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
+    server, thread, base_url = await _start_test_server(monkeypatch)
     try:
-        async with httpx.AsyncClient(base_url=base_url2) as probe2:
-            for _ in range(60):
-                try:
-                    if (await probe2.get("/api/v1/health")).status_code == 200:
-                        break
-                except Exception:
-                    await asyncio.sleep(0.1)
-            else:
-                pytest.fail("Worker 2 subprocess failed to become healthy for CE-02.")
-
-        raw_redis = deps.get_redis()
-        logout_mid_coord = threading.Event()
-        worker2_login_done = threading.Event()
-
-        class _InterleavingRedisProxy:
-            def __init__(self, inner):
-                self._inner = inner
-
-            def __getattr__(self, name):
-                return getattr(self._inner, name)
-
-            def incr(self, key, *args, **kwargs):
-                res = self._inner.incr(key, *args, **kwargs)
-                if (
-                    threading.current_thread().name == "ce02-worker-logout"
-                    and isinstance(key, str)
-                    and key.startswith("hc:browser_global_seq:")
-                    and not logout_mid_coord.is_set()
-                ):
-                    logout_mid_coord.set()
-                    worker2_login_done.wait(timeout=3.0)
-                return res
-
-        monkeypatch.setattr(deps, "_redis", _InterleavingRedisProxy(raw_redis))
-
-        async with httpx.AsyncClient(
-            base_url=base_url1, headers={"Origin": base_url1}
-        ) as client_a:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_a:
             await client_a.post("/api/v1/auth/coord/session")
             shared_browser_cookie = client_a.cookies.get("hc_browser")
             assert shared_browser_cookie
 
-            # Initial session F1 on same browser via Worker 2
-            async with httpx.AsyncClient(
-                base_url=base_url2,
-                headers={"Origin": base_url2},
-                cookies={"hc_browser": shared_browser_cookie},
-            ) as init_login_client:
-                r1 = await init_login_client.post(
-                    "/api/v1/auth/password/login",
-                    headers={"X-Auth-Mode": "cookie"},
-                    json={
-                        "mobile": mobile,
-                        "password": "HamiCounter!901",
-                        "attempt_id": f"hc_{uuid.uuid4().hex}",
-                    },
-                )
-                assert r1.status_code == 200
-                csrf1 = r1.cookies.get("hc_csrf")
-                ref1 = r1.cookies.get("hc_refresh")
+            # Initial session F1 via registered login-attempts/start
+            a1 = f"hc_a1_{uuid.uuid4().hex}"
+            st1 = await client_a.post(
+                "/api/v1/auth/login-attempts/start",
+                json={"attempt_id": a1, "flow": "PASSWORD"},
+            )
+            assert st1.status_code == 200, f"F01/H03: /login-attempts/start missing or failed: {st1.status_code}"
+            assert st1.json()["started_logout_seq"] == 0
 
-            # Register Worker 2 attempt B2 BEFORE /logout begins!
+            r1 = await client_a.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a1},
+            )
+            assert r1.status_code == 200
+            csrf1 = client_a.cookies.get("hc_csrf")
+            ref1 = client_a.cookies.get("hc_refresh")
+
+            # Register pre-logout attempt B2 BEFORE /logout begins!
             b2_attempt = f"hc_b2_{uuid.uuid4().hex}"
-            async with httpx.AsyncClient(
-                base_url=base_url2,
-                headers={"Origin": base_url2},
-                cookies={"hc_browser": shared_browser_cookie},
-            ) as start_client:
-                start_resp = await start_client.post(
-                    "/api/v1/auth/login-attempts/start",
-                    json={"attempt_id": b2_attempt, "flow": "PASSWORD"},
-                )
-                if start_resp.status_code == 200:
-                    assert start_resp.json()["started_logout_seq"] == 0
+            start_resp = await client_a.post(
+                "/api/v1/auth/login-attempts/start",
+                json={"attempt_id": b2_attempt, "flow": "PASSWORD"},
+            )
+            assert start_resp.status_code == 200
+            assert start_resp.json()["started_logout_seq"] == 0
+            assert start_resp.json().get("cancel_capability")
 
-            async def do_logout_worker1():
+            # Schedule 1: Deterministic PG Phase A -> Phase B barrier via authenticate_via_password
+            pause_b2 = {"active": True}
+            b2_entered_slow_auth = threading.Event()
+            release_b2_phase_b = threading.Event()
+            orig_auth_pwd = AuthService.authenticate_via_password
+
+            async def _paused_auth_pwd(self, *args, **kwargs):
+                res = await orig_auth_pwd(self, *args, **kwargs)
+                if pause_b2["active"]:
+                    pause_b2["active"] = False
+                    b2_entered_slow_auth.set()
+                    await asyncio.to_thread(release_b2_phase_b.wait, 5.0)
+                return res
+
+            monkeypatch.setattr(AuthService, "authenticate_via_password", _paused_auth_pwd)
+
+            async def do_b2_login():
                 async with httpx.AsyncClient(
-                    base_url=base_url1,
-                    headers={"Origin": base_url1, "X-Auth-Mode": "cookie", "X-CSRF-Token": csrf1},
-                    cookies={"hc_browser": shared_browser_cookie, "hc_refresh": ref1, "hc_csrf": csrf1},
-                ) as lo_client:
-                    return await lo_client.post("/api/v1/auth/logout")
-
-            async def do_concurrent_login_worker2():
-                await asyncio.to_thread(logout_mid_coord.wait, 0.2)
-                try:
-                    async with httpx.AsyncClient(
-                        base_url=base_url2,
-                        headers={"Origin": base_url2},
-                        cookies={"hc_browser": shared_browser_cookie},
-                    ) as client_b:
-                        body = {
+                    base_url=base_url,
+                    headers={"Origin": base_url},
+                    cookies={"hc_browser": shared_browser_cookie},
+                ) as client_b:
+                    return await client_b.post(
+                        "/api/v1/auth/password/login",
+                        headers={"X-Auth-Mode": "cookie"},
+                        json={
                             "mobile": mobile,
                             "password": "HamiCounter!901",
                             "attempt_id": b2_attempt,
-                        }
-                        if start_resp.status_code != 200:
-                            body["started_server_logout_seq"] = 0
-                        return await client_b.post(
-                            "/api/v1/auth/password/login",
-                            headers={"X-Auth-Mode": "cookie"},
-                            json=body,
-                        )
-                finally:
-                    worker2_login_done.set()
+                        },
+                    )
 
-            lo1_resp, r2_resp = await asyncio.gather(
-                do_logout_worker1(), do_concurrent_login_worker2()
-            )
-            assert lo1_resp.status_code == 200
-            lo1_coord = lo1_resp.json().get("auth_coord", {})
-            surviving = await _count_active_refresh_tokens(uid)
+            b2_task = asyncio.create_task(do_b2_login())
+            entered = await asyncio.to_thread(b2_entered_slow_auth.wait, 5.0)
+            assert entered, "Pre-logout B2 never reached Phase A -> slow auth boundary!"
 
-            # Because B2 genuinely started BEFORE /logout (started_logout_seq=0), NO schedule
-            # is permitted to leave B2 surviving after /logout completed!
-            assert surviving == 0, (
-                f"C2-H02/F01: Pre-logout attempt B2 leaked {surviving} surviving ACTIVE session(s) after /logout! "
-                f"(r2_status={r2_resp.status_code}, lo1_coord={lo1_coord})"
+            # Tab A executes /logout while B2 is paused strictly between Phase A and Phase B!
+            async with httpx.AsyncClient(
+                base_url=base_url,
+                headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": csrf1},
+                cookies={"hc_browser": shared_browser_cookie, "hc_refresh": ref1, "hc_csrf": csrf1},
+            ) as lo_client:
+                lo1_resp = await lo_client.post("/api/v1/auth/logout")
+                assert lo1_resp.status_code == 200
+                lo1_coord = lo1_resp.json().get("auth_coord", {})
+
+            release_b2_phase_b.set()
+            r2_resp = await b2_task
+            assert r2_resp.status_code == 409, (
+                f"F01/H03: Delayed pre-logout attempt B2 MUST fail 409 at Phase B after /logout, got {r2_resp.status_code}"
             )
-            assert int(lo1_coord.get("logout_seq", 0)) > int(lo1_coord.get("login_seq", 0)), (
-                f"C2-H04: Inverted causal auth_coord returned by /logout while surviving=0: {lo1_coord}"
-            )
-            if r2_resp.status_code == 200:
-                r2_coord = r2_resp.json().get("auth_coord", {})
-                assert int(lo1_coord.get("logout_seq", 0)) > int(r2_coord.get("login_seq", 0)), (
-                    f"C2-H04: /password/login returned 200 after logout committed! lo1={lo1_coord}, r2={r2_coord}"
-                )
-            else:
-                assert r2_resp.status_code == 409
+            assert await _count_active_refresh_tokens(uid) == 0
+            assert int(lo1_coord.get("logout_seq", 0)) > int(lo1_coord.get("login_seq", 0))
 
             conn = await asyncpg.connect(DATABASE_URL)
             try:
-                has_bsf = await conn.fetchval(
-                    "SELECT to_regclass('public.browser_session_families') IS NOT NULL;"
-                )
-                assert has_bsf, "T52/T53 SSOT table browser_session_families must exist."
+                assert await conn.fetchval("SELECT to_regclass('public.browser_session_families') IS NOT NULL;")
                 non_revoked_fams = await conn.fetchval(
                     "SELECT COUNT(*) FROM browser_session_families WHERE user_id = $1 AND status != 'REVOKED';",
                     uid,
                 )
                 assert non_revoked_fams == 0
-                if start_resp.status_code == 200:
-                    start_seq_stored = await conn.fetchval(
-                        "SELECT started_logout_seq FROM login_attempt_states WHERE attempt_id = $1;",
-                        b2_attempt,
-                    )
-                    assert start_seq_stored == 0
+                start_seq_stored = await conn.fetchval(
+                    "SELECT started_logout_seq FROM login_attempt_states WHERE attempt_id = $1;",
+                    b2_attempt,
+                )
+                assert start_seq_stored == 0
             finally:
                 await conn.close()
+
+            # Schedule 2 (competing post-logout registration): B3 registered AFTER logout succeeds cleanly!
+            b3_attempt = f"hc_b3_{uuid.uuid4().hex}"
+            st3 = await client_a.post(
+                "/api/v1/auth/login-attempts/start",
+                json={"attempt_id": b3_attempt, "flow": "PASSWORD"},
+            )
+            assert st3.status_code == 200
+            assert st3.json()["started_logout_seq"] >= 1
+            r3 = await client_a.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": b3_attempt},
+            )
+            assert r3.status_code == 200
+            r3_coord = r3.json()["auth_coord"]
+            assert int(r3_coord["login_seq"]) > int(r3_coord["logout_seq"])
+            assert await _count_active_refresh_tokens(uid) == 1
     finally:
-        worker2_proc.terminate()
-        try:
-            worker2_proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            worker2_proc.kill()
-        await _stop_server(server1, thread1)
+        await _stop_server(server, thread)
         await _cleanup_user(uid)
 
 
 # ---------------------------------------------------------------------------
-# CE-03a (C2-H02/F06): PG failure mid-revocation fails closed 503, keeps rows
-# intact in PG discovery state, and heals cleanly on retry
+# CE-03a (C2-H02/F06/REV1-H02): PG failure mid-revocation fails closed 503, keeps
+# F1 ACTIVE for retry, and Retry revokes F1 while separate device F2 stays ACTIVE
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monkeypatch):
@@ -535,21 +486,28 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
             ) as client2:
                 await client1.post("/api/v1/auth/coord/session")
                 shared_bid = client1.cookies.get("hc_browser")
+                a1_id = f"hc_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client1, a1_id)
                 r1 = await client1.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f"hc_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a1_id},
                 )
                 assert r1.status_code == 200
                 f1 = uuid.UUID(r1.json()["family_id"])
                 csrf1 = r1.cookies.get("hc_csrf")
                 ref1_cookie = r1.cookies.get("hc_refresh")
 
-                a2 = f"hc_a2_{uuid.uuid4().hex}"
+                # Separate device client2 gets its OWN distinct browser_id -> F2 must stay isolated!
+                await client2.post("/api/v1/auth/coord/session")
+                bid2 = client2.cookies.get("hc_browser")
+                assert bid2 and bid2 != shared_bid
+                a2_id = f"hc_dev2_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client2, a2_id)
                 r2 = await client2.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a2},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a2_id},
                 )
                 assert r2.status_code == 200
                 f2 = uuid.UUID(r2.json()["family_id"])
@@ -603,10 +561,7 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                     headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": csrf1},
                     cookies={"hc_browser": shared_bid, "hc_refresh": ref1_cookie, "hc_csrf": csrf1},
                 ) as f1_client:
-                    fail_lo = await f1_client.post(
-                        "/api/v1/auth/logout",
-                        json={"cancelled_login_attempt_ids": [a2]},
-                    )
+                    fail_lo = await f1_client.post("/api/v1/auth/logout")
                     assert fail_lo.status_code == 503
 
                 # PG discovery state MUST still preserve BOTH F1 & F2 as ACTIVE until retry commits!
@@ -622,14 +577,12 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                     headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": csrf1},
                     cookies={"hc_browser": shared_bid, "hc_refresh": ref1_cookie, "hc_csrf": csrf1},
                 ) as heal_client:
-                    heal_lo = await heal_client.post(
-                        "/api/v1/auth/logout",
-                        json={"cancelled_login_attempt_ids": [a2]},
-                    )
+                    heal_lo = await heal_client.post("/api/v1/auth/logout")
                     assert heal_lo.status_code == 200
 
+                # Same-browser F1 revoked cleanly while separate-device F2 REMAINS ACTIVE (INV-12 / REV1-H02)!
                 assert await svc.verify_active_family(f1, uid) is False
-                assert await svc.verify_active_family(f2, uid) is False
+                assert await svc.verify_active_family(f2, uid) is True
         finally:
             await pool.close()
     finally:
@@ -638,8 +591,8 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
 
 
 # ---------------------------------------------------------------------------
-# CE-03b (C2-H02/F06): Redis outage after PG commit leaves PENDING_REVOKE
-# durable and concurrent reconcilers promote 100% with SKIP LOCKED
+# CE-03b (C2-H02/F06/REV1-M01): Redis outage after PG commit leaves PENDING_REVOKE
+# durable and overlapping concurrent reconcilers partition disjoint batches (SKIP LOCKED)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(monkeypatch):
@@ -648,16 +601,18 @@ async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(mon
     server, thread, base_url = await _start_test_server(monkeypatch)
     seeded_fids: list[uuid.UUID] = []
     try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=6)
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8)
         svc = SessionService(pool, redis_client=deps.get_redis())
         try:
             async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
                 await client.post("/api/v1/auth/coord/session")
                 shared_bid = client.cookies.get("hc_browser")
+                a3_id = f"hc_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client, a3_id)
                 r_login = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f"hc_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a3_id},
                 )
                 assert r_login.status_code == 200
                 f3 = uuid.UUID(r_login.json()["family_id"])
@@ -730,7 +685,7 @@ async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(mon
                     )
                     assert bsf_status == "PENDING_REVOKE", f"Expected PENDING_REVOKE before recovery, got {bsf_status!r}"
 
-                    # Seed 5 additional PENDING_REVOKE rows to prove dual concurrent reconcilers cannot drop/collide
+                    # Seed 5 additional PENDING_REVOKE rows (6 total)
                     for idx in range(5):
                         extra_fid = uuid.uuid4()
                         seeded_fids.append(extra_fid)
@@ -747,18 +702,65 @@ async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(mon
                 finally:
                     await conn.close()
 
-                # 4. Heal Redis & run TWO concurrent reconcile_pending_revocations workers!
+                # 4. Heal Redis & run TWO overlapping workers forced into simultaneous SKIP LOCKED row locks!
                 redis_outage["active"] = False
                 monkeypatch.setattr(deps, "_redis", real_redis)
                 assert hasattr(SessionService, "reconcile_pending_revocations")
 
-                svc_w1 = SessionService(pool, redis_client=real_redis)
-                svc_w2 = SessionService(pool, redis_client=real_redis)
+                overlap_barrier = threading.Barrier(2, timeout=4.0)
+                worker_keys: dict[str, list[str]] = {"w1": [], "w2": []}
+
+                class _OverlapRedisProxy:
+                    def __init__(self, inner, worker_name: str):
+                        self._inner = inner
+                        self._worker_name = worker_name
+                        self._tripped = False
+
+                    def __getattr__(self, name):
+                        return getattr(self._inner, name)
+
+                    def setex(self, key, *args, **kwargs):
+                        if isinstance(key, str) and key.startswith("hc:revoked_family:"):
+                            worker_keys[self._worker_name].append(key)
+                            if not self._tripped:
+                                self._tripped = True
+                                overlap_barrier.wait()
+                        return self._inner.setex(key, *args, **kwargs)
+
+                    def set(self, key, *args, **kwargs):
+                        if isinstance(key, str) and key.startswith("hc:revoked_family:"):
+                            worker_keys[self._worker_name].append(key)
+                            if not self._tripped:
+                                self._tripped = True
+                                overlap_barrier.wait()
+                        return self._inner.set(key, *args, **kwargs)
+
+                def _run_reconciler_worker(worker_name: str) -> int:
+                    async def _inner() -> int:
+                        w_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
+                        try:
+                            w_svc = SessionService(w_pool, redis_client=_OverlapRedisProxy(real_redis, worker_name))
+                            return await w_svc.reconcile_pending_revocations(batch_size=2, max_batches=1)
+                        finally:
+                            await w_pool.close()
+
+                    return asyncio.run(_inner())
+
                 c1, c2 = await asyncio.gather(
-                    svc_w1.reconcile_pending_revocations(batch_size=2),
-                    svc_w2.reconcile_pending_revocations(batch_size=2),
+                    asyncio.to_thread(_run_reconciler_worker, "w1"),
+                    asyncio.to_thread(_run_reconciler_worker, "w2"),
                 )
-                assert (c1 + c2) >= 6, f"Expected >= 6 reconciled PENDING_REVOKE rows, got c1={c1}, c2={c2}"
+                assert c1 >= 2 and c2 >= 2, (
+                    f"REV1-M01: Expected both overlapping SKIP LOCKED workers to process disjoint batches >=2, "
+                    f"got c1={c1}, c2={c2}"
+                )
+                assert set(worker_keys["w1"]).isdisjoint(set(worker_keys["w2"])), (
+                    f"REV1-M01: Overlapping workers touched same families: {worker_keys}"
+                )
+
+                # Drain remaining batch (6 - 4 = 2)
+                c_rem = await svc.reconcile_pending_revocations(batch_size=10, max_batches=5)
+                assert (c1 + c2 + c_rem) >= 6
 
                 all_fids = [f3, *seeded_fids]
                 conn = await asyncpg.connect(DATABASE_URL)
@@ -1014,10 +1016,12 @@ async def test_ce07a_cross_user_and_anonymous_same_browser_cancel_blocked(monkey
             # 1. Cross-user cancel by User B MUST return 403 and leave User A ACTIVE
             async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_b:
                 await client_b.post("/api/v1/auth/coord/session")
+                attempt_b = f"hc_userb_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client_b, attempt_b)
                 rb = await client_b.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile_b, "password": "HamiCounter!901", "attempt_id": f"hc_userb_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile_b, "password": "HamiCounter!901", "attempt_id": attempt_b},
                 )
                 assert rb.status_code == 200
                 token_b = rb.json()["access_token"]
@@ -1103,8 +1107,8 @@ async def test_ce07b_anonymous_browser_cookie_no_elevated_quota_or_ttl(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# CE-08 (C2-M02/F04/F05): Stale delayed F1 /refresh returns 401 and Tab A
-# rebinds F3 even when COOKIE_MAY_BE_STALE BroadcastChannel delivery is dropped
+# CE-08 (C2-M02/F04/F05/REV1-H04): Unconditionally verified F1 cookie
+# overwrite + all-page BroadcastChannel suppression -> 401 /refresh rebinds F3
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_without_broadcast(monkeypatch):
@@ -1115,6 +1119,37 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
         async with async_playwright() as p:
             browser = await _launch_headless_chromium(p)
             context = await browser.new_context()
+            # Suppress COOKIE_MAY_BE_STALE BroadcastChannel delivery across ALL pages in context
+            await context.add_init_script(
+                """
+                (() => {
+                  window.__hcStaleBroadcastReceived = 0;
+                  if (typeof BroadcastChannel === 'function') {
+                    const origPost = BroadcastChannel.prototype.postMessage;
+                    BroadcastChannel.prototype.postMessage = function(msg) {
+                      if (msg && msg.type === 'COOKIE_MAY_BE_STALE') return;
+                      return origPost.apply(this, arguments);
+                    };
+                    const OrigBC = BroadcastChannel;
+                    window.BroadcastChannel = class extends OrigBC {
+                      addEventListener(type, listener, ...rest) {
+                        if (type === 'message' && typeof listener === 'function') {
+                          const wrapped = (ev) => {
+                            if (ev && ev.data && ev.data.type === 'COOKIE_MAY_BE_STALE') {
+                              window.__hcStaleBroadcastReceived += 1;
+                              return;
+                            }
+                            return listener.call(this, ev);
+                          };
+                          return super.addEventListener(type, wrapped, ...rest);
+                        }
+                        return super.addEventListener(type, listener, ...rest);
+                      }
+                    };
+                  }
+                })();
+                """
+            )
             page_b = await context.new_page()
             await page_b.add_init_script(
                 """
@@ -1128,14 +1163,6 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
                   }
                   return origFetch.apply(this, arguments);
                 };
-                // Drop COOKIE_MAY_BE_STALE broadcast to prove client self-recovers via 401->rebind!
-                if (typeof BroadcastChannel === 'function') {
-                  const origPost = BroadcastChannel.prototype.postMessage;
-                  BroadcastChannel.prototype.postMessage = function(msg) {
-                    if (msg && msg.type === 'COOKIE_MAY_BE_STALE') return;
-                    return origPost.apply(this, arguments);
-                  };
-                }
                 """
             )
             page_a = await context.new_page()
@@ -1144,23 +1171,31 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
             release_b1_response = asyncio.Event()
             b1_intercept_active = {"on": True}
             rebind_responses: list[int] = []
+            refresh_responses: list[int] = []
+            held_f1_refresh = {"value": ""}
 
             async def hold_b1_login(route):
                 if b1_intercept_active["on"] and route.request.method == "POST":
                     b1_intercept_active["on"] = False
                     resp = await route.fetch()
+                    for hdr_val in resp.headers_array:
+                        if hdr_val["name"].lower() == "set-cookie" and hdr_val["value"].startswith("hc_refresh="):
+                            held_f1_refresh["value"] = hdr_val["value"].split(";", 1)[0].split("=", 1)[1]
                     b1_arrived_after_server.set()
                     await release_b1_response.wait()
                     await route.fulfill(response=resp)
                     return
                 await route.continue_()
 
-            page_a.on(
-                "response",
-                lambda r: rebind_responses.append(r.status)
-                if r.request.method == "POST" and r.url.endswith("/api/v1/auth/session/rebind-cookie")
-                else None,
-            )
+            def _watch_page_a_resp(r):
+                if r.request.method != "POST":
+                    return
+                if r.url.endswith("/api/v1/auth/session/rebind-cookie"):
+                    rebind_responses.append(r.status)
+                elif r.url.endswith("/api/v1/auth/refresh"):
+                    refresh_responses.append(r.status)
+
+            page_a.on("response", _watch_page_a_resp)
 
             try:
                 await page_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
@@ -1172,6 +1207,7 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
                 await page_b.fill("#hc-pwd-input", "HamiCounter!901")
                 await page_b.click("#hc-pwd-login-btn")
                 await asyncio.wait_for(b1_arrived_after_server.wait(), timeout=6.0)
+                assert held_f1_refresh["value"], "Failed to capture F1 hc_refresh Set-Cookie from delayed 200!"
 
                 # 2. Tab A logs out (revoking F1) and logs in as F3
                 await page_a.click("#hc-logout-btn")
@@ -1180,34 +1216,46 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
                 await page_a.fill("#hc-pwd-input", "HamiCounter!901")
                 await page_a.click("#hc-pwd-login-btn")
                 await _wait_selector_text(page_a, "#hc-auth-status-badge", "AUTHENTICATED")
+                jar_f3 = {c["name"]: c["value"] for c in await context.cookies()}
+                assert jar_f3.get("hc_refresh") and jar_f3["hc_refresh"] != held_f1_refresh["value"]
 
-                # 3. Delayed B1 HTTP 200 overwrites jar with revoked F1 (BroadcastChannel COOKIE_MAY_BE_STALE blocked!)
+                # 3. Release delayed B1 HTTP 200 and UNCONDITIONALLY assert jar was overwritten with stale F1
                 release_b1_response.set()
                 await asyncio.sleep(0.5)
 
-                # Capture overwritten stale F1 cookies directly from Chromium jar and verify server rejects direct /refresh (401)
                 jar_overwritten = {c["name"]: c["value"] for c in await context.cookies()}
-                if jar_overwritten.get("hc_refresh") and jar_overwritten.get("hc_csrf"):
-                    async with httpx.AsyncClient(
-                        base_url=base_url,
-                        headers={
-                            "Origin": base_url,
-                            "X-Auth-Mode": "cookie",
-                            "X-CSRF-Token": jar_overwritten["hc_csrf"],
-                        },
-                        cookies=jar_overwritten,
-                    ) as stale_client:
-                        stale_ref = await stale_client.post("/api/v1/auth/refresh")
-                        assert stale_ref.status_code == 401
+                assert jar_overwritten.get("hc_refresh") == held_f1_refresh["value"], (
+                    f"REV1-H04: Delayed B1 did not overwrite jar with stale F1! "
+                    f"held_f1={held_f1_refresh['value']!r}, jar={jar_overwritten.get('hc_refresh')!r}"
+                )
+                assert jar_overwritten.get("hc_csrf"), "Overwritten jar missing hc_csrf"
+                assert await page_a.evaluate("() => window.__hcStaleBroadcastReceived") == 0
 
-                # 4. Tab A clicks forced refresh WITHOUT BroadcastChannel hint -> MUST hit /session/rebind-cookie -> 200 & stay AUTHENTICATED
+                async with httpx.AsyncClient(
+                    base_url=base_url,
+                    headers={
+                        "Origin": base_url,
+                        "X-Auth-Mode": "cookie",
+                        "X-CSRF-Token": jar_overwritten["hc_csrf"],
+                    },
+                    cookies=jar_overwritten,
+                ) as stale_client:
+                    stale_ref = await stale_client.post("/api/v1/auth/refresh")
+                    assert stale_ref.status_code == 401
+
+                # 4. Tab A clicks forced refresh WITHOUT BroadcastChannel hint -> MUST hit 401 then /rebind-cookie -> 200
+                refresh_responses.clear()
+                rebind_responses.clear()
                 await page_a.click("#hc-refresh-btn")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.6)
                 status_after = (await page_a.locator("#hc-auth-status-badge").inner_text()).strip()
                 assert status_after == "AUTHENTICATED", (
                     f"C2-M02: Stale delayed 200 Set-Cookie broke Tab A ({status_after!r}) without COOKIE_MAY_BE_STALE!"
                 )
+                assert 401 in refresh_responses, f"Expected initial stale /refresh 401 before rebind, got {refresh_responses}"
                 assert 200 in rebind_responses, f"Expected /session/rebind-cookie 200 recovery, got {rebind_responses}"
+                jar_rebound = {c["name"]: c["value"] for c in await context.cookies()}
+                assert jar_rebound.get("hc_refresh") and jar_rebound["hc_refresh"] != held_f1_refresh["value"]
             finally:
                 release_b1_response.set()
                 await context.close()
@@ -1218,35 +1266,40 @@ async def test_ce08_delayed_200_cookie_overwrite_rejects_stale_and_rebinds_witho
 
 
 # ---------------------------------------------------------------------------
-# CE-08b (F04/F05/Section 3): Adversarial /session/rebind-cookie security matrix
+# CE-08b (F04/F05/REV1-H04): Normal-TTL (120s) /session/rebind-cookie security matrix
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ce08b_rebind_cookie_adversarial_matrix(monkeypatch):
     _clear_rate_limit_keys()
     uid, mobile = await _create_test_user(["USER"])
-    server, thread, base_url = await _start_test_server(monkeypatch, access_ttl=1)
+    server, thread, base_url = await _start_test_server(monkeypatch, access_ttl=120)
     try:
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
         svc = SessionService(pool, redis_client=deps.get_redis())
         try:
             async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_a:
                 await client_a.post("/api/v1/auth/coord/session")
                 bid_a = client_a.cookies.get("hc_browser")
+                assert bid_a
 
                 # Login F1 -> superseded by newer login F2 on SAME browser (LATEST_FAMILY_WINS)
+                f1_aid = f"hc_f1_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client_a, f1_aid)
                 r1 = await client_a.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f"hc_f1_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f1_aid},
                 )
                 assert r1.status_code == 200
                 tok1 = r1.json()["access_token"]
                 f1 = uuid.UUID(r1.json()["family_id"])
 
+                f2_aid = f"hc_f2_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(client_a, f2_aid)
                 r2 = await client_a.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f"hc_f2_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f2_aid},
                 )
                 assert r2.status_code == 200
                 tok2 = r2.json()["access_token"]
@@ -1299,7 +1352,7 @@ async def test_ce08b_rebind_cookie_adversarial_matrix(monkeypatch):
                 assert await svc.verify_active_family(f2, uid) is True
                 assert "refresh_token" not in r_reb.text
 
-                # 5. Rebind vs /logout never resurrects F2 + expired bearer rejected 401
+                # 5. Rebind vs /logout NEVER resurrects F2, and post-logout rebind fails 401
                 lo_coro = client_a.post(
                     "/api/v1/auth/logout",
                     headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client_a.cookies.get("hc_csrf")},
@@ -1311,17 +1364,50 @@ async def test_ce08b_rebind_cookie_adversarial_matrix(monkeypatch):
                 )
                 r_lo, r_reb2 = await asyncio.gather(lo_coro, reb2_coro)
                 assert r_lo.status_code == 200
+                assert r_reb2.status_code in (200, 401, 409)
                 assert await svc.verify_active_family(f2, uid) is False
 
-                await asyncio.sleep(1.3)
-                rebind_exp = await client_a.post(
+                rebind_after_lo = await client_a.post(
                     "/api/v1/auth/session/rebind-cookie",
                     headers={"Authorization": f"Bearer {tok2}"},
                     cookies={"hc_browser": bid_a},
                 )
-                assert rebind_exp.status_code == 401
+                assert rebind_after_lo.status_code == 401
+                assert await svc.verify_active_family(f2, uid) is False
         finally:
             await pool.close()
+    finally:
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-08c (F04/F05/REV1-H04): Isolated expired-bearer JWT rejected 401
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce08c_rebind_cookie_rejects_expired_bearer_jwt(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch, access_ttl=1)
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_a:
+            await client_a.post("/api/v1/auth/coord/session")
+            exp_aid = f"hc_exp_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client_a, exp_aid)
+            r_login = await client_a.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": exp_aid},
+            )
+            assert r_login.status_code == 200
+            tok = r_login.json()["access_token"]
+
+            await asyncio.sleep(1.5)
+            rebind_exp = await client_a.post(
+                "/api/v1/auth/session/rebind-cookie",
+                headers={"Authorization": f"Bearer {tok}"},
+            )
+            assert rebind_exp.status_code == 401
     finally:
         await _stop_server(server, thread)
         await _cleanup_user(uid)
@@ -1450,20 +1536,27 @@ async def test_ce10_logout_isolates_multidevice_and_unrelated_user(monkeypatch):
                 await dev_a2.post("/api/v1/auth/coord/session")
                 await user_b.post("/api/v1/auth/coord/session")
 
+                a1_id = f"hc_a1_{uuid.uuid4().hex}"
+                a2_id = f"hc_a2_{uuid.uuid4().hex}"
+                ub_id = f"hc_ub_{uuid.uuid4().hex}"
+                await _register_attempt_if_supported(dev_a1, a1_id)
+                await _register_attempt_if_supported(dev_a2, a2_id)
+                await _register_attempt_if_supported(user_b, ub_id)
+
                 r_a1 = await dev_a1.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile_a, "password": "HamiCounter!901", "attempt_id": f"hc_a1_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile_a, "password": "HamiCounter!901", "attempt_id": a1_id},
                 )
                 r_a2 = await dev_a2.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile_a, "password": "HamiCounter!901", "attempt_id": f"hc_a2_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile_a, "password": "HamiCounter!901", "attempt_id": a2_id},
                 )
                 r_ub = await user_b.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
-                    json={"mobile": mobile_b, "password": "HamiCounter!901", "attempt_id": f"hc_ub_{uuid.uuid4().hex}"},
+                    json={"mobile": mobile_b, "password": "HamiCounter!901", "attempt_id": ub_id},
                 )
                 assert r_a1.status_code == 200 and r_a2.status_code == 200 and r_ub.status_code == 200
 
@@ -1503,24 +1596,23 @@ async def test_ce10_logout_isolates_multidevice_and_unrelated_user(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# CE-11 (F01 / F03): Forged started_server_logout_seq=999 bypass rejected &
-# concurrent duplicate attempt_id produces at most 1 family
+# CE-11a (F01/REV1-M04): Forged started_server_logout_seq=999 on /password/login
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_ce11_forged_logout_seq_bypass_and_duplicate_attempt_id_rejected(monkeypatch):
+async def test_ce11a_forged_logout_seq_password_login_rejected(monkeypatch):
     _clear_rate_limit_keys()
     uid, mobile = await _create_test_user(["USER"])
     server, thread, base_url = await _start_test_server(monkeypatch)
-    r = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
             await client.post("/api/v1/auth/coord/session")
 
-            # Login & logout so browser logout_seq == 1
+            init_aid = f"hc_init_pwd_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client, init_aid)
             r1 = await client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
-                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": f"hc_init_{uuid.uuid4().hex}"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": init_aid},
             )
             assert r1.status_code == 200
             lo1 = await client.post(
@@ -1529,32 +1621,67 @@ async def test_ce11_forged_logout_seq_bypass_and_duplicate_attempt_id_rejected(m
             )
             assert lo1.status_code == 200
 
-            # 1a. Password login forging started_server_logout_seq=999 MUST FAIL 409!
+            forged_aid = f"hc_forge_pwd_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client, forged_aid)
             forged_pwd = await client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
                 json={
                     "mobile": mobile,
                     "password": "HamiCounter!901",
-                    "attempt_id": f"hc_forge_pwd_{uuid.uuid4().hex}",
+                    "attempt_id": forged_aid,
                     "started_server_logout_seq": 999,
                 },
             )
             assert forged_pwd.status_code == 409, (
-                f"F01: Forged started_server_logout_seq=999 bypassed rejection! status={forged_pwd.status_code}"
+                f"F01: Forged started_server_logout_seq=999 bypassed password login rejection! "
+                f"status={forged_pwd.status_code}"
             )
+            assert await _count_active_refresh_tokens(uid) == 0
+    finally:
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
 
-            # 1b. OTP verify forging started_server_logout_seq=999 MUST FAIL 409!
+
+# ---------------------------------------------------------------------------
+# CE-11b (F01/REV1-M04): Forged started_server_logout_seq=999 on /otp/verify
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce11b_forged_logout_seq_otp_verify_rejected(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
+            await client.post("/api/v1/auth/coord/session")
+
+            init_aid = f"hc_init_otp_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client, init_aid)
+            r1 = await client.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": init_aid},
+            )
+            assert r1.status_code == 200
+            lo1 = await client.post(
+                "/api/v1/auth/logout",
+                headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
+            )
+            assert lo1.status_code == 200
+
             await OtpService(r).request_otp(mobile)
             otp_code = r.get(f"otp:code:{mobile}")
             assert otp_code
+            forged_otp_aid = f"hc_forge_otp_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client, forged_otp_aid, flow="OTP")
             forged_otp = await client.post(
                 "/api/v1/auth/otp/verify",
                 headers={"X-Auth-Mode": "cookie"},
                 json={
                     "mobile": mobile,
                     "code": otp_code,
-                    "attempt_id": f"hc_forge_otp_{uuid.uuid4().hex}",
+                    "attempt_id": forged_otp_aid,
                     "started_server_logout_seq": 999,
                 },
             )
@@ -1562,9 +1689,27 @@ async def test_ce11_forged_logout_seq_bypass_and_duplicate_attempt_id_rejected(m
                 f"F01: OTP verify accepted forged started_server_logout_seq=999! status={forged_otp.status_code}"
             )
             assert await _count_active_refresh_tokens(uid) == 0
+    finally:
+        r.close()
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
 
-            # 2. Concurrent duplicate attempt_id MUST create at most ONE family and reject duplicate with 409!
+
+# ---------------------------------------------------------------------------
+# CE-11c (F03/REV1-H05/M04): Concurrent duplicate attempt_id single family &
+# PG 4-column composite FK rejects mismatched attempt/family binding
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce11c_concurrent_duplicate_attempt_id_and_binding_fk_enforced(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
+            await client.post("/api/v1/auth/coord/session")
+
             dup_aid = f"hc_dup_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(client, dup_aid)
             d1, d2 = await asyncio.gather(
                 client.post(
                     "/api/v1/auth/password/login",
@@ -1582,32 +1727,52 @@ async def test_ce11_forged_logout_seq_bypass_and_duplicate_attempt_id_rejected(m
 
             conn = await asyncpg.connect(DATABASE_URL)
             try:
-                fam_count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM browser_session_families WHERE attempt_id = $1;",
+                fam_rows = await conn.fetch(
+                    "SELECT family_id, browser_id, user_id FROM browser_session_families WHERE attempt_id = $1;",
                     dup_aid,
                 )
-                assert fam_count == 1
+                assert len(fam_rows) == 1
+                fam_row = fam_rows[0]
+
+                has_fk = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_las_exact_family_binding');"
+                )
+                assert has_fk, "REV1-H05: Composite 4-column FK fk_las_exact_family_binding missing from schema."
+
+                mismatch_aid = f"hc_mismatch_{uuid.uuid4().hex}"
+                with pytest.raises(asyncpg.ForeignKeyViolationError):
+                    async with conn.transaction():
+                        await conn.execute(
+                            """
+                            INSERT INTO login_attempt_states (
+                                attempt_id, family_id, browser_id, user_id, status,
+                                started_logout_seq, attempt_expires_at, expires_at
+                            )
+                            VALUES ($1, $2, $3, $4, 'ACTIVE', 0, NOW() + INTERVAL '30 seconds', NOW() + INTERVAL '3600 seconds');
+                            """,
+                            mismatch_aid,
+                            fam_row["family_id"],
+                            fam_row["browser_id"],
+                            fam_row["user_id"],
+                        )
             finally:
                 await conn.close()
     finally:
-        r.close()
         await _stop_server(server, thread)
         await _cleanup_user(uid)
 
 
 # ---------------------------------------------------------------------------
-# CE-12 (F08): Continuous Lua ZSET sliding-window boundary, 429 non-pollution,
-# weighted ID quota, & Redis 503 fail-closed
+# CE-12a (F08/REV1-M04): Continuous Lua ZSET sliding-window boundary & 429 non-pollution
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_ce12_sliding_window_zset_boundary_weighted_ids_and_redis_503(monkeypatch):
+async def test_ce12a_sliding_window_zset_boundary_and_429_non_pollution(monkeypatch):
     _clear_rate_limit_keys()
     monkeypatch.setattr(auth_mod, "CANCEL_RL_WINDOW_SECONDS", 2, raising=False)
     server, thread, base_url = await _start_test_server(monkeypatch)
     r = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
-            # 1. At t=0: send 10 requests; at t=1.1s: send 10 requests -> total 20 in window [0..2s]
             for i in range(10):
                 resp = await client.post(
                     "/api/v1/auth/login-attempts/cancel",
@@ -1622,20 +1787,16 @@ async def test_ce12_sliding_window_zset_boundary_weighted_ids_and_redis_503(monk
                 )
                 assert resp.status_code == 200
 
-            # 21st hits 429 AND must NOT pollute ZSET count!
             r429 = await client.post(
                 "/api/v1/auth/login-attempts/cancel",
                 json={"attempt_ids": [f"hc_sw_blocked_{uuid.uuid4().hex[:8]}"]},
             )
             assert r429.status_code == 429
 
-            # Verify ZSET implementation (not fixed INCRBY string key) & 429 didn't inflate cardinality above 20
-            ip_req_key = "hc:rl:cancel_req:ip:127.0.0.1"
+            ip_req_key = "hc:rl:cancel:anon:ip:127.0.0.1:req"
             assert r.type(ip_req_key) == "zset", f"F08: Expected ZSET bucket, got type={r.type(ip_req_key)!r}"
             assert r.zcard(ip_req_key) == 20, f"F08: 429 request polluted ZSET count={r.zcard(ip_req_key)}"
 
-            # Wait 1.05s -> total elapsed 2.15s: t=0 (10 entries) expired continuously, t=1.1s (10 entries) REMAIN!
-            # Sending 11 more MUST allow first 10 and fail 429 on 11th (proving continuous sliding vs fixed reset)!
             await asyncio.sleep(1.05)
             post_statuses = []
             for i in range(11):
@@ -1646,9 +1807,92 @@ async def test_ce12_sliding_window_zset_boundary_weighted_ids_and_redis_503(monk
                 post_statuses.append(resp.status_code)
             assert post_statuses[:10] == [200] * 10, f"Continuous window failed: {post_statuses}"
             assert post_statuses[10] == 429, f"F08: Fixed-window reset leaked extra capacity: {post_statuses}"
+    finally:
+        r.close()
+        await _stop_server(server, thread)
 
-            # 2. Weighted ID cap check (64 unauth IDs): 4 batches * 16 = 64 pass; 5th batch of 1 hits 429!
-            await asyncio.sleep(2.1)
+
+# ---------------------------------------------------------------------------
+# CE-12b (REV1-H06): Mixed :anon: (120s) and :auth: (300s) namespace isolation
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce12b_mixed_anon_and_auth_namespace_isolation(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        async with (
+            httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as auth_client,
+            httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as anon_client,
+        ):
+            await auth_client.post("/api/v1/auth/coord/session")
+            a1 = f"hc_rl_auth_{uuid.uuid4().hex}"
+            await _register_attempt_if_supported(auth_client, a1)
+            login_r = await auth_client.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a1},
+            )
+            assert login_r.status_code == 200
+            tok = login_r.json()["access_token"]
+
+            c_auth = await auth_client.post(
+                "/api/v1/auth/login-attempts/cancel",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"attempt_ids": [f"hc_auth_c_{uuid.uuid4().hex[:8]}"]},
+            )
+            assert c_auth.status_code == 200
+
+            auth_ip_key = "hc:rl:cancel:auth:ip:127.0.0.1:req"
+            assert r.type(auth_ip_key) == "zset", (
+                f"REV1-H06: Expected isolated :auth: ZSET bucket, got type={r.type(auth_ip_key)!r}"
+            )
+            assert r.zcard(auth_ip_key) == 1
+            auth_ttl_before = r.ttl(auth_ip_key)
+            assert 250 <= auth_ttl_before <= 310
+
+            # Seed an aged entry (180s ago: outside 120s anon window, INSIDE 300s auth window)
+            aged_score = int(time.time() * 1000) - 180_000
+            r.zadd(auth_ip_key, {f"{aged_score}:aged:1:1": aged_score})
+            assert r.zcard(auth_ip_key) == 2
+
+            # Now send 5 anonymous cancels from the same IP -> must hit :anon: ONLY!
+            for idx in range(5):
+                c_anon = await anon_client.post(
+                    "/api/v1/auth/login-attempts/cancel",
+                    json={"attempt_ids": [f"hc_anon_c_{idx}_{uuid.uuid4().hex[:8]}"]},
+                )
+                assert c_anon.status_code == 200
+
+            anon_ip_key = "hc:rl:cancel:anon:ip:127.0.0.1:req"
+            assert r.type(anon_ip_key) == "zset"
+            assert r.zcard(anon_ip_key) == 5
+            assert 0 < r.ttl(anon_ip_key) <= 130
+
+            # Anonymous 120s pruning/PEXPIRE MUST NOT prune or shorten authenticated 300s entries!
+            assert r.zcard(auth_ip_key) == 2, (
+                f"REV1-H06: Anonymous 120s cleanup corrupted authenticated 300s bucket! zcard={r.zcard(auth_ip_key)}"
+            )
+            assert r.ttl(auth_ip_key) >= 250, (
+                f"REV1-H06: Anonymous PEXPIRE truncated authenticated TTL to {r.ttl(auth_ip_key)}"
+            )
+    finally:
+        r.close()
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-12c (F08/REV1-M04): Weighted attempt-ID quota & Redis outage 503 fail-closed
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce12c_weighted_ids_cap_and_redis_503_fail_closed(monkeypatch):
+    _clear_rate_limit_keys()
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
             for b in range(4):
                 batch_ids = [f"hc_wid_{b}_{j}_{uuid.uuid4().hex[:8]}" for j in range(16)]
                 rw = await client.post("/api/v1/auth/login-attempts/cancel", json={"attempt_ids": batch_ids})
@@ -1657,9 +1901,13 @@ async def test_ce12_sliding_window_zset_boundary_weighted_ids_and_redis_503(monk
                 "/api/v1/auth/login-attempts/cancel",
                 json={"attempt_ids": [f"hc_wid_over_{uuid.uuid4().hex[:8]}"]},
             )
-            assert rw_over.status_code == 429
+            assert rw_over.status_code == 429, (
+                f"F08: Weighted ID quota allowed >64 IDs! status={rw_over.status_code}"
+            )
+            ip_ids_key = "hc:rl:cancel:anon:ip:127.0.0.1:ids"
+            assert r.type(ip_ids_key) == "zset"
+            assert r.zcard(ip_ids_key) == 64
 
-            # 3. Redis failure fails closed 503
             real_rd = deps.get_redis()
 
             class _EvalBoomRedis:
@@ -1687,10 +1935,10 @@ async def test_ce12_sliding_window_zset_boundary_weighted_ids_and_redis_503(monk
 
 
 # ---------------------------------------------------------------------------
-# CE-13 (F07): Missing navigator.locks + forged hc_coord bi=1 fails closed
+# CE-13a (F07): Missing navigator.locks fails closed with zero login traffic
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_ce13_missing_web_locks_fails_closed_and_bi_hint_untrusted(monkeypatch):
+async def test_ce13a_missing_web_locks_fails_closed(monkeypatch):
     _clear_rate_limit_keys()
     uid, mobile = await _create_test_user(["USER"])
     server, thread, base_url = await _start_test_server(monkeypatch)
@@ -1699,6 +1947,12 @@ async def test_ce13_missing_web_locks_fails_closed_and_bi_hint_untrusted(monkeyp
             browser = await _launch_headless_chromium(p)
             context = await browser.new_context()
             page = await context.new_page()
+
+            login_net_calls: list[str] = []
+            page.on(
+                "request",
+                lambda req: login_net_calls.append(req.url) if "/api/v1/auth/password/login" in req.url else None,
+            )
 
             await page.add_init_script(
                 """
@@ -1736,10 +1990,241 @@ async def test_ce13_missing_web_locks_fails_closed_and_bi_hint_untrusted(monkeyp
                 assert "WEB_LOCKS" in (snap.get("lastErrorMessage") or "") or "Web Locks" in (snap.get("lastErrorMessage") or ""), (
                     f"F07: Expected explicit fail-closed WEB_LOCKS error when navigator.locks is missing, got {snap}"
                 )
+                assert len(login_net_calls) == 0, f"F07: Sent login request without navigator.locks: {login_net_calls}"
                 assert await _count_active_refresh_tokens(uid) == 0
             finally:
                 await context.close()
                 await browser.close()
+    finally:
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-13b (F07/REV1-M02): Forged hc_coord.bi=1 under normal Web Locks still
+# invokes authoritative /coord/session and cannot trust forged seq values
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce13b_forged_bi_hint_ignored_under_normal_web_locks(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    try:
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            coord_requests: list[int] = []
+
+            def _watch_coord(resp):
+                if resp.request.method == "POST" and resp.url.endswith("/api/v1/auth/coord/session"):
+                    coord_requests.append(resp.status)
+
+            page.on("response", _watch_coord)
+
+            await page.add_init_script(
+                """
+                (() => {
+                  document.cookie = 'hc_coord=g.99.lo.0.li.99.sg.99.slo.0.sli.99.lp.0.bi.1; Path=/; SameSite=Lax';
+                })();
+                """
+            )
+            try:
+                await page.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+                await page.fill("#hc-pwd-mobile", mobile)
+                await page.fill("#hc-pwd-input", "HamiCounter!901")
+                await page.click("#hc-pwd-login-btn")
+                await _wait_selector_text(page, "#hc-auth-status-badge", "AUTHENTICATED")
+
+                assert len(coord_requests) >= 1 and 200 in coord_requests, (
+                    f"REV1-M02: Client skipped authoritative /coord/session due to forged hc_coord.bi=1! calls={coord_requests}"
+                )
+                jar = {c["name"]: c["value"] for c in await context.cookies()}
+                assert jar.get("hc_browser"), "REV1-M02: Expected server-signed hc_browser cookie despite forged bi=1!"
+
+                # Verify server PG state wasn't inflated to forged g.99 / lo.0 / li.99
+                async with httpx.AsyncClient(
+                    base_url=base_url,
+                    headers={"Origin": base_url},
+                    cookies={"hc_browser": jar["hc_browser"]},
+                ) as verify_client:
+                    st = await verify_client.post(
+                        "/api/v1/auth/login-attempts/start",
+                        json={"attempt_id": f"hc_bi_check_{uuid.uuid4().hex}", "flow": "PASSWORD"},
+                    )
+                    assert st.status_code == 200, (
+                        f"REV1-M02: /login-attempts/start missing or failed after login: {st.status_code}"
+                    )
+                    assert st.json()["started_logout_seq"] == 0
+            finally:
+                await context.close()
+                await browser.close()
+    finally:
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-14 (REV1-H07/REV1-H01): Pre-Phase-A delayed /password/login after
+# /login-attempts/start rejected 409; unregistered coordinated login rejected
+# 409; concurrent L1/L2/L4/L6/L3 operations complete with 0 PG deadlocks
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce14_pre_phase_a_delayed_login_unregistered_reject_and_lock_stress(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    try:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8)
+        svc = SessionService(pool, redis_client=deps.get_redis())
+        try:
+            async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
+                await client.post("/api/v1/auth/coord/session")
+
+                # Setup login so browser logout_seq starts clean
+                a_init = f"hc_ce14_init_{uuid.uuid4().hex}"
+                st_init = await client.post(
+                    "/api/v1/auth/login-attempts/start",
+                    json={"attempt_id": a_init, "flow": "PASSWORD"},
+                )
+                assert st_init.status_code == 200, (
+                    f"REV1-H07: /login-attempts/start missing or failed: {st_init.status_code}"
+                )
+                r_init = await client.post(
+                    "/api/v1/auth/password/login",
+                    headers={"X-Auth-Mode": "cookie"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a_init},
+                )
+                assert r_init.status_code == 200
+
+                # 1. Pre-Phase-A delay scenario (REV1-H07):
+                # Register delayed_aid at logout_seq=0, THEN Tab A logs out BEFORE delayed_aid reaches Phase A!
+                delayed_aid = f"hc_ce14_prephasea_{uuid.uuid4().hex}"
+                st_del = await client.post(
+                    "/api/v1/auth/login-attempts/start",
+                    json={"attempt_id": delayed_aid, "flow": "PASSWORD"},
+                )
+                assert st_del.status_code == 200
+                assert st_del.json()["started_logout_seq"] == 0
+
+                lo = await client.post(
+                    "/api/v1/auth/logout",
+                    headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
+                )
+                assert lo.status_code == 200
+                assert await _count_active_refresh_tokens(uid) == 0
+
+                # Spy on AuthService.authenticate_via_password to prove Phase A rejects BEFORE Argon2 work!
+                pwd_calls = {"count": 0}
+                orig_auth_pwd = AuthService.authenticate_via_password
+
+                async def _spy_auth_pwd(self, *args, **kwargs):
+                    pwd_calls["count"] += 1
+                    return await orig_auth_pwd(self, *args, **kwargs)
+
+                monkeypatch.setattr(AuthService, "authenticate_via_password", _spy_auth_pwd)
+
+                late_pre_phase_a = await client.post(
+                    "/api/v1/auth/password/login",
+                    headers={"X-Auth-Mode": "cookie"},
+                    json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": delayed_aid},
+                )
+                assert late_pre_phase_a.status_code == 409, (
+                    f"REV1-H07: Pre-Phase-A delayed login bypassed post-registration logout! "
+                    f"status={late_pre_phase_a.status_code}"
+                )
+                assert pwd_calls["count"] == 0, "REV1-H07: Rejected Phase A executed slow password verification!"
+
+                # 2. Unregistered attempt on coordinated browser MUST fail 409 BEFORE Argon2!
+                unreg_resp = await client.post(
+                    "/api/v1/auth/password/login",
+                    headers={"X-Auth-Mode": "cookie"},
+                    json={
+                        "mobile": mobile,
+                        "password": "HamiCounter!901",
+                        "attempt_id": f"hc_ce14_unreg_{uuid.uuid4().hex}",
+                    },
+                )
+                assert unreg_resp.status_code == 409, (
+                    f"REV1-H07: Coordinated browser accepted unregistered attempt_id! status={unreg_resp.status_code}"
+                )
+                assert pwd_calls["count"] == 0
+                assert await _count_active_refresh_tokens(uid) == 0
+
+                # 3. Competing PG lock-order stress across L1/L2/L4/L6/L3 (REV1-H01): 0 deadlocks, 0 5xx
+                monkeypatch.setattr(AuthService, "authenticate_via_password", orig_auth_pwd)
+                for _round in range(2):
+                    a_main = f"hc_stress_main_{uuid.uuid4().hex}"
+                    assert (await client.post(
+                        "/api/v1/auth/login-attempts/start",
+                        json={"attempt_id": a_main, "flow": "PASSWORD"},
+                    )).status_code == 200
+                    r_main = await client.post(
+                        "/api/v1/auth/password/login",
+                        headers={"X-Auth-Mode": "cookie"},
+                        json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": a_main},
+                    )
+                    assert r_main.status_code == 200
+                    tok_main = r_main.json()["access_token"]
+                    csrf_main = client.cookies.get("hc_csrf")
+
+                    a_race = f"hc_stress_race_{uuid.uuid4().hex}"
+                    st_race = await client.post(
+                        "/api/v1/auth/login-attempts/start",
+                        json={"attempt_id": a_race, "flow": "PASSWORD"},
+                    )
+                    assert st_race.status_code == 200
+                    cap_race = st_race.json()["cancel_capability"]
+
+                    async def _do_l1(aid=a_race):
+                        return await client.post(
+                            "/api/v1/auth/password/login",
+                            headers={"X-Auth-Mode": "cookie"},
+                            json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": aid},
+                        )
+
+                    async def _do_l2(aid=a_race, cap=cap_race):
+                        return await client.post(
+                            "/api/v1/auth/login-attempts/cancel",
+                            json={"attempt_ids": [aid], "cancel_capabilities": {aid: cap}},
+                        )
+
+                    async def _do_l4(csrf=csrf_main):
+                        return await client.post(
+                            "/api/v1/auth/logout",
+                            headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": csrf},
+                        )
+
+                    async def _do_l6(tok=tok_main):
+                        return await client.post(
+                            "/api/v1/auth/session/rebind-cookie",
+                            headers={"Authorization": f"Bearer {tok}"},
+                        )
+
+                    async def _do_l3():
+                        return await svc.reconcile_pending_revocations(batch_size=5, max_batches=2)
+
+                    results = await asyncio.gather(
+                        _do_l1(),
+                        _do_l2(),
+                        _do_l4(),
+                        _do_l6(),
+                        _do_l3(),
+                        return_exceptions=False,
+                    )
+                    for res in results[:4]:
+                        assert res.status_code < 500, f"REV1-H01: Lock-order server failure status={res.status_code}: {res.text}"
+
+                await svc.reconcile_pending_revocations(batch_size=20, max_batches=5)
+                if client.cookies.get("hc_csrf"):
+                    await client.post(
+                        "/api/v1/auth/logout",
+                        headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
+                    )
+                assert await _count_active_refresh_tokens(uid) == 0
+        finally:
+            await pool.close()
     finally:
         await _stop_server(server, thread)
         await _cleanup_user(uid)
