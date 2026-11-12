@@ -1,0 +1,119 @@
+{
+  "schema": "hamicard.t48_owner_preview_package.v1",
+  "task_id": "HC-T48",
+  "command_id": "HC-CMD-049",
+  "branch": "docs/hc-t48-owner-preview",
+  "design_source_branch": "fix/hc-t28-ui-a11y-polish",
+  "design_manifest_sha": "e60499a872d1662f06816da4b33759c7ed7c960f",
+  "design_ui_source_sha": "af9534cf4d1f005eaa67233fdbda0f7f6fb7e38c",
+  "design_ui_tree_sha": "6e90ce76db234067b3c4d9264a40dd08e1b3478b",
+  "base_develop_sha": "309a5853a3e9ee5503b4866b9370a8398c97264f",
+  "governance": {
+    "open_01_18_status": "PROPOSED",
+    "open_15_status": "PROPOSED",
+    "no_auto_approval": true,
+    "no_local_ide_paths": true,
+    "no_secrets_or_pii": true
+  },
+  "owner_accessible_urls": {
+    "review_guide_md": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/OWNER_REVIEW_FA.md",
+    "decision_matrix_md": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/OWNER_DECISION_MATRIX_FA.md",
+    "html_gallery": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/index.html",
+    "screenshots": [
+      {
+        "filename": "desktop_home.png",
+        "sha256": "430e4f462545e3cb428b1e26a956712d8c4db77752c5a73b62e28164edc35945",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_home.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_home.png"
+      },
+      {
+        "filename": "desktop_plans.png",
+        "sha256": "85db410bde96618a99c382921e7ae24edec6db006bbea2d6481a6ff6926c4c31",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_plans.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_plans.png"
+      },
+      {
+        "filename": "desktop_panel_agent.png",
+        "sha256": "d0fa5cd7e0bfbc06af142460fb8f31ba7c7539328a9e1388271f74e11140c0b0",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_panel_agent.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_panel_agent.png"
+      },
+      {
+        "filename": "desktop_state_disabled.png",
+        "sha256": "15892bd27f97904bf928336dd5adeca721d3ff2960f6965e0d75f4df50e2513e",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_state_disabled.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/desktop_state_disabled.png"
+      },
+      {
+        "filename": "tablet_doctors.png",
+        "sha256": "704817f66aa5df2e80ec525bb7e5912ff5dc16affb4d5e2cc701d8842e61df46",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/tablet_doctors.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/tablet_doctors.png"
+      },
+      {
+        "filename": "mobile_home.png",
+        "sha256": "ba21a5966c20ecca3cb2320d5b15165f471b4e2f3dda9ac27ab6ca5434dfa13b",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/mobile_home.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/mobile_home.png"
+      },
+      {
+        "filename": "mobile_panel_support.png",
+        "sha256": "1dcca1cac9a043babd521e604f91a8fae12eb03980710ff968a1edf3fd58f600",
+        "github_blob_url": "https://github.com/mytest19861986/hami3/blob/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/mobile_panel_support.png",
+        "github_raw_url": "https://raw.githubusercontent.com/mytest19861986/hami3/docs/hc-t48-owner-preview/docs/owner_preview/screenshots/mobile_panel_support.png"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "OWNER_REVIEW_FA.md",
+      "bytes": 16180,
+      "sha256": "37271a8dd320e53ca539ec9adea6538ce81d7f997ee0f925f04da1e7b43f425d"
+    },
+    {
+      "path": "OWNER_DECISION_MATRIX_FA.md",
+      "bytes": 22377,
+      "sha256": "d62fce1d5e359a13cab1691f389e846a820ec4bc9532f3ded0fa07a46d664584"
+    },
+    {
+      "path": "index.html",
+      "bytes": 821586,
+      "sha256": "786bfd273b1bffe3aa48037b6cd51d7239d25d6fa8aabadbdaabb23615ced8ff"
+    },
+    {
+      "path": "screenshots/desktop_home.png",
+      "bytes": 111152,
+      "sha256": "430e4f462545e3cb428b1e26a956712d8c4db77752c5a73b62e28164edc35945"
+    },
+    {
+      "path": "screenshots/desktop_plans.png",
+      "bytes": 67249,
+      "sha256": "85db410bde96618a99c382921e7ae24edec6db006bbea2d6481a6ff6926c4c31"
+    },
+    {
+      "path": "screenshots/desktop_panel_agent.png",
+      "bytes": 94029,
+      "sha256": "d0fa5cd7e0bfbc06af142460fb8f31ba7c7539328a9e1388271f74e11140c0b0"
+    },
+    {
+      "path": "screenshots/desktop_state_disabled.png",
+      "bytes": 59443,
+      "sha256": "15892bd27f97904bf928336dd5adeca721d3ff2960f6965e0d75f4df50e2513e"
+    },
+    {
+      "path": "screenshots/tablet_doctors.png",
+      "bytes": 78103,
+      "sha256": "704817f66aa5df2e80ec525bb7e5912ff5dc16affb4d5e2cc701d8842e61df46"
+    },
+    {
+      "path": "screenshots/mobile_home.png",
+      "bytes": 115157,
+      "sha256": "ba21a5966c20ecca3cb2320d5b15165f471b4e2f3dda9ac27ab6ca5434dfa13b"
+    },
+    {
+      "path": "screenshots/mobile_panel_support.png",
+      "bytes": 83337,
+      "sha256": "1dcca1cac9a043babd521e604f91a8fae12eb03980710ff968a1edf3fd58f600"
+    }
+  ]
+}
