@@ -36,6 +36,7 @@ from src.auth.otp_service import (
     SmsDeliveryError,
     normalize_iranian_mobile,
 )
+from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.auth.service import AuthService, InvalidCredentialsError
 from src.auth.session_service import (
     AccountBlockedError,
@@ -815,4 +816,70 @@ async def logout(
         "success": True,
         "revoked_tokens": revoked_count,
         "message": "نشست و تمامی توکن‌های خانواده نشست با موفقیت باطل شدند.",
+    }
+
+
+PANEL_ROLES_VALID = {"USER", "DOCTOR", "AGENT", "SUPPORT", "ADMIN", "SUPER_ADMIN"}
+
+
+@router.get("/panels/{panel_role}/access")
+async def check_panel_access(
+    panel_role: str,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Read-only server-authoritative panel role routing boundary check for Phase 3 UI integration.
+    Re-reads live roles from PostgreSQL `user_roles` via `RbacEngine` without altering financial
+    or OPEN-* policy gates.
+    """
+    _set_no_store(response)
+    normalized = panel_role.strip().upper().replace("-", "_")
+    if normalized not in PANEL_ROLES_VALID:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported panel role.",
+        )
+
+    async with pool.acquire() as conn:
+        rbac = RbacEngine(pool)
+        try:
+            roles = sorted(list(await rbac.get_user_roles(conn, current_user["id"])))
+        except RbacAccessDeniedError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+        allowed = (
+            "SUPER_ADMIN" in roles
+            or normalized in roles
+            or ("ADMIN" in roles and normalized == "USER")
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"عدم دسترسی مجاز به پنل {normalized}: نقش تاییدشده شما در سرور "
+                    f"({', '.join(roles) or 'NONE'}) اجازه ورود به این بخش را ندارد."
+                ),
+            )
+
+        verification_status = None
+        if normalized == "DOCTOR" and "DOCTOR" in roles and "ADMIN" not in roles and "SUPER_ADMIN" not in roles:
+            verification_status = await conn.fetchval(
+                "SELECT verification_status FROM doctors WHERE user_id = $1;",
+                current_user["id"],
+            )
+        elif normalized == "AGENT" and "AGENT" in roles and "ADMIN" not in roles and "SUPER_ADMIN" not in roles:
+            verification_status = await conn.fetchval(
+                "SELECT verification_status FROM agents WHERE user_id = $1;",
+                current_user["id"],
+            )
+
+    return {
+        "authorized": True,
+        "panel_role": normalized,
+        "effective_roles": roles,
+        "verification_status": verification_status,
+        "mode": "PHASE3_SYNTHETIC_INTEGRATED_READONLY",
+        "open_policies_status": "PROPOSED",
     }

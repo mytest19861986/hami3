@@ -4,10 +4,11 @@ Baseline: BL-HAMICARD-PRD-V1
 """
 
 import os
+import pathlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from src.adapters.payment import PaymentGatewayError
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
 
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+UI_SHELL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui_shell")
 API_V1_PREFIX = "/api/v1"
 
 
@@ -87,6 +89,14 @@ def create_app() -> FastAPI:
         allow_methods=cors_cfg["allow_methods"],
         allow_headers=cors_cfg["allow_headers"],
     )
+
+    @application.middleware("http")
+    async def enforce_sensitive_no_store(request: Request, call_next):
+        resp = await call_next(request)
+        if request.url.path.startswith(f"{API_V1_PREFIX}/auth") or request.url.path.startswith(f"{API_V1_PREFIX}/profile"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+            resp.headers["Pragma"] = "no-cache"
+        return resp
 
     # Register routers under /api/v1
     application.include_router(health_router, prefix=API_V1_PREFIX)
@@ -158,6 +168,61 @@ def create_app() -> FastAPI:
         if os.path.exists(pub_file):
             return FileResponse(pub_file, media_type="text/html", headers=_poc_security_headers)
         return Response(status_code=404, content="Auth PoC public page not found.")
+
+    _asset_security_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+
+    def _resolve_ui_shell_asset(subdir: str, filename: str) -> pathlib.Path | None:
+        base_dir = pathlib.Path(UI_SHELL_DIR, subdir).resolve()
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            return None
+        candidate = (base_dir / filename).resolve()
+        try:
+            candidate.relative_to(base_dir)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return candidate
+
+    @application.get("/phase3", include_in_schema=False)
+    def phase3_redirect():
+        return RedirectResponse(
+            url="/phase3/",
+            status_code=307,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, private"},
+        )
+
+    @application.get("/phase3/", include_in_schema=False)
+    @application.get("/phase3/index.html", include_in_schema=False)
+    def phase3_index():
+        ui_index = os.path.join(UI_SHELL_DIR, "index.html")
+        if os.path.exists(ui_index):
+            return FileResponse(ui_index, media_type="text/html", headers=_poc_security_headers)
+        return Response(status_code=404, content="Phase 3 UI shell not found.")
+
+    @application.get("/phase3/styles/{filename}", include_in_schema=False)
+    def phase3_css_asset(filename: str):
+        if not filename.endswith(".css"):
+            return Response(status_code=404, content="Not found.")
+        asset = _resolve_ui_shell_asset("styles", filename)
+        if not asset:
+            return Response(status_code=404, content="Not found.")
+        return FileResponse(str(asset), media_type="text/css", headers=_asset_security_headers)
+
+    @application.get("/phase3/js/{filename}", include_in_schema=False)
+    def phase3_js_asset(filename: str):
+        if not filename.endswith(".js"):
+            return Response(status_code=404, content="Not found.")
+        asset = _resolve_ui_shell_asset("js", filename)
+        if not asset:
+            return Response(status_code=404, content="Not found.")
+        return FileResponse(str(asset), media_type="application/javascript", headers=_asset_security_headers)
 
     return application
 

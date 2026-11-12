@@ -620,8 +620,14 @@ async def test_t36_ac5_csp_static_safety_branch_isolation_and_open_policies_prop
     assert not re.search(r"<script(?![^>]*\bsrc=)", poc_html, re.IGNORECASE)
     assert not re.search(r"\son[a-z]+\s*=", poc_html, re.IGNORECASE)
 
-    # 3. Ensure zero integration with unapproved ui_shell & legacy index.html untouched
-    assert not (ROOT_DIR / "src" / "ui_shell").exists()
+    # 3. Ensure integrated ui_shell uses zero persistent web storage / legacy tokens and keeps index.html compatible
+    ui_shell_dir = ROOT_DIR / "src" / "ui_shell"
+    assert ui_shell_dir.exists()
+    for ui_file in ui_shell_dir.rglob("*.js"):
+        ui_text = ui_file.read_text(encoding="utf-8")
+        assert "hamicard_session_token" not in ui_text
+        assert not re.search(r"\beval\s*\(", ui_text)
+        assert not re.search(r"\bnew\s+Function\b", ui_text)
     idx_html = (ROOT_DIR / "src" / "static" / "index.html").read_text(encoding="utf-8")
     assert "refreshSessionSingleFlight" in idx_html
 

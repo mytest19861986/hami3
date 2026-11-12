@@ -45,7 +45,7 @@ async def get_my_profile(
             "roles": current_user["roles"],
             "has_profile": False
         }
-    return {**profile, "has_profile": True}
+    return {**profile, "roles": current_user["roles"], "has_profile": True}
 
 
 @router.put("/me")

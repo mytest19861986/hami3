@@ -1,0 +1,37 @@
+{
+  "schema": "hamicard.t39_screenshot_manifest.v1",
+  "task_id": "HC-T39",
+  "command_id": "HC-CMD-040",
+  "screenshots": {
+    "01_phase3_auth_shell_guest.png": {
+      "path": "docs/screenshots/phase3_t39/01_phase3_auth_shell_guest.png",
+      "bytes": 115050,
+      "sha256": "ef04132cf3ee0703a77e6a60acbbd8e65a5dff7e66fb42f0591f8a9313bda435"
+    },
+    "02_phase3_authenticated_user_xss_escaped.png": {
+      "path": "docs/screenshots/phase3_t39/02_phase3_authenticated_user_xss_escaped.png",
+      "bytes": 118900,
+      "sha256": "32ce274ff4e9c10228158f72d32321881f2aeb278e481173611099e97eafeee5"
+    },
+    "03_phase3_forbidden_403_rbac.png": {
+      "path": "docs/screenshots/phase3_t39/03_phase3_forbidden_403_rbac.png",
+      "bytes": 69759,
+      "sha256": "f6656e9287e9dde5f89378e59f3f77e8a91fb0f68230bb249d5b911dcf277220"
+    },
+    "04_phase3_session_expired_401.png": {
+      "path": "docs/screenshots/phase3_t39/04_phase3_session_expired_401.png",
+      "bytes": 111812,
+      "sha256": "d8af1c171b79f573c212c99d50df9eb3922af20deb9e39142b42670acfc6096e"
+    },
+    "05_phase3_admin_panel_authorized.png": {
+      "path": "docs/screenshots/phase3_t39/05_phase3_admin_panel_authorized.png",
+      "bytes": 115408,
+      "sha256": "dcbee74c74af44676ec37afd848b50a663033eee2502dc80946d7bdda0a67a74"
+    },
+    "06_phase3_logged_out_bfcache_scrub.png": {
+      "path": "docs/screenshots/phase3_t39/06_phase3_logged_out_bfcache_scrub.png",
+      "bytes": 109594,
+      "sha256": "83e56329dddc1b8f5594615b6ce96b2259c19ce8021069c1718c0852fd074675"
+    }
+  }
+}
