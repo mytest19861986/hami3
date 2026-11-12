@@ -70,7 +70,14 @@ def create_app() -> FastAPI:
     @application.exception_handler(PayoutAdapterConfigurationError)
     @application.exception_handler(SmsAdapterError)
     async def fail_closed_runtime_config_handler(request: Request, exc: Exception):
-        return JSONResponse(status_code=503, content={"detail": str(exc)})
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, private",
+                "Pragma": "no-cache",
+            },
+        )
 
     # Environment-controlled fail-closed CORS configuration (M-1 / HC-T26)
     application.add_middleware(

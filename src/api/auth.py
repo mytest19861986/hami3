@@ -174,14 +174,35 @@ def _error_json(
     return resp
 
 
-def _resolve_cookie_mode_header(req: Request) -> bool:
+def _resolve_auth_mode_header(req: Request) -> str:
     raw_mode = (req.headers.get("x-auth-mode") or "").strip().lower()
     if raw_mode not in ("", "cookie", "bearer"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unsupported X-Auth-Mode header value.",
         )
-    return raw_mode == "cookie"
+    return raw_mode
+
+
+def _resolve_cookie_mode_header(req: Request) -> bool:
+    return _resolve_auth_mode_header(req) == "cookie"
+
+
+def _resolve_using_cookie(req: Request) -> tuple[bool, str | None, str | None]:
+    """
+    Determines whether `/refresh` or `/logout` runs in cookie mode without letting
+    ambient client hint/CSRF cookies (`hc_has_session`, `hc_csrf`) hijack legacy callers (T36-L2).
+    """
+    auth_mode = _resolve_auth_mode_header(req)
+    cookie_refresh = req.cookies.get(REFRESH_COOKIE_NAME)
+    cookie_csrf = req.cookies.get(CSRF_COOKIE_NAME)
+    if auth_mode == "cookie":
+        using_cookie = True
+    elif auth_mode == "bearer":
+        using_cookie = False
+    else:
+        using_cookie = cookie_refresh is not None
+    return using_cookie, cookie_refresh, cookie_csrf
 
 
 @router.post("/otp/request")
@@ -234,11 +255,10 @@ async def verify_otp(
             resolve_access_token_ttl()
         except AccessTokenConfigurationError as exc:
             return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), req, clear_cookies=False)
-        if req.headers.get("origin") is not None or req.headers.get("referer") is not None:
-            try:
-                validate_cookie_request_origin(req)
-            except (CorsOriginRejectedError, CorsConfigurationError, EnvironmentConfigurationError) as exc:
-                return _error_json(status.HTTP_403_FORBIDDEN, str(exc), req, clear_cookies=False)
+        try:
+            validate_cookie_request_origin(req)
+        except (CorsOriginRejectedError, CorsConfigurationError, EnvironmentConfigurationError) as exc:
+            return _error_json(status.HTTP_403_FORBIDDEN, str(exc), req, clear_cookies=False)
 
     if not validate_iranian_mobile(payload.mobile):
         raise HTTPException(
@@ -327,11 +347,10 @@ async def login_password(
             resolve_access_token_ttl()
         except AccessTokenConfigurationError as exc:
             return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), req, clear_cookies=False)
-        if req.headers.get("origin") is not None or req.headers.get("referer") is not None:
-            try:
-                validate_cookie_request_origin(req)
-            except (CorsOriginRejectedError, CorsConfigurationError, EnvironmentConfigurationError) as exc:
-                return _error_json(status.HTTP_403_FORBIDDEN, str(exc), req, clear_cookies=False)
+        try:
+            validate_cookie_request_origin(req)
+        except (CorsOriginRejectedError, CorsConfigurationError, EnvironmentConfigurationError) as exc:
+            return _error_json(status.HTTP_403_FORBIDDEN, str(exc), req, clear_cookies=False)
 
     if not validate_iranian_mobile(payload.mobile):
         raise HTTPException(
@@ -409,16 +428,7 @@ async def refresh_session(
     Competing concurrent callers receive HTTP 409 Conflict WITHOUT credential disclosure.
     """
     _set_no_store(response)
-    cookie_mode_header = _resolve_cookie_mode_header(req)
-    cookie_refresh = req.cookies.get(REFRESH_COOKIE_NAME)
-    cookie_csrf = req.cookies.get(CSRF_COOKIE_NAME)
-    cookie_hint = req.cookies.get(SESSION_HINT_COOKIE_NAME)
-    using_cookie = (
-        cookie_mode_header
-        or (cookie_refresh is not None)
-        or (cookie_csrf is not None)
-        or (cookie_hint is not None)
-    )
+    using_cookie, cookie_refresh, cookie_csrf = _resolve_using_cookie(req)
 
     session_svc = SessionService(pool, redis_client=r)
     client_ip = req.client.host if req.client else "127.0.0.1"
@@ -616,6 +626,29 @@ async def refresh_session(
         ) from e
 
 
+async def _revoke_families_fail_closed(
+    session_svc: SessionService,
+    family_ids: list[Any],
+) -> tuple[int, RevocationStoreUnavailableError | None]:
+    """
+    Revokes every distinct target family in PostgreSQL SSOT even if Redis revocation store errors
+    mid-batch, and returns any first RevocationStoreUnavailableError for fail-closed HTTP 503.
+    """
+    revoked_count = 0
+    first_err: RevocationStoreUnavailableError | None = None
+    seen: set[Any] = set()
+    for fid in family_ids:
+        if fid is None or fid in seen:
+            continue
+        seen.add(fid)
+        try:
+            revoked_count += await session_svc.revoke_session_family(fid, reason="LOGOUT")
+        except RevocationStoreUnavailableError as exc:
+            if first_err is None:
+                first_err = exc
+    return revoked_count, first_err
+
+
 @router.post("/logout")
 async def logout(
     req: Request,
@@ -630,16 +663,7 @@ async def logout(
     rejected (AC-14). Supports cookie + CSRF mode and legacy Bearer token mode.
     """
     _set_no_store(response)
-    cookie_mode_header = _resolve_cookie_mode_header(req)
-    cookie_refresh = req.cookies.get(REFRESH_COOKIE_NAME)
-    cookie_csrf = req.cookies.get(CSRF_COOKIE_NAME)
-    cookie_hint = req.cookies.get(SESSION_HINT_COOKIE_NAME)
-    using_cookie = (
-        cookie_mode_header
-        or (cookie_refresh is not None)
-        or (cookie_csrf is not None)
-        or (cookie_hint is not None)
-    )
+    using_cookie, cookie_refresh, cookie_csrf = _resolve_using_cookie(req)
 
     session_svc = SessionService(pool, redis_client=r)
     auth_header = req.headers.get("authorization")
@@ -662,6 +686,15 @@ async def logout(
                 "Missing or invalid X-CSRF-Token.",
                 req,
                 clear_cookies=False,
+            )
+
+        # Fail-closed signing configuration check BEFORE verifying HMAC CSRF or mutating state (T36-L3)
+        try:
+            resolve_access_signing_secret()
+            resolve_access_token_ttl()
+        except (AccessTokenConfigurationError, EnvironmentConfigurationError) as exc:
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), req, clear_cookies=False
             )
 
         target_family_id = None
@@ -711,22 +744,21 @@ async def logout(
                 clear_cookies=False,
             )
 
-        try:
-            revoked_count = await session_svc.revoke_session_family(
-                target_family_id, reason="LOGOUT"
-            )
-            if (
-                bearer_claims is not None
-                and bearer_claims["family_id"] != target_family_id
-                and bearer_claims["user_id"] == actor_user_id
-            ):
-                revoked_count += await session_svc.revoke_session_family(
-                    bearer_claims["family_id"], reason="LOGOUT"
-                )
-        except RevocationStoreUnavailableError as exc:
+        families_to_revoke = [target_family_id]
+        if (
+            bearer_claims is not None
+            and bearer_claims["family_id"] != target_family_id
+            and bearer_claims["user_id"] == actor_user_id
+        ):
+            families_to_revoke.append(bearer_claims["family_id"])
+
+        revoked_count, revocation_err = await _revoke_families_fail_closed(
+            session_svc, families_to_revoke
+        )
+        if revocation_err is not None:
             return _error_json(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                str(exc),
+                str(revocation_err),
                 req,
                 clear_cookies=True,
             )
@@ -740,33 +772,44 @@ async def logout(
         }
 
     # Legacy Bearer mode preserved for existing API callers
-    current_user: Dict[str, Any] = await get_current_user(
-        response=response,
-        authorization=auth_header,
-        pool=pool,
-        r=r,
-    )
-
     try:
-        revoked_count = await session_svc.revoke_session_family(
-            current_user["session_family_id"], reason="LOGOUT"
+        current_user: Dict[str, Any] = await get_current_user(
+            response=response,
+            authorization=auth_header,
+            pool=pool,
+            r=r,
         )
-        if payload and payload.refresh_token:
-            digest = hash_token(payload.refresh_token)
-            async with pool.acquire() as conn:
-                tok_row = await conn.fetchrow(
-                    "SELECT user_id, family_id FROM refresh_tokens WHERE token_hash = $1;",
-                    digest,
-                )
-                if tok_row and tok_row["user_id"] == current_user["id"]:
-                    revoked_count += await session_svc.revoke_session_family(
-                        tok_row["family_id"], reason="LOGOUT"
-                    )
-    except RevocationStoreUnavailableError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                str(exc.detail),
+                req,
+                clear_cookies=False,
+            )
+        raise
+
+    legacy_families = [current_user["session_family_id"]]
+    if payload and payload.refresh_token:
+        digest = hash_token(payload.refresh_token)
+        async with pool.acquire() as conn:
+            tok_row = await conn.fetchrow(
+                "SELECT user_id, family_id FROM refresh_tokens WHERE token_hash = $1;",
+                digest,
+            )
+            if tok_row and tok_row["user_id"] == current_user["id"]:
+                legacy_families.append(tok_row["family_id"])
+
+    revoked_count, revocation_err = await _revoke_families_fail_closed(
+        session_svc, legacy_families
+    )
+    if revocation_err is not None:
+        return _error_json(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            str(revocation_err),
+            req,
+            clear_cookies=False,
+        )
 
     return {
         "success": True,
