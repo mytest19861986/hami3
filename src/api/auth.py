@@ -864,19 +864,49 @@ async def check_panel_access(
             )
 
         verification_status = None
-        if normalized == "DOCTOR" and "DOCTOR" in roles and "ADMIN" not in roles and "SUPER_ADMIN" not in roles:
-            verification_status = await conn.fetchval(
-                "SELECT verification_status FROM doctors WHERE user_id = $1;",
-                current_user["id"],
-            )
-        elif normalized == "AGENT" and "AGENT" in roles and "ADMIN" not in roles and "SUPER_ADMIN" not in roles:
-            verification_status = await conn.fetchval(
-                "SELECT verification_status FROM agents WHERE user_id = $1;",
-                current_user["id"],
-            )
+        operational_access = True
+        access_level = "OPERATIONAL_ROLE_VERIFIED"
+
+        if normalized in ("DOCTOR", "AGENT"):
+            table_name = "doctors" if normalized == "DOCTOR" else "agents"
+            if normalized in roles:
+                verification_status = await conn.fetchval(
+                    f"SELECT verification_status FROM {table_name} WHERE user_id = $1;",
+                    current_user["id"],
+                )
+                if verification_status != "APPROVED":
+                    effective_vstatus = verification_status or "MISSING"
+                    return JSONResponse(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        content={
+                            "detail": (
+                                f"دسترسی عملیاتی به پنل {normalized} فقط پس از تایید نهایی (APPROVED) امکان‌پذیر است "
+                                f"(وضعیت فعلی پرونده: {effective_vstatus})."
+                            ),
+                            "code": "PROFESSIONAL_APPROVAL_REQUIRED",
+                            "panel_role": normalized,
+                            "verification_status": effective_vstatus,
+                            "operational_access": False,
+                            "status_view_allowed": True,
+                            "effective_roles": roles,
+                            "open_policies_status": "PROPOSED",
+                        },
+                        headers={
+                            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+                            "Pragma": "no-cache",
+                        },
+                    )
+                access_level = "OPERATIONAL_APPROVED"
+            else:
+                # SUPER_ADMIN administrative inspection without impersonating an APPROVED professional record
+                operational_access = False
+                access_level = "ADMIN_REVIEW_ONLY"
+                verification_status = "ADMIN_REVIEW_ONLY"
 
     return {
         "authorized": True,
+        "operational_access": operational_access,
+        "access_level": access_level,
         "panel_role": normalized,
         "effective_roles": roles,
         "verification_status": verification_status,

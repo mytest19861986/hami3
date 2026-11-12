@@ -527,6 +527,14 @@ async function verifyPanelAuthorization(roleKey) {
         detail: '',
         unreadCount: extras && typeof extras.unread_count === 'number' ? extras.unread_count : null,
       };
+    } else if (res.status === 403 && res.data && res.data.code === 'PROFESSIONAL_APPROVAL_REQUIRED') {
+      APP_STATE.panelDecision = {
+        status: 'APPLICATION_STATUS_ONLY',
+        httpStatus: 403,
+        data: res.data,
+        detail: res.data.detail || 'پرونده صنفی شما هنوز تایید نهایی (APPROVED) نشده است.',
+        unreadCount: null,
+      };
     } else if (res.status === 403) {
       APP_STATE.panelDecision = {
         status: 'FORBIDDEN',
@@ -599,6 +607,25 @@ function renderRolePanel(roleKey) {
       `;
     }
 
+    if (dec && dec.status === 'APPLICATION_STATUS_ONLY' && dec.data) {
+      const vStatus = dec.data.verification_status || 'PENDING';
+      return `
+        <section id="hc-application-status-box" class="hc-card hc-card--warn hc-state-box" role="status">
+          <div class="hc-flex-between hc-mb-sm">
+            <span class="hc-badge hc-badge--warn">صفحه محدود وضعیت پرونده صنفی (بدون دسترسی عملیاتی)</span>
+            <span class="hc-badge hc-badge--info">وضعیت پرونده در سرور: <code dir="ltr">${escapeHtml(vStatus)}</code></span>
+          </div>
+          <h1 class="hc-h1-lg">پرونده «${escapeHtml(cfg.roleTitle)}» در وضعیت «${escapeHtml(vStatus)}» است</h1>
+          <p>${escapeHtml(dec.detail)}</p>
+          <p class="hc-text-sec-sm">امکانات عملیاتی داشبورد پزشک/نماینده تنها پس از تغییر وضعیت پرونده در پایگاه‌داده به <code dir="ltr">APPROVED</code> توسط سرور فعال می‌شوند.</p>
+          <div class="hc-flex-wrap hc-mt-md">
+            <a href="#/panel/user" class="hc-btn hc-btn--secondary">ورود به پنل کاربری عادی</a>
+            <a href="#/home" class="hc-btn hc-btn--primary">بازگشت به صفحه اصلی</a>
+          </div>
+        </section>
+      `;
+    }
+
     if (dec && dec.status === 'FORBIDDEN') {
       const roles = (snap.profile && snap.profile.roles) || [];
       const allowedRoute = getPrimaryPanelRoute(roles);
@@ -635,10 +662,26 @@ function renderRolePanel(roleKey) {
   const fullName = [prof.first_name, prof.last_name].filter(Boolean).join(' ').trim();
   const dec = APP_STATE.panelDecision;
   const serverVerifiedBanner =
-    dec && dec.status === 'ALLOW' && dec.data
+    dec && dec.status === 'ALLOW' && dec.data && dec.data.access_level === 'ADMIN_REVIEW_ONLY'
+      ? `<div id="hc-admin-review-badge" class="hc-card hc-card--warn hc-mb-sm">
+          <div class="hc-flex-between">
+            <span class="hc-badge hc-badge--warn">نمای بازبینی مدیریتی (غیرعملیاتی • ${escapeHtml(dec.data.panel_role)})</span>
+            ${
+              dec.unreadCount !== null
+                ? `<span class="hc-badge hc-badge--info">اعلان‌های خوانده‌نشده: ${toPersianDigits(dec.unreadCount)}</span>`
+                : ''
+            }
+          </div>
+          <div class="hc-text-sec-sm hc-mt-sm">
+            ناظر مدیریتی: <strong>${escapeHtml(fullName || prof.mobile || 'مدیر ارشد')}</strong>
+            | نقش‌های سروری: <code dir="ltr">${escapeHtml((dec.data.effective_roles || []).join(', '))}</code>
+            | حالت: <code dir="ltr">ADMIN_REVIEW_ONLY (operational_access=false)</code>
+          </div>
+        </div>`
+      : dec && dec.status === 'ALLOW' && dec.data && dec.data.operational_access === true
       ? `<div id="hc-panel-authorized-badge" class="hc-card hc-mb-sm">
           <div class="hc-flex-between">
-            <span class="hc-badge hc-badge--ok">دسترسی تاییدشده سرور (HTTP 200 • ${escapeHtml(dec.data.panel_role)})</span>
+            <span class="hc-badge hc-badge--ok">دسترسی تاییدشده عملیاتی سرور (HTTP 200 • ${escapeHtml(dec.data.panel_role)})</span>
             ${
               dec.unreadCount !== null
                 ? `<span class="hc-badge hc-badge--info">اعلان‌های خوانده‌نشده: ${toPersianDigits(dec.unreadCount)}</span>`
