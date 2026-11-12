@@ -7,7 +7,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from src.adapters.payment import PaymentGatewayError
@@ -27,6 +27,7 @@ from src.api.reviews import router as reviews_router
 from src.api.sales import router as sales_router
 from src.api.visits import router as visits_router
 from src.api.wallets import router as wallets_router
+from src.auth.access_tokens import AccessTokenConfigurationError, RevocationStoreUnavailableError
 from src.core.cors import StrictCORSMiddleware, resolve_cors_settings
 from src.core.env import EnvironmentConfigurationError
 from src.core.settings import load_and_validate_settings
@@ -63,6 +64,8 @@ def create_app() -> FastAPI:
     )
 
     @application.exception_handler(EnvironmentConfigurationError)
+    @application.exception_handler(AccessTokenConfigurationError)
+    @application.exception_handler(RevocationStoreUnavailableError)
     @application.exception_handler(PaymentGatewayError)
     @application.exception_handler(PayoutAdapterConfigurationError)
     @application.exception_handler(SmsAdapterError)
@@ -115,6 +118,39 @@ def create_app() -> FastAPI:
         if os.path.exists(manifest_file):
             return FileResponse(manifest_file, media_type="application/manifest+json")
         return {}
+
+    _poc_security_headers = {
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "img-src 'self' data:; "
+            "font-src 'self'; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'"
+        ),
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+
+    @application.get("/auth-poc", include_in_schema=False)
+    def auth_poc_page():
+        poc_file = os.path.join(STATIC_DIR, "auth_poc.html")
+        if os.path.exists(poc_file):
+            return FileResponse(poc_file, media_type="text/html", headers=_poc_security_headers)
+        return Response(status_code=404, content="Auth PoC page not found.")
+
+    @application.get("/auth-poc/public", include_in_schema=False)
+    def auth_poc_public_page():
+        pub_file = os.path.join(STATIC_DIR, "auth_poc_public.html")
+        if os.path.exists(pub_file):
+            return FileResponse(pub_file, media_type="text/html", headers=_poc_security_headers)
+        return Response(status_code=404, content="Auth PoC public page not found.")
 
     return application
 

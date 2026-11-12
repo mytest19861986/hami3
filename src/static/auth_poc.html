@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HamiCard Phase 3 Auth Security PoC (HC-T36)</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/auth_poc.css" />
+  <script src="/static/auth_poc.js" defer></script>
+</head>
+<body>
+  <main class="poc-main">
+    <header class="poc-header">
+      <h1>HamiCard Secure Cookie Auth PoC (HC-T36)</h1>
+      <p class="poc-note" data-testid="governance-notice">
+        Isolated Security PoC only (no Phase 3 consumer UI, OPEN-01..18 remain PROPOSED, zero localStorage/sessionStorage).
+      </p>
+      <div class="poc-status-row">
+        <span>Status: <strong id="poc-auth-state" data-testid="auth-state">UNAUTHENTICATED</strong></span>
+        <a id="poc-public-link" data-testid="public-link" href="/auth-poc/public">Navigate to Public Page</a>
+      </div>
+    </header>
+
+    <section class="poc-grid">
+      <article class="poc-card">
+        <h2>1. OTP Authentication (Cookie Mode)</h2>
+        <form id="poc-otp-req-form">
+          <label for="poc-mobile">Mobile</label>
+          <input id="poc-mobile" name="mobile" type="text" value="09121112233" autocomplete="tel" />
+          <button id="poc-request-otp-btn" type="submit">Request OTP</button>
+        </form>
+        <form id="poc-otp-verify-form">
+          <label for="poc-otp-code">OTP Code</label>
+          <input id="poc-otp-code" name="code" type="text" maxlength="6" autocomplete="one-time-code" />
+          <button id="poc-verify-otp-btn" type="submit">Verify OTP (Cookie Mode)</button>
+        </form>
+      </article>
+
+      <article class="poc-card">
+        <h2>2. Password Login (Cookie Mode)</h2>
+        <form id="poc-pwd-form">
+          <label for="poc-pwd-mobile">Mobile</label>
+          <input id="poc-pwd-mobile" name="mobile" type="text" autocomplete="username" />
+          <label for="poc-pwd-input">Password</label>
+          <input id="poc-pwd-input" name="password" type="password" autocomplete="current-password" />
+          <button id="poc-pwd-login-btn" type="submit">Login With Password</button>
+        </form>
+      </article>
+
+      <article class="poc-card">
+        <h2>3. Protected API &amp; Session Coordination</h2>
+        <div class="poc-actions">
+          <button id="poc-fetch-profile-btn" type="button">Fetch Protected Profile (/api/v1/profile/me)</button>
+          <button id="poc-refresh-btn" type="button">Silent Coordinated Refresh</button>
+          <button id="poc-logout-btn" type="button" class="danger">Logout Everywhere</button>
+        </div>
+        <pre id="poc-profile-output" data-testid="profile-output">Not loaded.</pre>
+      </article>
+
+      <article class="poc-card">
+        <h2>4. Storage &amp; Memory Self-Audit</h2>
+        <pre id="poc-storage-audit" data-testid="storage-audit"></pre>
+        <p id="poc-event-log" data-testid="event-log">Ready.</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

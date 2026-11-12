@@ -18,7 +18,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Dict
 
 import asyncpg
+import redis
 
+from src.auth.access_tokens import mark_family_revoked_in_redis
 from src.core.security import generate_secure_token, hash_token
 
 
@@ -49,8 +51,47 @@ class SecurityReplayAttackError(SessionError):
 
 
 class SessionService:
-    def __init__(self, db_pool: asyncpg.Pool):
+    def __init__(self, db_pool: asyncpg.Pool, redis_client: redis.Redis | None = None):
         self.pool = db_pool
+        self.redis = redis_client
+
+    async def get_refresh_token_meta(self, raw_refresh_token: str) -> Dict[str, Any] | None:
+        """Read-only lookup of refresh token metadata without modifying or rotating state."""
+        if not raw_refresh_token:
+            return None
+        token_digest = hash_token(raw_refresh_token)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, family_id, status, expires_at
+                FROM refresh_tokens
+                WHERE token_hash = $1;
+                """,
+                token_digest,
+            )
+            return dict(row) if row else None
+
+    async def verify_active_family(self, family_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+        """Confirms at least one non-expired ACTIVE refresh token remains in `family_id` (SSOT)."""
+        now = datetime.now(UTC)
+        async with self.pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM refresh_tokens
+                        WHERE family_id = $1
+                          AND user_id = $2
+                          AND status = 'ACTIVE'
+                          AND expires_at > $3
+                    );
+                    """,
+                    family_id,
+                    user_id,
+                    now,
+                )
+            )
 
     async def create_session(
         self,
@@ -110,6 +151,7 @@ class SessionService:
         token_digest = hash_token(raw_refresh_token)
         err_to_raise = None
         result_payload = None
+        revoked_family_reason: tuple[uuid.UUID, str] | None = None
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -137,6 +179,7 @@ class SessionService:
                             "UPDATE refresh_tokens SET status = 'REVOKED' WHERE family_id = $1;",
                             family_id,
                         )
+                        revoked_family_reason = (family_id, "ACCOUNT_BLOCKED")
                         err_to_raise = AccountBlockedError(
                             f"Account is {user_status}. All sessions revoked."
                         )
@@ -175,6 +218,7 @@ class SessionService:
                                 ip_address,
                             )
 
+                            revoked_family_reason = (family_id, "REPLAY_ATTACK")
                             err_to_raise = SecurityReplayAttackError(
                                 f"CRITICAL: Replay of already rotated token detected! Entire token family {family_id} revoked."
                             )
@@ -184,6 +228,7 @@ class SessionService:
                             "UPDATE refresh_tokens SET status = 'REVOKED' WHERE family_id = $1;",
                             family_id,
                         )
+                        revoked_family_reason = (family_id, "REVOKED_REUSE")
                         err_to_raise = SecurityReplayAttackError(
                             "Attempted use of explicitly revoked token. Family terminated."
                         )
@@ -233,11 +278,19 @@ class SessionService:
 
                         result_payload = {
                             "status": "ROTATED",
+                            "user_id": str(user_id),
                             "session_id": str(new_token_id),
                             "family_id": str(family_id),
                             "refresh_token": new_raw_token,
                             "expires_at": new_expires_at.isoformat(),
                         }
+
+        if revoked_family_reason is not None and self.redis is not None:
+            mark_family_revoked_in_redis(
+                self.redis,
+                revoked_family_reason[0],
+                reason=revoked_family_reason[1],
+            )
 
         if err_to_raise:
             raise err_to_raise
@@ -270,10 +323,12 @@ class SessionService:
                     "UPDATE refresh_tokens SET status = 'REVOKED' WHERE family_id = $1 AND status != 'REVOKED';",
                     row["family_id"],
                 )
+                if self.redis is not None:
+                    mark_family_revoked_in_redis(self.redis, row["family_id"], reason="ACCOUNT_BLOCKED")
                 return None
             return dict(row)
 
-    async def revoke_session_family(self, family_id: uuid.UUID) -> int:
+    async def revoke_session_family(self, family_id: uuid.UUID, reason: str = "LOGOUT") -> int:
         """Revokes every token in a given session family (F-05, T13-AC5)."""
         async with self.pool.acquire() as conn:
             res = await conn.execute(
@@ -284,17 +339,21 @@ class SessionService:
                 """,
                 family_id,
             )
-            try:
-                return int(res.split()[1])
-            except Exception:
-                return 0
+        if self.redis is not None:
+            mark_family_revoked_in_redis(self.redis, family_id, reason=reason)
+        try:
+            return int(res.split()[1])
+        except Exception:
+            return 0
 
-    async def revoke_session(self, raw_refresh_token: str) -> bool:
+    async def revoke_session(self, raw_refresh_token: str, reason: str = "LOGOUT") -> bool:
         """
         Revokes the ENTIRE session family associated with `raw_refresh_token` (F-05, T13-AC5).
         Prevents session survival via previously rotated tokens or sibling tokens in the same family.
         """
         token_digest = hash_token(raw_refresh_token)
+        revoked_fid = None
+        rowcount = 0
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -303,31 +362,38 @@ class SessionService:
                 )
                 if not row:
                     return False
+                revoked_fid = row["family_id"]
                 res = await conn.execute(
                     """
                     UPDATE refresh_tokens
                     SET status = 'REVOKED'
                     WHERE family_id = $1 AND status != 'REVOKED';
                     """,
-                    row["family_id"],
+                    revoked_fid,
                 )
                 try:
-                    return int(res.split()[1]) >= 1
+                    rowcount = int(res.split()[1])
                 except Exception:
-                    return False
+                    rowcount = 0
+        if revoked_fid is not None and self.redis is not None:
+            mark_family_revoked_in_redis(self.redis, revoked_fid, reason=reason)
+        return rowcount >= 1
 
-    async def revoke_all_user_sessions(self, user_id: uuid.UUID) -> int:
+    async def revoke_all_user_sessions(
+        self, user_id: uuid.UUID, reason: str = "USER_REVOKED"
+    ) -> int:
         """Revokes all sessions across all families for a given user."""
         async with self.pool.acquire() as conn:
-            res = await conn.execute(
+            rows = await conn.fetch(
                 """
                 UPDATE refresh_tokens
                 SET status = 'REVOKED'
-                WHERE user_id = $1 AND status != 'REVOKED';
+                WHERE user_id = $1 AND status != 'REVOKED'
+                RETURNING family_id;
                 """,
                 user_id,
             )
-            try:
-                return int(res.split()[1])
-            except Exception:
-                return 0
+        if self.redis is not None:
+            for fid in {r["family_id"] for r in rows}:
+                mark_family_revoked_in_redis(self.redis, fid, reason=reason)
+        return len(rows)

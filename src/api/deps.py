@@ -14,6 +14,14 @@ import asyncpg
 import redis
 from fastapi import Depends, Header, HTTPException, Response, status
 
+from src.auth.access_tokens import (
+    ACCESS_TOKEN_PREFIX,
+    AccessTokenConfigurationError,
+    InvalidAccessTokenError,
+    RevocationStoreUnavailableError,
+    is_family_revoked_in_redis,
+    verify_access_token,
+)
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
 from src.auth.session_service import SessionService
 
@@ -73,9 +81,11 @@ async def get_current_user(
     response: Response,
     authorization: str | None = Header(None),
     pool: asyncpg.Pool = Depends(get_db_pool),
+    r: redis.Redis = Depends(get_redis),
 ) -> Dict[str, Any]:
     """
-    Validates Bearer session token against PostgreSQL active sessions (SSOT),
+    Validates short-lived access token (`hc_at_v1.*`) OR legacy Bearer session token against
+    fail-closed Redis revocation set + PostgreSQL active session family (SSOT),
     resolves authoritative roles from `user_roles` (F-04), and enforces no-store cache headers (AUTH-013).
     """
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
@@ -88,15 +98,108 @@ async def get_current_user(
         )
 
     raw_token = authorization.split(" ", 1)[1].strip()
-    session_svc = SessionService(pool)
-    session = await session_svc.verify_active_session(raw_token)
+    session_svc = SessionService(pool, redis_client=r)
+    rbac = RbacEngine(pool)
+
+    if raw_token.startswith(f"{ACCESS_TOKEN_PREFIX}."):
+        try:
+            claims = verify_access_token(raw_token)
+        except AccessTokenConfigurationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        except InvalidAccessTokenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Access token invalid or expired.",
+            ) from exc
+
+        try:
+            revoked_in_redis = is_family_revoked_in_redis(r, claims["family_id"])
+        except RevocationStoreUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+
+        if revoked_in_redis:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been revoked.",
+            )
+
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT id, mobile, status, is_mobile_verified FROM users WHERE id = $1",
+                claims["user_id"],
+            )
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User not found.",
+                )
+            if user["status"] != "ACTIVE":
+                try:
+                    await session_svc.revoke_session_family(
+                        claims["family_id"], reason="ACCOUNT_BLOCKED"
+                    )
+                except RevocationStoreUnavailableError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=str(exc),
+                    ) from exc
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Account access unavailable.",
+                )
+
+            family_active = await session_svc.verify_active_family(
+                claims["family_id"], claims["user_id"]
+            )
+            if not family_active:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session has expired or was revoked.",
+                )
+
+            try:
+                authoritative_roles = await rbac.get_user_roles(conn, user["id"])
+            except RbacAccessDeniedError as exc:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+            user_dict = dict(user)
+            user_dict["roles"] = sorted(list(authoritative_roles))
+            user_dict["session_id"] = str(claims["session_id"])
+            user_dict["session_family_id"] = claims["family_id"]
+            return user_dict
+
+    try:
+        session = await session_svc.verify_active_session(raw_token)
+    except RevocationStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
     if not session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session has expired or was revoked.",
         )
 
-    rbac = RbacEngine(pool)
+    try:
+        if is_family_revoked_in_redis(r, session["family_id"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been revoked.",
+            )
+    except RevocationStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id, mobile, status, is_mobile_verified FROM users WHERE id = $1",
@@ -108,9 +211,17 @@ async def get_current_user(
                 detail="User not found.",
             )
         if user["status"] != "ACTIVE":
-            await session_svc.revoke_session_family(session["family_id"])
+            try:
+                await session_svc.revoke_session_family(
+                    session["family_id"], reason="ACCOUNT_BLOCKED"
+                )
+            except RevocationStoreUnavailableError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc),
+                ) from exc
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Account access unavailable.",
             )
 
