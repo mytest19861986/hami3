@@ -5,7 +5,9 @@ Baseline: BL-HAMICARD-PRD-V1
 
 import os
 import pathlib
+import posixpath
 from contextlib import asynccontextmanager
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -55,6 +57,65 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 UI_SHELL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui_shell")
 API_V1_PREFIX = "/api/v1"
 
+_RESTRICTED_404_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, private",
+    "Pragma": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+def _restricted_404_response() -> Response:
+    return Response(
+        status_code=404,
+        content="Not found.",
+        media_type="text/plain; charset=utf-8",
+        headers=_RESTRICTED_404_HEADERS,
+    )
+
+
+def _normalize_candidate_path(raw_path: str) -> str:
+    candidate = raw_path or "/"
+    for _ in range(5):
+        decoded = unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+    candidate = candidate.replace("\\", "/")
+    # Strip matrix/path parameters per segment if supplied (e.g. /auth-poc;jsessionid=x)
+    segments = [seg.split(";", 1)[0] for seg in candidate.split("/")]
+    cleaned = "/" + "/".join(seg for seg in segments if seg != "")
+    normalized = posixpath.normpath(cleaned)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+    return normalized.lower()
+
+
+def _is_restricted_experimental_path(request: Request) -> bool:
+    raw_bytes = request.scope.get("raw_path")
+    candidates = [request.url.path]
+    if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+        raw_str = raw_bytes.decode("latin-1", errors="ignore").split("?", 1)[0]
+        candidates.append(raw_str)
+
+    for candidate in candidates:
+        norm = _normalize_candidate_path(candidate)
+        if (
+            norm == "/auth-poc"
+            or norm.startswith("/auth-poc/")
+            or norm == "/auth_poc"
+            or norm.startswith("/auth_poc/")
+            or norm == "/static/index.html"
+            or norm.startswith("/static/index.html/")
+            or norm.startswith("/static/auth_poc")
+            or norm.startswith("/static/auth-poc")
+        ):
+            return True
+        if norm.startswith("/static/") and posixpath.basename(norm).startswith(("auth_poc", "auth-poc")):
+            return True
+    return False
+
 
 def create_app() -> FastAPI:
     cors_cfg = resolve_cors_settings()
@@ -80,6 +141,26 @@ def create_app() -> FastAPI:
                 "Pragma": "no-cache",
             },
         )
+
+    # P3-05 / HC-T45: Block experimental /auth-poc* routes & /static/auth_poc* assets
+    # plus legacy /static/index.html in restricted (production/staging) environments.
+    # Registered before StrictCORSMiddleware so CORS checks still apply cleanly on all responses.
+    @application.middleware("http")
+    async def block_restricted_experimental_routes(request: Request, call_next):
+        try:
+            restricted = is_restricted_environment()
+        except EnvironmentConfigurationError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": str(exc)},
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, private",
+                    "Pragma": "no-cache",
+                },
+            )
+        if restricted and _is_restricted_experimental_path(request):
+            return _restricted_404_response()
+        return await call_next(request)
 
     # Environment-controlled fail-closed CORS configuration (M-1 / HC-T26)
     application.add_middleware(
@@ -118,14 +199,14 @@ def create_app() -> FastAPI:
     @application.get("/static/index.html", include_in_schema=False)
     def blocked_legacy_static_index():
         if is_restricted_environment():
-            return Response(status_code=404, content="Not found.")
+            return _restricted_404_response()
         index_file = os.path.join(STATIC_DIR, "index.html")
         if os.path.exists(index_file):
             return FileResponse(
                 index_file,
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache"},
             )
-        return Response(status_code=404, content="Not found.")
+        return _restricted_404_response()
 
     # Mount static files and web portal
     if os.path.exists(STATIC_DIR):
@@ -174,18 +255,24 @@ def create_app() -> FastAPI:
     }
 
     @application.get("/auth-poc", include_in_schema=False)
+    @application.get("/auth-poc/", include_in_schema=False)
     def auth_poc_page():
+        if is_restricted_environment():
+            return _restricted_404_response()
         poc_file = os.path.join(STATIC_DIR, "auth_poc.html")
         if os.path.exists(poc_file):
             return FileResponse(poc_file, media_type="text/html", headers=_poc_security_headers)
-        return Response(status_code=404, content="Auth PoC page not found.")
+        return Response(status_code=404, content="Auth PoC page not found.", headers=_RESTRICTED_404_HEADERS)
 
     @application.get("/auth-poc/public", include_in_schema=False)
+    @application.get("/auth-poc/public/", include_in_schema=False)
     def auth_poc_public_page():
+        if is_restricted_environment():
+            return _restricted_404_response()
         pub_file = os.path.join(STATIC_DIR, "auth_poc_public.html")
         if os.path.exists(pub_file):
             return FileResponse(pub_file, media_type="text/html", headers=_poc_security_headers)
-        return Response(status_code=404, content="Auth PoC public page not found.")
+        return Response(status_code=404, content="Auth PoC public page not found.", headers=_RESTRICTED_404_HEADERS)
 
     _asset_security_headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
