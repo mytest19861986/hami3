@@ -2,7 +2,7 @@ name: HamiCard CI/CD Automated Test Pipeline
 
 on:
   push:
-    branches: [ main, develop, 'feature/**' ]
+    branches: [ main, develop, 'feature/**', 'fix/**', 'ci/**', 'chore/**' ]
   pull_request:
     branches: [ main, develop ]
 
@@ -67,3 +67,70 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
         run: |
           python scripts/run_all_tests.py
+
+  phase3-security-and-browser-tests:
+    name: Phase 3 Security, Pytest & Playwright E2E Verification
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hamicard_dev
+          POSTGRES_USER: hamicard
+          POSTGRES_PASSWORD: hamicard_dev_secret_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install System Utilities & Postgres Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Install Python & Playwright Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt playwright>=1.42.0
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: Apply Database Schema & Seed Data
+        run: |
+          PGPASSWORD=hamicard_dev_secret_pass psql -h localhost -U hamicard -d hamicard_dev -f db/init.sql
+
+      - name: Run Ruff Linter
+        run: |
+          ruff check src tests scripts/run_phase3_t39_demo.py
+
+      - name: Run HC Security & Playwright Browser E2E Suites
+        env:
+          PYTHONPATH: .
+          DATABASE_URL: postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest -v -rs tests/test_hc_*.py tests/test_adapters.py
