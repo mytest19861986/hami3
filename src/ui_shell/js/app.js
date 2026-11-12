@@ -42,6 +42,7 @@ const APP_STATE = {
   },
   panelDecisionKey: null,
   panelDecision: null, // { status: 'LOADING' | 'ALLOW' | 'FORBIDDEN' | 'EXPIRED' | 'ERROR', httpStatus, data, detail, unreadCount }
+  panelAuthCheckSeq: 0,
 };
 
 const VALID_STATES = ['NORMAL', 'LOADING', 'EMPTY', 'ERROR', 'DISABLED_GATE'];
@@ -99,6 +100,17 @@ function getPrimaryPanelRoute(roles) {
 
 function renderSessionBar() {
   const snap = getAuthSnapshot();
+
+  if (snap.status === 'LOGOUT_PENDING') {
+    return `
+      <div id="hc-session-bar" class="hc-session-bar hc-session-bar--expired" role="status" aria-live="polite" aria-label="در حال خروج امن از نشست">
+        <div class="hc-flex-wrap">
+          <span id="hc-session-badge" class="hc-badge hc-badge--warn">در حال خروج امن (LOGOUT_PENDING)</span>
+          <span id="hc-logout-pending-banner" class="hc-text-sec-xs">${escapeHtml(snap.lastEventMessage)}</span>
+        </div>
+      </div>
+    `;
+  }
 
   if (snap.status === 'REMOTE_REVOKE_FAILED') {
     const actionsHtml = snap.canRetryLogout
@@ -435,6 +447,8 @@ function renderAuthShellView() {
   const badgeClass =
     snap.status === 'AUTHENTICATED'
       ? 'hc-badge--ok'
+      : snap.status === 'LOGOUT_PENDING'
+      ? 'hc-badge--warn'
       : snap.status === 'EXPIRED' || snap.status === 'REMOTE_REVOKE_FAILED'
       ? 'hc-badge--err'
       : 'hc-badge--proposed';
@@ -526,11 +540,27 @@ function renderAuthShellView() {
 }
 
 async function verifyPanelAuthorization(roleKey) {
-  const decisionKey = `${roleKey}:${getSessionVersion()}`;
+  const startVersion = getSessionVersion();
+  const decisionKey = `${roleKey}:${startVersion}`;
   if (APP_STATE.panelDecisionKey === decisionKey) {
     return;
   }
 
+  const preSnap = getAuthSnapshot();
+  if (
+    preSnap.logoutBarrierActive ||
+    preSnap.status === 'LOGOUT_PENDING' ||
+    (!preSnap.authenticated && !hasSessionHintCookie())
+  ) {
+    APP_STATE.panelAuthCheckSeq += 1;
+    APP_STATE.panelDecisionKey = null;
+    APP_STATE.panelDecision = null;
+    render();
+    return;
+  }
+
+  APP_STATE.panelAuthCheckSeq += 1;
+  const checkSeq = APP_STATE.panelAuthCheckSeq;
   APP_STATE.panelDecisionKey = decisionKey;
   APP_STATE.panelDecision = {
     status: 'LOADING',
@@ -541,15 +571,32 @@ async function verifyPanelAuthorization(roleKey) {
   };
   render();
 
+  const isDecisionStillValid = () => {
+    const cur = getAuthSnapshot();
+    return (
+      APP_STATE.panelAuthCheckSeq === checkSeq &&
+      APP_STATE.panelDecisionKey === decisionKey &&
+      getSessionVersion() === startVersion &&
+      !cur.logoutBarrierActive &&
+      cur.status !== 'LOGOUT_PENDING'
+    );
+  };
+
   try {
     const res = await checkPanelAccess(roleKey);
-    if (APP_STATE.panelDecisionKey !== decisionKey) {
+    if (!isDecisionStillValid()) {
       return;
     }
 
     if (res.ok) {
       const extras = await fetchReadOnlyRoleExtras();
-      if (APP_STATE.panelDecisionKey !== decisionKey) {
+      const postSnap = getAuthSnapshot();
+      if (!isDecisionStillValid() || !postSnap.authenticated) {
+        if (!postSnap.authenticated) {
+          APP_STATE.panelDecisionKey = null;
+          APP_STATE.panelDecision = null;
+          render();
+        }
         return;
       }
       APP_STATE.panelDecision = {
@@ -593,7 +640,12 @@ async function verifyPanelAuthorization(roleKey) {
       };
     }
   } catch (err) {
-    if (APP_STATE.panelDecisionKey !== decisionKey) {
+    if (!isDecisionStillValid()) {
+      if (!getAuthSnapshot().authenticated) {
+        APP_STATE.panelDecisionKey = null;
+        APP_STATE.panelDecision = null;
+        render();
+      }
       return;
     }
     APP_STATE.panelDecision = {
@@ -613,6 +665,16 @@ function renderRolePanel(roleKey) {
   if (overrideState) return overrideState;
 
   const snap = getAuthSnapshot();
+  if (snap.status === 'LOGOUT_PENDING') {
+    return `
+      <section id="hc-logout-pending-panel" class="hc-card hc-state-box" role="status" aria-busy="true">
+        <span class="hc-badge hc-badge--warn">در حال خروج امن و پاک‌سازی نشست (LOGOUT_PENDING)</span>
+        <h1 class="hc-h1-lg hc-mt-md">در حال ابطال نشست در سرور...</h1>
+        <p class="hc-text-sec-sm">تا تکمیل پاسخ سرور، اطلاعات کاربری و دسترسی پنل پنهان و مسدود نگه داشته می‌شوند.</p>
+      </section>
+    `;
+  }
+
   const shouldVerifyWithServer =
     snap.authenticated || (!snap.logoutBarrierActive && hasSessionHintCookie());
 
@@ -693,7 +755,7 @@ function renderRolePanel(roleKey) {
 
   const prof = snap.profile || {};
   const fullName = [prof.first_name, prof.last_name].filter(Boolean).join(' ').trim();
-  const dec = APP_STATE.panelDecision;
+  const dec = snap.authenticated ? APP_STATE.panelDecision : null;
   const serverVerifiedBanner =
     dec && dec.status === 'ALLOW' && dec.data && dec.data.access_level === 'ADMIN_REVIEW_ONLY'
       ? `<div id="hc-admin-review-badge" class="hc-card hc-card--warn hc-mb-sm">
@@ -863,7 +925,7 @@ function bindViewEvents() {
     } else if (res && res.canRetryLogout) {
       announceStatus('هشدار: لغو نشست روی سرور تأیید نشد؛ تلاش مجدد لازم است.');
     } else {
-      announceStatus('هشدار: کوکی‌های نشست پاک شدند اما تأیید فوری سرویس ابطال در دسترس نبود.');
+      announceStatus('هشدار: کوکی‌های قابل مشاهده نشست پاک شدند اما لغو نهایی نشست در سرور و پایگاه‌داده تأیید نشد.');
     }
   };
 
@@ -1227,12 +1289,19 @@ function initShell() {
   });
 
   window.addEventListener('hashchange', () => {
+    APP_STATE.panelAuthCheckSeq += 1;
     APP_STATE.panelDecisionKey = null;
     render();
     announceStatus(`مسیر صفحه به ${getParsedHash()} تغییر یافت.`);
   });
 
   initAuthLifecycle(() => {
+    const snap = getAuthSnapshot();
+    if (!snap.authenticated) {
+      APP_STATE.panelAuthCheckSeq += 1;
+      APP_STATE.panelDecisionKey = null;
+      APP_STATE.panelDecision = null;
+    }
     render();
   });
 

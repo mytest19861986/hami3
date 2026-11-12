@@ -5,6 +5,8 @@ REMEDIATION: HC-T13 (F-01..F-05, T13-AC1..AC6), HC-T36 (Cookie Refresh + Short-L
 
 import hmac
 import os
+import re
+import uuid
 from typing import Any, Dict
 
 import asyncpg
@@ -71,15 +73,101 @@ class OtpRequestSchema(BaseModel):
 class OtpVerifySchema(BaseModel):
     mobile: str = Field(..., example="09121234567")
     code: str = Field(..., min_length=6, max_length=6, example="123456")
+    attempt_id: str | None = Field(default=None, max_length=96)
 
 
 class PasswordLoginSchema(BaseModel):
     mobile: str = Field(..., example="09121234567")
     password: str = Field(..., example="SecurePassword123")
+    attempt_id: str | None = Field(default=None, max_length=96)
 
 
 class RefreshTokenSchema(BaseModel):
     refresh_token: str | None = None
+    cancelled_login_attempt_ids: list[str] | None = Field(default=None, max_length=16)
+
+
+class CancelLoginAttemptsSchema(BaseModel):
+    attempt_ids: list[str] = Field(..., min_length=1, max_length=16)
+
+
+CANCELLED_LOGIN_ATTEMPT_REDIS_PREFIX = "hc:cancelled_login_attempt:"
+LOGIN_ATTEMPT_FAMILY_REDIS_PREFIX = "hc:login_attempt_family:"
+LOGIN_ATTEMPT_TTL_SECONDS = 600
+_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,96}$")
+
+
+def _sanitize_attempt_id(raw: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or not _ATTEMPT_ID_RE.match(cleaned):
+        return None
+    return cleaned
+
+
+def _sanitize_attempt_id_list(raw_list: list[str] | None) -> list[str]:
+    if not raw_list:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        aid = _sanitize_attempt_id(item)
+        if aid and aid not in seen:
+            seen.add(aid)
+            out.append(aid)
+    return out
+
+
+def _is_login_attempt_cancelled(r: redis.Redis, attempt_id: str | None) -> bool:
+    if not attempt_id:
+        return False
+    try:
+        return bool(r.get(f"{CANCELLED_LOGIN_ATTEMPT_REDIS_PREFIX}{attempt_id}"))
+    except redis.RedisError as exc:
+        raise RevocationStoreUnavailableError(
+            "Authentication coordination store unavailable; fail-closed rejection."
+        ) from exc
+
+
+def _record_login_attempt_family(r: redis.Redis, attempt_id: str | None, family_id: Any) -> None:
+    if not attempt_id or not family_id:
+        return
+    try:
+        r.set(
+            f"{LOGIN_ATTEMPT_FAMILY_REDIS_PREFIX}{attempt_id}",
+            str(family_id),
+            ex=LOGIN_ATTEMPT_TTL_SECONDS,
+        )
+    except redis.RedisError as exc:
+        raise RevocationStoreUnavailableError(
+            "Authentication coordination store unavailable while binding login attempt."
+        ) from exc
+
+
+def _mark_login_attempts_cancelled(r: redis.Redis, attempt_ids: list[str]) -> list[uuid.UUID]:
+    discovered_families: list[uuid.UUID] = []
+    if not attempt_ids:
+        return discovered_families
+    try:
+        for aid in attempt_ids:
+            r.set(
+                f"{CANCELLED_LOGIN_ATTEMPT_REDIS_PREFIX}{aid}",
+                "1",
+                ex=LOGIN_ATTEMPT_TTL_SECONDS,
+            )
+            fid_raw = r.get(f"{LOGIN_ATTEMPT_FAMILY_REDIS_PREFIX}{aid}")
+            if fid_raw:
+                fid_str = fid_raw.decode("utf-8") if isinstance(fid_raw, bytes) else str(fid_raw)
+                try:
+                    discovered_families.append(uuid.UUID(fid_str))
+                except ValueError:
+                    pass
+    except redis.RedisError as exc:
+        raise RevocationStoreUnavailableError(
+            "Redis revocation store unavailable while cancelling pending login attempts."
+        ) from exc
+    return discovered_families
 
 
 def _set_no_store(response: Response) -> None:
@@ -268,6 +356,21 @@ async def verify_otp(
         )
 
     clean_mobile = normalize_iranian_mobile(payload.mobile)
+    attempt_id = _sanitize_attempt_id(payload.attempt_id)
+    if attempt_id:
+        try:
+            if _is_login_attempt_cancelled(r, attempt_id):
+                return _error_json(
+                    status.HTTP_409_CONFLICT,
+                    "Login attempt was superseded by logout.",
+                    req,
+                    clear_cookies=cookie_mode,
+                )
+        except RevocationStoreUnavailableError as exc:
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), req, clear_cookies=False
+            )
+
     try:
         auth_svc = AuthService(pool, r)
     except (SmsDeliveryError, SmsAdapterError) as exc:
@@ -291,10 +394,45 @@ async def verify_otp(
             detail="Authentication unavailable for this account.",
         ) from e
 
+    session = res["session"]
+    if attempt_id:
+        try:
+            _record_login_attempt_family(r, attempt_id, session["family_id"])
+            superseded = _is_login_attempt_cancelled(r, attempt_id)
+        except RevocationStoreUnavailableError as exc:
+            try:
+                await SessionService(pool, redis_client=r).revoke_session_family(
+                    uuid.UUID(str(session["family_id"])), reason="LOGOUT_SUPERSEDED"
+                )
+            except Exception:
+                pass
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                str(exc),
+                req,
+                clear_cookies=cookie_mode,
+            )
+        if superseded:
+            try:
+                await SessionService(pool, redis_client=r).revoke_session_family(
+                    uuid.UUID(str(session["family_id"])), reason="LOGOUT_SUPERSEDED"
+                )
+            except RevocationStoreUnavailableError as exc:
+                return _error_json(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    str(exc),
+                    req,
+                    clear_cookies=cookie_mode,
+                )
+            return _error_json(
+                status.HTTP_409_CONFLICT,
+                "Login attempt was superseded by logout.",
+                req,
+                clear_cookies=cookie_mode,
+            )
+
     if not cookie_mode:
         return res
-
-    session = res["session"]
     try:
         access_token, expires_in, access_expires_at = issue_access_token(
             user_id=res["user_id"],
@@ -360,6 +498,21 @@ async def login_password(
         )
 
     clean_mobile = normalize_iranian_mobile(payload.mobile)
+    attempt_id = _sanitize_attempt_id(payload.attempt_id)
+    if attempt_id:
+        try:
+            if _is_login_attempt_cancelled(r, attempt_id):
+                return _error_json(
+                    status.HTTP_409_CONFLICT,
+                    "Login attempt was superseded by logout.",
+                    req,
+                    clear_cookies=cookie_mode,
+                )
+        except RevocationStoreUnavailableError as exc:
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc), req, clear_cookies=False
+            )
+
     try:
         auth_svc = AuthService(pool, r)
     except (SmsDeliveryError, SmsAdapterError) as exc:
@@ -379,10 +532,45 @@ async def login_password(
             detail="Invalid credentials or authentication unavailable.",
         )
 
+    session = res["session"]
+    if attempt_id:
+        try:
+            _record_login_attempt_family(r, attempt_id, session["family_id"])
+            superseded = _is_login_attempt_cancelled(r, attempt_id)
+        except RevocationStoreUnavailableError as exc:
+            try:
+                await SessionService(pool, redis_client=r).revoke_session_family(
+                    uuid.UUID(str(session["family_id"])), reason="LOGOUT_SUPERSEDED"
+                )
+            except Exception:
+                pass
+            return _error_json(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                str(exc),
+                req,
+                clear_cookies=cookie_mode,
+            )
+        if superseded:
+            try:
+                await SessionService(pool, redis_client=r).revoke_session_family(
+                    uuid.UUID(str(session["family_id"])), reason="LOGOUT_SUPERSEDED"
+                )
+            except RevocationStoreUnavailableError as exc:
+                return _error_json(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    str(exc),
+                    req,
+                    clear_cookies=cookie_mode,
+                )
+            return _error_json(
+                status.HTTP_409_CONFLICT,
+                "Login attempt was superseded by logout.",
+                req,
+                clear_cookies=cookie_mode,
+            )
+
     if not cookie_mode:
         return res
-
-    session = res["session"]
     try:
         access_token, expires_in, access_expires_at = issue_access_token(
             user_id=res["user_id"],
@@ -753,13 +941,24 @@ async def logout(
         ):
             families_to_revoke.append(bearer_claims["family_id"])
 
+        cancelled_attempt_ids = _sanitize_attempt_id_list(
+            payload.cancelled_login_attempt_ids if payload else None
+        )
+        attempt_cancel_err: RevocationStoreUnavailableError | None = None
+        if cancelled_attempt_ids:
+            try:
+                families_to_revoke.extend(_mark_login_attempts_cancelled(r, cancelled_attempt_ids))
+            except RevocationStoreUnavailableError as exc:
+                attempt_cancel_err = exc
+
         revoked_count, revocation_err = await _revoke_families_fail_closed(
             session_svc, families_to_revoke
         )
-        if revocation_err is not None:
+        effective_revocation_err = revocation_err or attempt_cancel_err
+        if effective_revocation_err is not None:
             return _error_json(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                str(revocation_err),
+                str(effective_revocation_err),
                 req,
                 clear_cookies=True,
             )
@@ -769,6 +968,7 @@ async def logout(
             "success": True,
             "auth_mode": "cookie",
             "revoked_tokens": revoked_count,
+            "cancelled_attempt_count": len(cancelled_attempt_ids),
             "message": "نشست و تمامی توکن‌های خانواده نشست با موفقیت باطل شدند.",
         }
 
@@ -801,8 +1001,75 @@ async def logout(
             if tok_row and tok_row["user_id"] == current_user["id"]:
                 legacy_families.append(tok_row["family_id"])
 
+    cancelled_attempt_ids = _sanitize_attempt_id_list(
+        payload.cancelled_login_attempt_ids if payload else None
+    )
+    attempt_cancel_err: RevocationStoreUnavailableError | None = None
+    if cancelled_attempt_ids:
+        try:
+            legacy_families.extend(_mark_login_attempts_cancelled(r, cancelled_attempt_ids))
+        except RevocationStoreUnavailableError as exc:
+            attempt_cancel_err = exc
+
     revoked_count, revocation_err = await _revoke_families_fail_closed(
         session_svc, legacy_families
+    )
+    effective_revocation_err = revocation_err or attempt_cancel_err
+    if effective_revocation_err is not None:
+        return _error_json(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            str(effective_revocation_err),
+            req,
+            clear_cookies=False,
+        )
+
+    return {
+        "success": True,
+        "revoked_tokens": revoked_count,
+        "cancelled_attempt_count": len(cancelled_attempt_ids),
+        "message": "نشست و تمامی توکن‌های خانواده نشست با موفقیت باطل شدند.",
+    }
+
+
+@router.post("/login-attempts/cancel")
+async def cancel_login_attempts(
+    payload: CancelLoginAttemptsSchema,
+    req: Request,
+    response: Response,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    r: redis.Redis = Depends(get_redis),
+):
+    """
+    Fail-closed cancellation barrier for in-flight OTP/password login attempts superseded by
+    concurrent logout (HC-T49). Marks random attempt_ids as cancelled in Redis and revokes any
+    session family already recorded for those attempt_ids in PostgreSQL + Redis.
+    """
+    _set_no_store(response)
+    try:
+        validate_cookie_request_origin(req)
+    except (CorsOriginRejectedError, CorsConfigurationError, EnvironmentConfigurationError) as exc:
+        return _error_json(status.HTTP_403_FORBIDDEN, str(exc), req, clear_cookies=False)
+
+    attempt_ids = _sanitize_attempt_id_list(payload.attempt_ids)
+    if not attempt_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one valid attempt_id is required.",
+        )
+
+    session_svc = SessionService(pool, redis_client=r)
+    try:
+        discovered_families = _mark_login_attempts_cancelled(r, attempt_ids)
+    except RevocationStoreUnavailableError as exc:
+        return _error_json(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            str(exc),
+            req,
+            clear_cookies=False,
+        )
+
+    revoked_count, revocation_err = await _revoke_families_fail_closed(
+        session_svc, discovered_families
     )
     if revocation_err is not None:
         return _error_json(
@@ -814,8 +1081,8 @@ async def logout(
 
     return {
         "success": True,
+        "cancelled_attempt_count": len(attempt_ids),
         "revoked_tokens": revoked_count,
-        "message": "نشست و تمامی توکن‌های خانواده نشست با موفقیت باطل شدند.",
     }
 
 
