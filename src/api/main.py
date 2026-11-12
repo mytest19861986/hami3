@@ -30,7 +30,7 @@ from src.api.visits import router as visits_router
 from src.api.wallets import router as wallets_router
 from src.auth.access_tokens import AccessTokenConfigurationError, RevocationStoreUnavailableError
 from src.core.cors import StrictCORSMiddleware, resolve_cors_settings
-from src.core.env import EnvironmentConfigurationError
+from src.core.env import EnvironmentConfigurationError, is_restricted_environment
 from src.core.settings import load_and_validate_settings
 from src.wallets.service import PayoutAdapterConfigurationError
 
@@ -114,15 +114,33 @@ def create_app() -> FastAPI:
     application.include_router(reviews_router, prefix=API_V1_PREFIX)
     application.include_router(notifications_router, prefix=API_V1_PREFIX)
 
+    # Block legacy /static/index.html in restricted environments before mounting /static
+    @application.get("/static/index.html", include_in_schema=False)
+    def blocked_legacy_static_index():
+        if is_restricted_environment():
+            return Response(status_code=404, content="Not found.")
+        index_file = os.path.join(STATIC_DIR, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(
+                index_file,
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache"},
+            )
+        return Response(status_code=404, content="Not found.")
+
     # Mount static files and web portal
     if os.path.exists(STATIC_DIR):
         application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @application.get("/", include_in_schema=False)
     def root():
+        if is_restricted_environment():
+            return phase3_index()
         index_file = os.path.join(STATIC_DIR, "index.html")
         if os.path.exists(index_file):
-            return FileResponse(index_file)
+            return FileResponse(
+                index_file,
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache"},
+            )
         return {
             "message": "به سامانه خدمات رفاهی و درمانی حامی‌کارت خوش آمدید.",
             "docs": "/docs",
@@ -207,6 +225,7 @@ def create_app() -> FastAPI:
         return Response(status_code=404, content="Phase 3 UI shell not found.")
 
     @application.get("/phase3/styles/{filename}", include_in_schema=False)
+    @application.get("/styles/{filename}", include_in_schema=False)
     def phase3_css_asset(filename: str):
         if not filename.endswith(".css"):
             return Response(status_code=404, content="Not found.")
@@ -216,6 +235,7 @@ def create_app() -> FastAPI:
         return FileResponse(str(asset), media_type="text/css", headers=_asset_security_headers)
 
     @application.get("/phase3/js/{filename}", include_in_schema=False)
+    @application.get("/js/{filename}", include_in_schema=False)
     def phase3_js_asset(filename: str):
         if not filename.endswith(".js"):
             return Response(status_code=404, content="Not found.")

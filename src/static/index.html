@@ -403,19 +403,32 @@
   <!-- ========================================================================= -->
   <script>
     const API_BASE = '/api/v1';
-    let currentAuthToken = localStorage.getItem('hamicard_session_token');
+    let currentAuthToken = null; // In-memory RAM only (zero persistent web storage)
     let currentUserData = null;
     let deferredPrompt = null;
     let otpTimerInterval = null;
     let _refreshInFlightPromise = null;
 
+    function getCookieValue(name) {
+      const prefix = `${name}=`;
+      const parts = document.cookie ? document.cookie.split(';') : [];
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i].trim();
+        if (part.indexOf(prefix) === 0) {
+          return decodeURIComponent(part.slice(prefix.length));
+        }
+      }
+      return null;
+    }
+
     /**
-     * Single-flight refresh token coordinator (T13-AC4 / F-01):
-     * Ensures parallel callers experiencing a 401 coalesce onto ONE refresh request,
-     * eliminating avoidable concurrent refresh collisions / replay triggers.
+     * Single-flight HttpOnly cookie refresh coordinator (T13-AC4 + T38/T43):
+     * Coalesces concurrent 401 refreshes into ONE credentialed POST /auth/refresh
+     * with X-Auth-Mode=cookie and X-CSRF-Token, keeping access tokens strictly in RAM.
      */
     async function refreshSessionSingleFlight() {
-      if (!currentAuthToken) return null;
+      const csrf = getCookieValue('hc_csrf');
+      if (!csrf) return null;
       if (_refreshInFlightPromise) {
         return _refreshInFlightPromise;
       }
@@ -424,14 +437,17 @@
         try {
           const res = await fetch(`${API_BASE}/auth/refresh`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh_token: currentAuthToken })
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: {
+              'X-Auth-Mode': 'cookie',
+              'X-CSRF-Token': csrf
+            }
           });
           if (res.ok) {
             const data = await res.json();
-            if (data && data.refresh_token) {
-              currentAuthToken = data.refresh_token;
-              localStorage.setItem('hamicard_session_token', currentAuthToken);
+            if (data && data.access_token) {
+              currentAuthToken = data.access_token;
               return currentAuthToken;
             }
           }
@@ -449,6 +465,9 @@
     }
 
     async function authenticatedFetch(url, options = {}) {
+      if (!currentAuthToken && getCookieValue('hc_has_session') === '1') {
+        await refreshSessionSingleFlight();
+      }
       if (!currentAuthToken) {
         throw new Error('No active session token');
       }
@@ -457,11 +476,11 @@
         'Authorization': `Bearer ${tok}`
       });
 
-      let res = await fetch(url, { ...options, headers: makeHeaders(currentAuthToken) });
+      let res = await fetch(url, { ...options, credentials: 'same-origin', cache: 'no-store', headers: makeHeaders(currentAuthToken) });
       if (res.status === 401) {
         const nextToken = await refreshSessionSingleFlight();
         if (nextToken) {
-          res = await fetch(url, { ...options, headers: makeHeaders(nextToken) });
+          res = await fetch(url, { ...options, credentials: 'same-origin', cache: 'no-store', headers: makeHeaders(nextToken) });
         }
       }
       return res;
@@ -713,13 +732,17 @@
       try {
         const res = await fetch(`${API_BASE}/auth/otp/verify`, {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Auth-Mode': 'cookie'
+          },
           body: JSON.stringify({mobile, code})
         });
         const data = await res.json();
-        if (res.ok && data.session) {
-          currentAuthToken = data.session.refresh_token;
-          localStorage.setItem('hamicard_session_token', currentAuthToken);
+        if (res.ok && data.access_token) {
+          currentAuthToken = data.access_token;
           closeAuthModal();
           await checkAuthSession();
         } else {
@@ -753,6 +776,9 @@
     }
 
     async function checkAuthSession() {
+      if (!currentAuthToken && getCookieValue('hc_has_session') === '1') {
+        await refreshSessionSingleFlight();
+      }
       if (!currentAuthToken) return;
       try {
         const res = await authenticatedFetch(`${API_BASE}/profile/me`);
@@ -787,22 +813,27 @@
 
     async function logout() {
       const tokenToRevoke = currentAuthToken;
+      const csrf = getCookieValue('hc_csrf') || '';
       currentAuthToken = null;
       _refreshInFlightPromise = null;
-      localStorage.removeItem('hamicard_session_token');
       document.getElementById('login-btn').classList.remove('hidden');
       document.getElementById('user-info-bar').classList.add('hidden');
       document.getElementById('user-info-bar').classList.remove('flex');
       closeDashboardModal();
-      if (tokenToRevoke) {
+      if (tokenToRevoke || csrf) {
         try {
+          const headers = {
+            'X-Auth-Mode': 'cookie',
+            'X-CSRF-Token': csrf
+          };
+          if (tokenToRevoke) {
+            headers['Authorization'] = `Bearer ${tokenToRevoke}`;
+          }
           await fetch(`${API_BASE}/auth/logout`, {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${tokenToRevoke}`
-            },
-            body: JSON.stringify({ refresh_token: tokenToRevoke })
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers
           });
         } catch (e) {
           console.warn('Server logout revocation request skipped:', e);

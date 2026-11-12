@@ -43,7 +43,10 @@ async def _launch_browser(p):
     for cand in BROWSER_CANDIDATES:
         if cand.exists():
             return await p.chromium.launch(headless=True, executable_path=str(cand))
-    return await p.chromium.launch(headless=True)
+    return await p.chromium.launch(
+        headless=True,
+        args=["--disable-dev-shm-usage", "--no-sandbox"],
+    )
 
 
 def _free_port() -> int:
@@ -54,6 +57,8 @@ def _free_port() -> int:
 
 @pytest_asyncio.fixture
 async def t41_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
     monkeypatch.setenv("ENVIRONMENT", "test")
     monkeypatch.setenv(
         "ACCESS_TOKEN_SECRET",
@@ -226,6 +231,8 @@ async def test_t41_http_doctor_and_agent_approval_gating_and_admin_review_separa
 async def test_t41_playwright_ui_reflects_pending_approved_and_admin_review_states(monkeypatch):
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
     monkeypatch.setenv("ENVIRONMENT", "test")
     monkeypatch.setenv("ACCESS_TOKEN_SECRET", "t41-ui-signing-secret-material-64-chars-minimum-entropy-value-0002")
     monkeypatch.setenv("ACCESS_TOKEN_TTL_SECONDS", "300")
