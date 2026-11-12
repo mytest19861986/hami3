@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS system_settings (
     data_type VARCHAR(20) NOT NULL DEFAULT 'json'
         CHECK (data_type IN ('string', 'integer', 'boolean', 'json', 'decimal')),
     is_mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+    approval_status VARCHAR(20) NOT NULL DEFAULT 'PROPOSED'
+        CHECK (approval_status IN ('PROPOSED', 'APPROVED', 'BLOCKED')),
+    approved_by UUID NULL,
+    approved_at TIMESTAMPTZ NULL,
     description TEXT NOT NULL,
     is_secret BOOLEAN NOT NULL DEFAULT FALSE,
     updated_by UUID NULL,
@@ -582,7 +586,7 @@ CREATE TABLE IF NOT EXISTS settlements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
-    amount_toman BIGINT NOT NULL CHECK (amount_toman >= 100000),
+    amount_toman BIGINT NOT NULL CONSTRAINT chk_settlements_amount_positive CHECK (amount_toman > 0),
     bank_card_number VARCHAR(16) NOT NULL,
     bank_sheba_number VARCHAR(26) NOT NULL,
     bank_account_holder_name VARCHAR(150) NOT NULL,
@@ -758,29 +762,30 @@ ON CONFLICT (province_id, name) DO NOTHING;
 -- 3. SYSTEM SETTINGS: PARAMETRIC POLICY FOR OPEN-01 TO OPEN-18
 -- ============================================================================
 
-INSERT INTO system_settings (key, value_json, data_type, is_mandatory, description, is_secret) VALUES
-('OPEN_01_REFERRER_VS_AGENT_BOUNDARY', '{"allow_referrer_sales_cases": false, "referrer_requires_agent_approval": true}', 'json', true, 'مرز همکار معرفی و نماینده فروش: معرف فقط لینک/کد معرفی دارد و حق ثبت پرونده فروش حضوری ندارد مگر نقش نماینده او تأیید شود.', false),
-('OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE', '{"precedence": "CUSTOM_FIRST", "description": "در صورت وجود تخفیف اختصاصی پزشک، آن اعمال میشود؛ در غیر این صورت درصد طرح"}', 'json', true, 'تقدم درصد تخفیف پزشک بر طرح: CUSTOM_FIRST یا PLAN_FIRST', false),
-('OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER', '{"trigger": "PAYMENT_RECORDED_AND_CASE_APPROVED", "auto_activate_membership": true}', 'json', true, 'زمان قطعی شدن فروش نمایندگی و فعالسازی عضویت و پورسانت', false),
-('OPEN_04_FINANCIAL_PERMISSIONS_MATRIX', '{"record_sale_payment": ["ADMIN", "SUPER_ADMIN"], "mark_settlement_paid": ["SUPER_ADMIN"], "edit_financial_settings": ["SUPER_ADMIN"]}', 'json', true, 'مجوز ثبت پرداخت فروش دستی و پرداخت تسویه خارج سامانه', false),
-('OPEN_05_COMBINED_COMMISSION_POLICY', '{"allow_combined": false, "max_total_percent": 30.0}', 'json', true, 'جمع پورسانت فروش و معرفی و سقف مجاز', false),
-('OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN', '{"min_amount_toman": 100000, "lock_on_request": true}', 'json', true, 'حداقل مبلغ تسویه و قاعده مسدودی موجودی در کیف پول', false),
-('OPEN_07_VISIT_CANCELLATION_REFUND_POLICY', '{"restore_quota": true, "refund_requires_reason": true}', 'json', true, 'بازگشت اعتبار سهمیه و اصلاح پورسانت در لغو یا مرجوعی', false),
-('OPEN_08_MULTI_ACTIVE_PLANS_PER_HOLDER', '{"allow_multiple_active_plans": false, "extension_adds_to_end_date": true}', 'json', true, 'سیاست چند طرح فعال همزمان برای یک دارنده (کد ملی)', false),
-('OPEN_09_NATIONAL_CODE_PHONE_CONFLICT', '{"national_code_unique": true, "phone_change_requires_admin": true}', 'json', true, 'سیاست تناقض یا تغییر کد ملی و شماره موبایل', false),
-('OPEN_10_RBAC_ADMIN_SUPPORT_MATRIX', '{"support_can_view_sheba": false, "support_can_approve_financials": false}', 'json', true, 'ماتریس دقیق اختیارات SUPPORT و ADMIN و SUPER_ADMIN', false),
-('OPEN_11_EXTERNAL_ADAPTERS_CONFIG', '{"sms_provider": "mock", "payment_gateway": "mock", "is_production_ready": false}', 'json', true, 'پیکربندی سرویس پیامک و درگاه پرداخت (Sandbox / Manual)', false),
-('OPEN_12_DATA_RETENTION_AND_SOFT_DELETE', '{"soft_delete_only": true, "retain_financial_records_days": -1}', 'json', true, 'سیاست نگهداری اسناد و حذف کاربر (حذف منطقی بدون پاکسازی فیزیکی مالی)', false),
-('OPEN_13_BACKUP_RETENTION_POLICY', '{"daily_backups_kept": 7, "weekly_backups_kept": 4, "monthly_backups_kept": 6, "encrypt_with_age": true}', 'json', true, 'دوره نگهداری بکاپهای رمزنگاریشده روی سرور و Google Drive', false),
-('OPEN_14_SLA_AND_RATE_LIMITS', '{"max_concurrent_users": 500, "api_p95_ms": 200, "otp_rate_limit_per_hour": 5}', 'json', true, 'معیارهای عددی بار، سرعت و محدودیت ارسال کد تایید', false),
-('OPEN_15_THEME_AND_FONTS', '{"font_family": "Vazirmatn", "primary_color_hex": "#0d9488", "secondary_color_hex": "#059669"}', 'json', true, 'تنظیمات رنگ سازمانی (سبز زمردی/فیروزهای) و فونت فارسی وزیرمتن', false),
-('OPEN_16_VISIT_MEDICAL_RECORD_LIMIT', '{"store_diagnosis": false, "store_full_emr": false, "allow_private_notes": true}', 'json', true, 'حد ثبت اطلاعات پزشکی در ویزیت جهت حفظ حریم خصوصی بیمار', false),
-('OPEN_17_ADMIN_GRANT_PLAN_POLICY', '{"roles_allowed": ["ADMIN", "SUPER_ADMIN"], "mandatory_reason": true}', 'json', true, 'قاعده اعطای طرح بدون پرداخت توسط مدیر', false),
-('OPEN_18_CURRENCY_AND_ROUNDING', '{"currency_stored": "TOMAN", "currency_display": "TOMAN", "rounding_mode": "FLOOR"}', 'json', true, 'واحد مبالغ (تومان صحیح BIGINT) و گرد کردن پورسانت به سمت پایین (Floor)', false)
+INSERT INTO system_settings (key, value_json, data_type, is_mandatory, approval_status, description, is_secret) VALUES
+('OPEN_01_REFERRER_VS_AGENT_BOUNDARY', '{"allow_referrer_sales_cases": false, "referrer_requires_agent_approval": true}', 'json', true, 'PROPOSED', 'مرز همکار معرفی و نماینده فروش: معرف فقط لینک/کد معرفی دارد و حق ثبت پرونده فروش حضوری ندارد مگر نقش نماینده او تأیید شود.', false),
+('OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE', '{"precedence": "CUSTOM_FIRST", "description": "در صورت وجود تخفیف اختصاصی پزشک، آن اعمال میشود؛ در غیر این صورت درصد طرح"}', 'json', true, 'PROPOSED', 'تقدم درصد تخفیف پزشک بر طرح: CUSTOM_FIRST یا PLAN_FIRST', false),
+('OPEN_03_AGENT_SALE_FINALIZATION_TRIGGER', '{"trigger": "PAYMENT_RECORDED_AND_CASE_APPROVED", "auto_activate_membership": true}', 'json', true, 'PROPOSED', 'زمان قطعی شدن فروش نمایندگی و فعالسازی عضویت و پورسانت', false),
+('OPEN_04_FINANCIAL_PERMISSIONS_MATRIX', '{"record_sale_payment": ["ADMIN", "SUPER_ADMIN"], "mark_settlement_paid": ["SUPER_ADMIN"], "edit_financial_settings": ["SUPER_ADMIN"]}', 'json', true, 'PROPOSED', 'مجوز ثبت پرداخت فروش دستی و پرداخت تسویه خارج سامانه', false),
+('OPEN_05_COMBINED_COMMISSION_POLICY', '{"allow_combined": false, "max_total_percent": 30.0}', 'json', true, 'PROPOSED', 'جمع پورسانت فروش و معرفی و سقف مجاز', false),
+('OPEN_06_MIN_SETTLEMENT_AMOUNT_TOMAN', '{"min_amount_toman": 100000, "lock_on_request": true}', 'json', true, 'PROPOSED', 'حداقل مبلغ تسویه و قاعده مسدودی موجودی در کیف پول', false),
+('OPEN_07_VISIT_CANCELLATION_REFUND_POLICY', '{"restore_quota": true, "refund_requires_reason": true}', 'json', true, 'PROPOSED', 'بازگشت اعتبار سهمیه و اصلاح پورسانت در لغو یا مرجوعی', false),
+('OPEN_08_MULTI_ACTIVE_PLANS_PER_HOLDER', '{"allow_multiple_active_plans": false, "extension_adds_to_end_date": true}', 'json', true, 'PROPOSED', 'سیاست چند طرح فعال همزمان برای یک دارنده (کد ملی)', false),
+('OPEN_09_NATIONAL_CODE_PHONE_CONFLICT', '{"national_code_unique": true, "phone_change_requires_admin": true}', 'json', true, 'PROPOSED', 'سیاست تناقض یا تغییر کد ملی و شماره موبایل', false),
+('OPEN_10_RBAC_ADMIN_SUPPORT_MATRIX', '{"support_can_view_sheba": false, "support_can_approve_financials": false}', 'json', true, 'PROPOSED', 'ماتریس دقیق اختیارات SUPPORT و ADMIN و SUPER_ADMIN', false),
+('OPEN_11_EXTERNAL_ADAPTERS_CONFIG', '{"sms_provider": "mock", "payment_gateway": "mock", "is_production_ready": false}', 'json', true, 'PROPOSED', 'پیکربندی سرویس پیامک و درگاه پرداخت (Sandbox / Manual)', false),
+('OPEN_12_DATA_RETENTION_AND_SOFT_DELETE', '{"soft_delete_only": true, "retain_financial_records_days": -1}', 'json', true, 'PROPOSED', 'سیاست نگهداری اسناد و حذف کاربر (حذف منطقی بدون پاکسازی فیزیکی مالی)', false),
+('OPEN_13_BACKUP_RETENTION_POLICY', '{"daily_backups_kept": 7, "weekly_backups_kept": 4, "monthly_backups_kept": 6, "encrypt_with_age": true}', 'json', true, 'PROPOSED', 'دوره نگهداری بکاپهای رمزنگاریشده روی سرور و Google Drive', false),
+('OPEN_14_SLA_AND_RATE_LIMITS', '{"max_concurrent_users": 500, "api_p95_ms": 200, "otp_rate_limit_per_hour": 5}', 'json', true, 'PROPOSED', 'معیارهای عددی بار، سرعت و محدودیت ارسال کد تایید', false),
+('OPEN_15_THEME_AND_FONTS', '{"font_family": "Vazirmatn", "primary_color_hex": "#0d9488", "secondary_color_hex": "#059669"}', 'json', true, 'PROPOSED', 'تنظیمات رنگ سازمانی (سبز زمردی/فیروزهای) و فونت فارسی وزیرمتن', false),
+('OPEN_16_VISIT_MEDICAL_RECORD_LIMIT', '{"store_diagnosis": false, "store_full_emr": false, "allow_private_notes": true}', 'json', true, 'PROPOSED', 'حد ثبت اطلاعات پزشکی در ویزیت جهت حفظ حریم خصوصی بیمار', false),
+('OPEN_17_ADMIN_GRANT_PLAN_POLICY', '{"roles_allowed": ["ADMIN", "SUPER_ADMIN"], "mandatory_reason": true}', 'json', true, 'PROPOSED', 'قاعده اعطای طرح بدون پرداخت توسط مدیر', false),
+('OPEN_18_CURRENCY_AND_ROUNDING', '{"currency_stored": "TOMAN", "currency_display": "TOMAN", "rounding_mode": "FLOOR"}', 'json', true, 'PROPOSED', 'واحد مبالغ (تومان صحیح BIGINT) و گرد کردن پورسانت به سمت پایین (Floor)', false)
 ON CONFLICT (key) DO UPDATE SET 
     value_json = EXCLUDED.value_json,
     data_type = EXCLUDED.data_type,
     is_mandatory = EXCLUDED.is_mandatory,
+    approval_status = EXCLUDED.approval_status,
     description = EXCLUDED.description,
     updated_at = NOW();
 

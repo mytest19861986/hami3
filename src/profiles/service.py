@@ -90,7 +90,11 @@ class ProfileService:
                        p.bank_card_number, p.bank_sheba_number, p.bank_account_holder_name,
                        p.created_at, p.updated_at,
                        pr.name as province_name, ci.name as city_name,
-                       u.mobile, u.roles
+                       u.mobile,
+                       COALESCE(
+                           ARRAY(SELECT ur.role_id FROM user_roles ur WHERE ur.user_id = u.id ORDER BY ur.role_id),
+                           ARRAY[]::varchar[]
+                       ) AS roles
                 FROM profiles p
                 JOIN users u ON u.id = p.user_id
                 LEFT JOIN provinces pr ON pr.id = p.province_id

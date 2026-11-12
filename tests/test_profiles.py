@@ -1,12 +1,20 @@
 """Integration and unit tests for ProfileService & ReferenceService (Phase 3)."""
 import asyncio
+import os
+import sys
 import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncpg
 
 from src.profiles.service import ProfileService, ProfileValidationError, ReferenceService
 
-DB_URL = "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev"
+DB_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://hamicard:hamicard_dev_secret_pass@localhost:5432/hamicard_dev",
+)
 
 
 async def setup_test_pool():
