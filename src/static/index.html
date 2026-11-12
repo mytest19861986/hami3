@@ -578,6 +578,15 @@
       }
     }
 
+    function escapeHtml(text) {
+      return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     // API: Load Plans
     async function loadPlans() {
       const container = document.getElementById('plans-container');
@@ -590,23 +599,24 @@
             const isPopular = idx === 1;
             const card = document.createElement('div');
             card.className = `relative bg-white rounded-3xl p-8 border ${isPopular ? 'border-brand-500 shadow-xl shadow-brand-500/10' : 'border-slate-200 shadow-sm'} flex flex-col justify-between`;
+            const safePlanId = escapeHtml(plan.id);
             card.innerHTML = `
               ${isPopular ? '<div class="absolute -top-3.5 right-8 bg-brand-600 text-white text-[10px] font-bold px-3 py-1 rounded-full uppercase tracking-wider">پیشنهاد ویژه</div>' : ''}
               <div>
-                <h3 class="text-xl font-bold text-slate-900 mb-2">${plan.title}</h3>
-                <p class="text-xs text-slate-500 mb-6 leading-relaxed">${plan.description || ''}</p>
+                <h3 class="text-xl font-bold text-slate-900 mb-2">${escapeHtml(plan.title)}</h3>
+                <p class="text-xs text-slate-500 mb-6 leading-relaxed">${escapeHtml(plan.description || '')}</p>
                 <div class="text-3xl font-extrabold text-slate-900 mb-1">
-                  ${parseInt(plan.price_toman).toLocaleString('fa-IR')} <span class="text-sm font-normal text-slate-500">تومان</span>
+                  ${parseInt(plan.price_toman, 10).toLocaleString('fa-IR')} <span class="text-sm font-normal text-slate-500">تومان</span>
                 </div>
-                <div class="text-xs text-brand-600 font-semibold mb-6">تخفیف تا ${plan.discount_percent}% در کلیه مراکز</div>
+                <div class="text-xs text-brand-600 font-semibold mb-6">تخفیف تا ${escapeHtml(plan.discount_percent)}% در کلیه مراکز</div>
                 <ul class="space-y-3 text-xs text-slate-600 border-t border-slate-100 pt-6 mb-8">
                   <li class="flex items-center gap-2">
                     <svg class="w-4 h-4 text-emerald-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"></path></svg>
-                    <span>مدت اعتبار: ${plan.validity_days} روز (۱ سال کامل)</span>
+                    <span>مدت اعتبار: ${escapeHtml(plan.validity_days)} روز (۱ سال کامل)</span>
                   </li>
                   <li class="flex items-center gap-2">
                     <svg class="w-4 h-4 text-emerald-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"></path></svg>
-                    <span>سقف ویزیت: ${plan.max_visits ? plan.max_visits + ' نوبت' : 'بدون سقف (نامحدود)'}</span>
+                    <span>سقف ویزیت: ${plan.max_visits ? escapeHtml(plan.max_visits) + ' نوبت' : 'بدون سقف (نامحدود)'}</span>
                   </li>
                   <li class="flex items-center gap-2">
                     <svg class="w-4 h-4 text-emerald-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"></path></svg>
@@ -614,10 +624,14 @@
                   </li>
                 </ul>
               </div>
-              <button onclick="handleBuyPlan('${plan.id}')" class="w-full py-3 ${isPopular ? 'bg-brand-600 hover:bg-brand-700 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-800'} font-bold text-xs rounded-xl transition-all shadow-sm">
+              <button data-plan-id="${safePlanId}" class="hc-legacy-buy-plan-btn w-full py-3 ${isPopular ? 'bg-brand-600 hover:bg-brand-700 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-800'} font-bold text-xs rounded-xl transition-all shadow-sm">
                 خرید اشتراک
               </button>
             `;
+            const buyBtn = card.querySelector('.hc-legacy-buy-plan-btn');
+            if (buyBtn) {
+              buyBtn.addEventListener('click', () => handleBuyPlan(plan.id));
+            }
             container.appendChild(card);
           });
         }
@@ -652,8 +666,8 @@
             card.innerHTML = `
               <div class="flex items-start justify-between mb-4">
                 <div>
-                  <h4 class="font-bold text-slate-900 text-base mb-1">${doc.clinic_name}</h4>
-                  <div class="text-xs text-brand-600 font-semibold">${doc.specialty || 'پزشک عمومی / دندانپزشک'}</div>
+                  <h4 class="font-bold text-slate-900 text-base mb-1">${escapeHtml(doc.clinic_name)}</h4>
+                  <div class="text-xs text-brand-600 font-semibold">${escapeHtml(doc.specialty || 'پزشک عمومی / دندانپزشک')}</div>
                 </div>
                 <div class="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center text-brand-600 font-bold">
                   د
@@ -661,10 +675,10 @@
               </div>
               <div class="text-xs text-slate-500 mb-4 flex items-center gap-1.5">
                 <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path></svg>
-                <span>${doc.province_name || ''} - ${doc.city_name || ''}</span>
+                <span>${escapeHtml(doc.province_name || '')} - ${escapeHtml(doc.city_name || '')}</span>
               </div>
               <div class="border-t border-slate-100 pt-3 flex justify-between items-center text-xs">
-                <span class="text-slate-400">کد نظام: ${doc.medical_council_code}</span>
+                <span class="text-slate-400">کد نظام: ${escapeHtml(doc.medical_council_code)}</span>
                 <span class="text-emerald-600 font-bold bg-emerald-50 px-2 py-0.5 rounded">طرف قرارداد رسمی</span>
               </div>
             `;

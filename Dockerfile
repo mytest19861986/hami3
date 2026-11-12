@@ -40,9 +40,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy installed packages from builder
 COPY --from=builder /root/.local /home/appuser/.local
 
-# Copy application source code
+# Copy application source code and strip dev/experimental PoC artifacts from release image
 COPY --chown=appuser:appuser src ./src
 COPY --chown=appuser:appuser db ./db
+RUN rm -f src/static/auth_poc* src/static/index.html
 
 USER appuser
 
@@ -51,5 +52,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/api/v1/health || exit 1
 
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["python", "-m", "src.api.release_entrypoint"]
 

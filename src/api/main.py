@@ -102,17 +102,17 @@ def _is_restricted_experimental_path(request: Request) -> bool:
     for candidate in candidates:
         norm = _normalize_candidate_path(candidate)
         if (
-            norm == "/auth-poc"
-            or norm.startswith("/auth-poc/")
-            or norm == "/auth_poc"
-            or norm.startswith("/auth_poc/")
+            norm.startswith("/auth-poc")
+            or norm.startswith("/auth_poc")
             or norm == "/static/index.html"
             or norm.startswith("/static/index.html/")
             or norm.startswith("/static/auth_poc")
             or norm.startswith("/static/auth-poc")
         ):
             return True
-        if norm.startswith("/static/") and posixpath.basename(norm).startswith(("auth_poc", "auth-poc")):
+        if (
+            norm.startswith("/static/") or norm.startswith("/phase3/")
+        ) and posixpath.basename(norm).startswith(("auth_poc", "auth-poc")):
             return True
     return False
 

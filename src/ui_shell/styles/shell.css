@@ -601,6 +601,7 @@ html, body {
 .hc-text-sec { color: var(--hc-text-secondary); }
 .hc-text-sec-sm { font-size: 0.875rem; color: var(--hc-text-secondary); }
 .hc-text-sec-xs { font-size: 0.82rem; color: var(--hc-text-secondary); }
+.hc-text-err-sm { font-size: 0.875rem; color: var(--hc-status-err-fg); font-weight: 600; }
 .hc-text-muted-xs { margin: 0; font-size: 0.78rem; color: var(--hc-text-muted); }
 .hc-text-muted-sm { margin: 0 0 0.35rem; font-size: 0.82rem; color: var(--hc-text-muted); }
 .hc-metric-label { font-size: 0.8rem; color: var(--hc-text-secondary); font-weight: 600; }

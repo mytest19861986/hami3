@@ -514,6 +514,8 @@ export async function logoutCookie() {
     headers.Authorization = `${AUTH_HEADER_SCHEME} ${accessToken}`;
   }
   let status = 0;
+  let detail = '';
+  let revokedOnServer = false;
   try {
     const resp = await fetch('/api/v1/auth/logout', {
       method: 'POST',
@@ -522,14 +524,46 @@ export async function logoutCookie() {
       headers,
     });
     status = resp.status;
+    revokedOnServer = Boolean(resp.ok);
+    if (!revokedOnServer) {
+      try {
+        const errData = await resp.json();
+        detail = errData.detail || '';
+      } catch {
+        detail = '';
+      }
+    }
   } catch {
     status = 0;
+    revokedOnServer = false;
   }
-  clearPrivateState(`خروج امن از نشست انجام شد (HTTP ${status || 'LOCAL'}).`, {
-    broadcastLogout: true,
-    statusLabel: 'UNAUTHENTICATED',
+
+  if (revokedOnServer) {
+    clearPrivateState(`خروج امن از نشست با تأیید سرور انجام شد (HTTP ${status}).`, {
+      broadcastLogout: true,
+      statusLabel: 'UNAUTHENTICATED',
+      errorText: '',
+    });
+    return { ok: true, revokedOnServer: true, status, detail: '' };
+  }
+
+  const errCodeText = status ? `HTTP ${status}` : 'خطای شبکه';
+  const reasonMessage = `هشدار: خروج محلی انجام شد اما لغو نشست روی سرور تأیید نشد (${errCodeText}).`;
+  const errorText = `لغو نشست روی سرور تأیید نشد (${errCodeText}${detail ? ` - ${detail}` : ''}). نشست سروری ممکن است هنوز فعال باشد؛ لطفاً دوباره خروج سروری را بزنید.`;
+  clearPrivateState(reasonMessage, {
+    broadcastLogout: false,
+    statusLabel: 'REMOTE_REVOKE_FAILED',
+    errorText,
   });
-  return status;
+  if (authChannel) {
+    authChannel.postMessage({
+      type: 'LOGOUT_FAILED_LOCAL_SCRUB',
+      status,
+      reason: reasonMessage,
+      errorText,
+    });
+  }
+  return { ok: false, revokedOnServer: false, status, detail };
 }
 
 export function initAuthLifecycle(onStateChange) {
@@ -568,6 +602,15 @@ export function initAuthLifecycle(onStateChange) {
           broadcastLogout: false,
           statusLabel: 'UNAUTHENTICATED',
         });
+      } else if (msg.type === 'LOGOUT_FAILED_LOCAL_SCRUB') {
+        clearPrivateState(
+          msg.reason || 'هشدار: خروج هم‌زمان در تب دیگر روی سرور تأیید نشد؛ حافظه محلی پاک‌سازی شد.',
+          {
+            broadcastLogout: false,
+            statusLabel: 'REMOTE_REVOKE_FAILED',
+            errorText: msg.errorText || '',
+          }
+        );
       }
     };
   }
