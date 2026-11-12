@@ -31,11 +31,11 @@ BROWSER_CANDIDATES = [
 ]
 
 
-def _get_browser_exe() -> str:
+def _get_browser_exe() -> str | None:
     for p in BROWSER_CANDIDATES:
         if p.exists():
             return str(p)
-    pytest.skip("No Chromium/Edge executable available for headless Playwright verification")
+    return None
 
 
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -90,7 +90,10 @@ def test_t16_ac1_ac2_ac3_rtl_responsive_states_and_screenshots(ui_server_url: st
     external_or_api_calls: list[str] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, executable_path=browser_exe)
+        launch_kwargs = {"headless": True}
+        if browser_exe:
+            launch_kwargs["executable_path"] = browser_exe
+        browser = p.chromium.launch(**launch_kwargs)
         try:
             for vp_name, width, height in viewports:
                 context = browser.new_context(viewport={"width": width, "height": height})
