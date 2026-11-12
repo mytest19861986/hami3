@@ -43,6 +43,7 @@ const APP_STATE = {
   panelDecisionKey: null,
   panelDecision: null, // { status: 'LOADING' | 'ALLOW' | 'FORBIDDEN' | 'EXPIRED' | 'ERROR', httpStatus, data, detail, unreadCount }
   panelAuthCheckSeq: 0,
+  loginSubmitting: false,
 };
 
 const VALID_STATES = ['NORMAL', 'LOADING', 'EMPTY', 'ERROR', 'DISABLED_GATE'];
@@ -426,10 +427,7 @@ function renderContentPage(slug) {
   `;
 }
 
-function renderAuthShellView() {
-  const overrideState = renderStateBannerIfNeeded('احراز هویت و نشست امن کوکی');
-  if (overrideState) return overrideState;
-
+function buildAuthAuditContext() {
   const snap = getAuthSnapshot();
   const auditPayload = {
     authStatus: snap.status,
@@ -443,7 +441,10 @@ function renderAuthShellView() {
     logoutBarrierActive: snap.logoutBarrierActive,
     persistentWebStorageUsed: false,
   };
+  return { snap, auditPayload };
+}
 
+function renderAuthStatusCard(snap) {
   const badgeClass =
     snap.status === 'AUTHENTICATED'
       ? 'hc-badge--ok'
@@ -454,8 +455,7 @@ function renderAuthShellView() {
       : 'hc-badge--proposed';
 
   return `
-    <section class="hc-section">
-      <div class="hc-card hc-mb-md">
+      <div id="hc-auth-status-card" class="hc-card hc-mb-md">
         <div class="hc-flex-between">
           <div>
             <span id="hc-auth-status-badge" class="hc-badge ${badgeClass}">${escapeHtml(snap.status)}</span>
@@ -477,6 +477,45 @@ function renderAuthShellView() {
             : ''
         }
       </div>
+  `;
+}
+
+function renderAuthAuditCard(snap, auditPayload) {
+  return `
+      <article id="hc-auth-audit-card" class="hc-card">
+        <div class="hc-flex-between hc-mb-sm">
+          <h2 class="hc-title-clean">۳. عملیات نشست، پروفایل و ممیزی حافظه مرورگر</h2>
+          <div class="hc-flex-wrap">
+            <button type="button" id="hc-refresh-btn" class="hc-btn hc-btn--secondary">رفرش هماهنگ (Coordinated Refresh)</button>
+            <button type="button" id="hc-fetch-profile-btn" class="hc-btn hc-btn--secondary">استعلام پروفایل (/profile/me)</button>
+            <button type="button" id="hc-logout-btn" class="hc-btn hc-btn--danger">خروج امن سراسری (All Tabs)</button>
+          </div>
+        </div>
+        <div class="hc-auth-grid">
+          <div>
+            <div class="hc-label-block">نتیجه پروفایل و نقش‌های سروری (XSS-Safe Escaped):</div>
+            <pre id="hc-auth-profile-box" class="hc-pre-audit">${escapeHtml(
+              snap.profile ? JSON.stringify(snap.profile, null, 2) : 'هنوز پروفایلی بارگذاری نشده است.'
+            )}</pre>
+          </div>
+          <div>
+            <div class="hc-label-block">ممیزی امنیت ذخیره‌سازی و کوکی:</div>
+            <pre id="hc-auth-audit-box" class="hc-pre-audit">${escapeHtml(JSON.stringify(auditPayload, null, 2))}</pre>
+          </div>
+        </div>
+      </article>
+  `;
+}
+
+function renderAuthShellView() {
+  const overrideState = renderStateBannerIfNeeded('احراز هویت و نشست امن کوکی');
+  if (overrideState) return overrideState;
+
+  const { snap, auditPayload } = buildAuthAuditContext();
+
+  return `
+    <section class="hc-section">
+      <div id="hc-auth-status-slot">${renderAuthStatusCard(snap)}</div>
 
       <div class="hc-auth-grid hc-mb-md">
         <article class="hc-card">
@@ -513,28 +552,7 @@ function renderAuthShellView() {
         </article>
       </div>
 
-      <article class="hc-card">
-        <div class="hc-flex-between hc-mb-sm">
-          <h2 class="hc-title-clean">۳. عملیات نشست، پروفایل و ممیزی حافظه مرورگر</h2>
-          <div class="hc-flex-wrap">
-            <button type="button" id="hc-refresh-btn" class="hc-btn hc-btn--secondary">رفرش هماهنگ (Coordinated Refresh)</button>
-            <button type="button" id="hc-fetch-profile-btn" class="hc-btn hc-btn--secondary">استعلام پروفایل (/profile/me)</button>
-            <button type="button" id="hc-logout-btn" class="hc-btn hc-btn--danger">خروج امن سراسری (All Tabs)</button>
-          </div>
-        </div>
-        <div class="hc-auth-grid">
-          <div>
-            <div class="hc-label-block">نتیجه پروفایل و نقش‌های سروری (XSS-Safe Escaped):</div>
-            <pre id="hc-auth-profile-box" class="hc-pre-audit">${escapeHtml(
-              snap.profile ? JSON.stringify(snap.profile, null, 2) : 'هنوز پروفایلی بارگذاری نشده است.'
-            )}</pre>
-          </div>
-          <div>
-            <div class="hc-label-block">ممیزی امنیت ذخیره‌سازی و کوکی:</div>
-            <pre id="hc-auth-audit-box" class="hc-pre-audit">${escapeHtml(JSON.stringify(auditPayload, null, 2))}</pre>
-          </div>
-        </div>
-      </article>
+      <div id="hc-auth-audit-slot">${renderAuthAuditCard(snap, auditPayload)}</div>
     </section>
   `;
 }
@@ -916,6 +934,7 @@ function bindViewEvents() {
   }
 
   const handleLogoutAttempt = async () => {
+    APP_STATE.loginSubmitting = false;
     const res = await logoutCookie();
     APP_STATE.panelDecisionKey = null;
     APP_STATE.panelDecision = null;
@@ -945,28 +964,32 @@ function bindViewEvents() {
   }
 
   const otpMobileEl = document.getElementById('hc-otp-mobile');
-  if (otpMobileEl) {
+  if (otpMobileEl && !otpMobileEl.dataset.hcBound) {
+    otpMobileEl.dataset.hcBound = '1';
     otpMobileEl.addEventListener('input', (e) => {
       APP_STATE.forms.otpMobile = e.target.value;
     });
   }
 
   const otpCodeEl = document.getElementById('hc-otp-code');
-  if (otpCodeEl) {
+  if (otpCodeEl && !otpCodeEl.dataset.hcBound) {
+    otpCodeEl.dataset.hcBound = '1';
     otpCodeEl.addEventListener('input', (e) => {
       APP_STATE.forms.otpCode = e.target.value;
     });
   }
 
   const pwdMobileEl = document.getElementById('hc-pwd-mobile');
-  if (pwdMobileEl) {
+  if (pwdMobileEl && !pwdMobileEl.dataset.hcBound) {
+    pwdMobileEl.dataset.hcBound = '1';
     pwdMobileEl.addEventListener('input', (e) => {
       APP_STATE.forms.pwdMobile = e.target.value;
     });
   }
 
   const otpReqBtn = document.getElementById('hc-otp-request-btn');
-  if (otpReqBtn) {
+  if (otpReqBtn && !otpReqBtn.dataset.hcBound) {
+    otpReqBtn.dataset.hcBound = '1';
     otpReqBtn.addEventListener('click', async () => {
       const mobile = (document.getElementById('hc-otp-mobile')?.value || '').trim();
       APP_STATE.forms.otpMobile = mobile;
@@ -977,35 +1000,49 @@ function bindViewEvents() {
   }
 
   const otpForm = document.getElementById('hc-otp-form');
-  if (otpForm) {
+  if (otpForm && !otpForm.dataset.hcBound) {
+    otpForm.dataset.hcBound = '1';
     otpForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const mobile = (document.getElementById('hc-otp-mobile')?.value || '').trim();
-      const code = (document.getElementById('hc-otp-code')?.value || '').trim();
-      APP_STATE.forms.otpMobile = mobile;
-      APP_STATE.forms.otpCode = code;
-      const res = await verifyOtpCookie(mobile, code);
-      if (res.ok) {
-        APP_STATE.panelDecisionKey = null;
-        APP_STATE.forms.otpCode = '';
-        announceStatus('ورود با OTP با موفقیت انجام شد.');
+      if (APP_STATE.loginSubmitting) return;
+      APP_STATE.loginSubmitting = true;
+      try {
+        const mobile = (document.getElementById('hc-otp-mobile')?.value || '').trim();
+        const code = (document.getElementById('hc-otp-code')?.value || '').trim();
+        APP_STATE.forms.otpMobile = mobile;
+        APP_STATE.forms.otpCode = code;
+        const res = await verifyOtpCookie(mobile, code);
+        if (res.ok) {
+          APP_STATE.panelDecisionKey = null;
+          APP_STATE.forms.otpCode = '';
+          announceStatus('ورود با OTP با موفقیت انجام شد.');
+        }
+      } finally {
+        APP_STATE.loginSubmitting = false;
       }
     });
   }
 
   const pwdForm = document.getElementById('hc-pwd-form');
-  if (pwdForm) {
+  if (pwdForm && !pwdForm.dataset.hcBound) {
+    pwdForm.dataset.hcBound = '1';
     pwdForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const mobile = (document.getElementById('hc-pwd-mobile')?.value || '').trim();
-      const pwdInput = document.getElementById('hc-pwd-input');
-      const password = pwdInput ? pwdInput.value : '';
-      APP_STATE.forms.pwdMobile = mobile;
-      const res = await loginPasswordCookie(mobile, password);
-      if (pwdInput) pwdInput.value = '';
-      if (res.ok) {
-        APP_STATE.panelDecisionKey = null;
-        announceStatus('ورود با رمز عبور با موفقیت انجام شد.');
+      if (APP_STATE.loginSubmitting) return;
+      APP_STATE.loginSubmitting = true;
+      try {
+        const mobile = (document.getElementById('hc-pwd-mobile')?.value || '').trim();
+        const pwdInput = document.getElementById('hc-pwd-input');
+        const password = pwdInput ? pwdInput.value : '';
+        APP_STATE.forms.pwdMobile = mobile;
+        const res = await loginPasswordCookie(mobile, password);
+        if (pwdInput) pwdInput.value = '';
+        if (res.ok) {
+          APP_STATE.panelDecisionKey = null;
+          announceStatus('ورود با رمز عبور با موفقیت انجام شد.');
+        }
+      } finally {
+        APP_STATE.loginSubmitting = false;
       }
     });
   }
@@ -1142,6 +1179,22 @@ export function render() {
   const route = getParsedHash();
   APP_STATE.route = route;
 
+  if (
+    route === '#/auth/shell' &&
+    APP_STATE.uiState === 'NORMAL' &&
+    document.getElementById('hc-session-bar-slot') &&
+    document.getElementById('hc-auth-status-slot') &&
+    document.getElementById('hc-auth-audit-slot')
+  ) {
+    const { snap, auditPayload } = buildAuthAuditContext();
+    document.getElementById('hc-session-bar-slot').innerHTML = renderSessionBar();
+    document.getElementById('hc-auth-status-slot').innerHTML = renderAuthStatusCard(snap);
+    document.getElementById('hc-auth-audit-slot').innerHTML = renderAuthAuditCard(snap, auditPayload);
+    updateActiveNavIndicators();
+    bindViewEvents();
+    return;
+  }
+
   let viewHtml = '';
   if (route === '#/home') {
     viewHtml = renderHomeView();
@@ -1160,7 +1213,7 @@ export function render() {
     viewHtml = renderHomeView();
   }
 
-  root.innerHTML = `${renderSessionBar()}${viewHtml}`;
+  root.innerHTML = `<div id="hc-session-bar-slot">${renderSessionBar()}</div>${viewHtml}`;
   updateActiveNavIndicators();
   bindViewEvents();
 }

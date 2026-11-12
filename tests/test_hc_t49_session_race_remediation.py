@@ -1074,3 +1074,484 @@ async def test_t49_logout_503_accurate_copy_blocks_late_refresh_and_3tab_race(mo
         server.should_exit = True
         thread.join(timeout=5.0)
         await _cleanup_user(uid)
+
+
+@pytest.mark.asyncio
+async def test_t49_cross_tab_killed_tab_revocation_and_logout_network_fallback_h01(monkeypatch):
+    """
+    R2-T50-H01:
+    1. Tab A logged in (`hc_browser` active). Tab B begins password login whose HTTP request
+       completes on backend, then Tab B is forcefully closed (`tab_b.close()`) BEFORE it can
+       send `/login-attempts/cancel` and BEFORE Tab A knows Tab B's `attempt_id`.
+       Tab A clicks Logout -> backend MUST still revoke Tab B's minted family via `hc_browser`
+       server-side generation + `hc:browser_recent_families` (0 ACTIVE DB refresh_tokens).
+    2. Also verifies a fresh Tab C opened during `LOGOUT_PENDING` does NOT call `/refresh`.
+    3. Also verifies `revokeSupersededLoginOnServer` STILL invokes `/login-attempts/cancel`
+       when `/api/v1/auth/logout` throws a network failure (isolated fallback try/catch).
+    """
+    pwd = "CrossTabKilledTab!901"
+    uid, mobile = await _create_test_user(["USER"], password=pwd)
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    rd = redis.from_url(REDIS_URL, decode_responses=True)
+
+    try:
+        for k in rd.keys("hc:rl:*"):
+            rd.delete(k)
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            tab_a = await context.new_page()
+            tab_b = await context.new_page()
+
+            await tab_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await tab_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+
+            await tab_a.fill("#hc-pwd-mobile", mobile)
+            await tab_a.fill("#hc-pwd-input", pwd)
+            await tab_a.click("#hc-pwd-login-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            # Hold Tab B's /password/login AFTER backend committed its DB session
+            login_committed = asyncio.Event()
+            release_tab_b = asyncio.Event()
+
+            async def _hold_tab_b_login(route):
+                if route.request.method != "POST":
+                    await route.continue_()
+                    return
+                resp = await route.fetch()
+                login_committed.set()
+                await release_tab_b.wait()
+                try:
+                    await route.fulfill(response=resp)
+                except Exception:
+                    pass
+
+            await tab_b.route("**/api/v1/auth/password/login", _hold_tab_b_login)
+            await tab_b.fill("#hc-pwd-mobile", mobile)
+            await tab_b.fill("#hc-pwd-input", pwd)
+            await tab_b.click("#hc-pwd-login-btn")
+            await asyncio.wait_for(login_committed.wait(), timeout=5.0)
+
+            # Force-close Tab B BEFORE its response returns or /login-attempts/cancel ever fires
+            await tab_b.close()
+            release_tab_b.set()
+
+            # Hold Tab A /logout briefly while opening Tab C to assert Tab C doesn't /refresh during LOGOUT_PENDING
+            logout_req_seen = asyncio.Event()
+            release_logout_req = asyncio.Event()
+
+            async def _hold_logout_a(route):
+                if route.request.method == "POST":
+                    logout_req_seen.set()
+                    await release_logout_req.wait()
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+            await tab_a.route("**/api/v1/auth/logout", _hold_logout_a)
+            await tab_a.click("#hc-top-logout-btn")
+            await asyncio.wait_for(logout_req_seen.wait(), timeout=5.0)
+
+            tab_c_refresh_calls: list[str] = []
+            tab_c = await context.new_page()
+            tab_c.on(
+                "request",
+                lambda req: tab_c_refresh_calls.append(req.url)
+                if req.method == "POST" and req.url.endswith("/api/v1/auth/refresh")
+                else None,
+            )
+            await tab_c.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            assert (await tab_c.inner_text("#hc-auth-status-badge")).strip() == "UNAUTHENTICATED"
+            assert tab_c_refresh_calls == [], f"Tab C fired /refresh during LOGOUT_PENDING: {tab_c_refresh_calls}"
+
+            release_logout_req.set()
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "UNAUTHENTICATED")
+            await tab_a.unroute("**/api/v1/auth/logout", _hold_logout_a)
+
+            # PostgreSQL MUST have 0 ACTIVE tokens even though Tab B died without /login-attempts/cancel!
+            conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                assert (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND status = 'ACTIVE';",
+                        uid,
+                    )
+                    == 0
+                )
+            finally:
+                await conn.close()
+
+            # Part 3: When /logout throws network failure in cleanup, /login-attempts/cancel MUST STILL fire!
+            await tab_a.fill("#hc-pwd-mobile", mobile)
+            await tab_a.fill("#hc-pwd-input", pwd)
+            await tab_a.click("#hc-pwd-login-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            page_d = await context.new_page()
+            await page_d.add_init_script(
+                """
+                const origFetch = window.fetch;
+                window.fetch = function(input, init) {
+                  const url = typeof input === 'string' ? input : (input && input.url) || '';
+                  if (url.includes('/api/v1/auth/password/login') && init && init.signal) {
+                    const clonedInit = { ...init };
+                    delete clonedInit.signal;
+                    return origFetch.call(this, input, clonedInit);
+                  }
+                  return origFetch.apply(this, arguments);
+                };
+                """
+            )
+            await page_d.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+
+            d_login_held = asyncio.Event()
+            release_d_login = asyncio.Event()
+            fallback_cancel_done = asyncio.Event()
+
+            async def _hold_d_login(route):
+                if route.request.method != "POST":
+                    await route.continue_()
+                    return
+                resp = await route.fetch()
+                d_login_held.set()
+                await release_d_login.wait()
+                try:
+                    await route.fulfill(response=resp)
+                except Exception:
+                    pass
+
+            async def _fail_logout_route(route):
+                if route.request.method == "POST":
+                    await route.abort("failed")
+                    return
+                await route.continue_()
+
+            page_d.on(
+                "response",
+                lambda r: fallback_cancel_done.set()
+                if r.request.method == "POST"
+                and r.url.endswith("/api/v1/auth/login-attempts/cancel")
+                and r.status == 200
+                else None,
+            )
+            await page_d.route("**/api/v1/auth/password/login", _hold_d_login)
+            await page_d.route("**/api/v1/auth/logout", _fail_logout_route)
+
+            await page_d.fill("#hc-pwd-mobile", mobile)
+            await page_d.fill("#hc-pwd-input", pwd)
+            await page_d.click("#hc-pwd-login-btn")
+            await asyncio.wait_for(d_login_held.wait(), timeout=5.0)
+
+            await tab_a.click("#hc-top-logout-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "UNAUTHENTICATED")
+
+            release_d_login.set()
+            await asyncio.wait_for(fallback_cancel_done.wait(), timeout=5.0)
+
+            await context.close()
+            await browser.close()
+    finally:
+        for k in rd.keys("hc:rl:*"):
+            rd.delete(k)
+        rd.close()
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        await _cleanup_user(uid)
+
+
+@pytest.mark.asyncio
+async def test_t49_m01_delayed_409_does_not_clobber_newer_login_and_m02_stale_refresh_rejected(
+    monkeypatch,
+):
+    """
+    R2-T50-M01 + R2-T50-M02 + R2-T50-H02 / L01:
+    - M01: Superseded login attempt returning delayed HTTP 409 does NOT emit Set-Cookie deletions
+      that wipe a newer legitimate session's cookies (`hc_refresh`, `hc_csrf`, `hc_has_session`).
+    - M02: Older non-explicit TOKEN_REFRESHED (`authGenSeq=1`, `familyId=fam1`) arriving after a
+      newer explicit login (`authGenSeq=2`, `familyId=fam2`) without intervening logout is rejected.
+    - H02 / L01: Simultaneous cross-tab `hc_coord` mutations via Web Locks never drop `logoutSeq`
+      or produce equal `lo == li > 0` collisions.
+    """
+    pwd = "CookieClobberAndStaleRefresh!901"
+    uid, mobile = await _create_test_user(["USER"], password=pwd)
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    rd = redis.from_url(REDIS_URL, decode_responses=True)
+
+    try:
+        for k in rd.keys("hc:rl:*"):
+            rd.delete(k)
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            tab_a = await context.new_page()
+            tab_b = await context.new_page()
+
+            await tab_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await tab_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+
+            # Step 1 (M01): Trigger a cancelled login attempt whose 409 response is held in flight
+            res_409_set_cookie_headers: list[str] = []
+            held_409_started = asyncio.Event()
+            release_held_409 = asyncio.Event()
+
+            async def _hold_first_cancel_409(route):
+                if route.request.method != "POST":
+                    await route.continue_()
+                    return
+                resp = await route.fetch()
+                if resp.status == 409:
+                    held_409_started.set()
+                    for k, v in resp.headers.items():
+                        if k.lower() == "set-cookie":
+                            res_409_set_cookie_headers.append(v)
+                    await release_held_409.wait()
+                await route.fulfill(response=resp)
+
+            await tab_b.route("**/api/v1/auth/password/login", _hold_first_cancel_409)
+
+            await tab_b.evaluate(
+                """async ([mob, pw]) => {
+                  const res = await fetch('/api/v1/auth/login-attempts/cancel', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ attempt_ids: ['hc_m01_precancelled_12345'] })
+                  });
+                  if (!res.ok) throw new Error('cancel failed');
+                  window.__m01Delayed409Promise = fetch('/api/v1/auth/password/login', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json', 'X-Auth-Mode': 'cookie' },
+                    body: JSON.stringify({
+                      mobile: mob,
+                      password: pw,
+                      attempt_id: 'hc_m01_precancelled_12345'
+                    })
+                  }).then(r => r.status);
+                }""",
+                [mobile, pwd],
+            )
+            await asyncio.wait_for(held_409_started.wait(), timeout=5.0)
+
+            # Establish newer valid session A2 on Tab A
+            await tab_a.fill("#hc-pwd-mobile", mobile)
+            await tab_a.fill("#hc-pwd-input", pwd)
+            await tab_a.click("#hc-pwd-login-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+            await _wait_selector_text(tab_b, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            # Release delayed 409 from A1 -> MUST NOT emit cookie deletions or invalidate A2!
+            release_held_409.set()
+            status_409 = await tab_b.evaluate("() => window.__m01Delayed409Promise")
+            await tab_b.unroute("**/api/v1/auth/password/login", _hold_first_cancel_409)
+            assert status_409 == 409
+            assert all("hc_refresh=" not in h.lower() for h in res_409_set_cookie_headers)
+            assert all("hc_csrf=" not in h.lower() for h in res_409_set_cookie_headers)
+
+            jar = {c["name"]: c for c in await context.cookies()}
+            assert "hc_refresh" in jar
+            assert "hc_csrf" in jar
+            assert "hc_has_session" in jar
+
+            await tab_a.click("#hc-fetch-profile-btn")
+            await tab_a.wait_for_timeout(150)
+            assert (await tab_a.inner_text("#hc-auth-status-badge")).strip() == "AUTHENTICATED"
+
+            # Step 2 (M02): Explicit login 2 on Tab A without intervening logout, then inject stale
+            # non-explicit TOKEN_REFRESHED from generation 1 / old family
+            async with tab_a.expect_response(
+                lambda r: r.url.endswith("/api/v1/auth/password/login")
+                and r.request.method == "POST"
+                and r.status == 200
+            ):
+                await tab_a.fill("#hc-pwd-mobile", mobile)
+                await tab_a.fill("#hc-pwd-input", pwd)
+                await tab_a.click("#hc-pwd-login-btn")
+            await tab_a.wait_for_function(
+                "() => { const m = /li\\.(\\d+)/.exec(document.cookie || ''); return m && Number(m[1]) >= 2; }",
+                timeout=5000,
+            )
+            await _wait_selector_text(tab_a, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            await tab_b.evaluate(
+                """() => {
+                  const ch = new BroadcastChannel('hamicard_phase3_auth');
+                  ch.postMessage({
+                    type: 'TOKEN_REFRESHED',
+                    accessToken: 'hc_at_v1.stale_old_family_non_explicit',
+                    accessExpiresAtMs: Date.now() + 300000,
+                    accessTtlMs: 300000,
+                    explicitLogin: false,
+                    authGenSeq: 1,
+                    familyId: '00000000-0000-0000-0000-000000000001',
+                    startedLogoutSeq: 0,
+                  });
+                  ch.close();
+                }"""
+            )
+            await tab_a.wait_for_timeout(150)
+            # Profile fetch MUST STILL work (real newer token preserved, not overwritten by stale token)
+            await tab_a.click("#hc-fetch-profile-btn")
+            await _wait_selector_text(tab_a, "#hc-auth-event-msg", "پروفایل کاربر", contains=True)
+
+            # Step 3 (H02 / L01): Simultaneous Web Lock serialized login & logout across Tab A & Tab B
+            await asyncio.gather(
+                tab_a.evaluate(
+                    """async () => {
+                      const m = await import('/phase3/js/auth_session.js');
+                      await m.logoutCookie();
+                    }"""
+                ),
+                tab_b.evaluate(
+                    """async ([mob, pw]) => {
+                      const m = await import('/phase3/js/auth_session.js');
+                      await m.loginPasswordCookie(mob, pw);
+                    }""",
+                    [mobile, pwd],
+                ),
+            )
+            coord_val = await tab_a.evaluate(
+                """() => {
+                  const m = /hc_coord=([^;]+)/.exec(document.cookie || '');
+                  return m ? m[1] : '';
+                }"""
+            )
+            assert coord_val.startswith("g.")
+            parts = coord_val.split(".")
+            g_num = int(parts[1])
+            lo_num = int(parts[3])
+            li_num = int(parts[5])
+            assert g_num >= max(lo_num, li_num) > 0
+            assert lo_num != li_num, f"Coord collision lo==li detected: {coord_val}"
+
+            await context.close()
+            await browser.close()
+    finally:
+        for k in rd.keys("hc:rl:*"):
+            rd.delete(k)
+        rd.close()
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        await _cleanup_user(uid)
+
+
+@pytest.mark.asyncio
+async def test_t49_m03_m04_over16_pending_attempts_and_cancel_rate_limit(monkeypatch):
+    """
+    R2-T50-M03 + R2-T50-M04:
+    - M03: 18 concurrent pending login attempts followed by `logoutCookie()` chunk batches cleanly
+      (never HTTP 422), revoking both active session & all 18 attempts in PG/Redis.
+    - M04: Unauthenticated `/api/v1/auth/login-attempts/cancel` enforces per-IP + global Redis
+      rate limits & key-creation quotas (`429 Too Many Requests`, `Retry-After`) without allocating
+      Redis cancellation keys on blocked requests.
+    """
+    pwd = "Over16AndRateLimit!901"
+    uid, mobile = await _create_test_user(["USER"], password=pwd)
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    rd = redis.from_url(REDIS_URL, decode_responses=True)
+
+    try:
+        for rl_key in rd.keys("hc:rl:*"):
+            rd.delete(rl_key)
+
+        async with async_playwright() as p:
+            browser = await _launch_headless_chromium(p)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            page = await context.new_page()
+
+            await page.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
+            await page.fill("#hc-pwd-mobile", mobile)
+            await page.fill("#hc-pwd-input", pwd)
+            await page.click("#hc-pwd-login-btn")
+            await _wait_selector_text(page, "#hc-auth-status-badge", "AUTHENTICATED")
+
+            held_18_event = asyncio.Event()
+            release_18_event = asyncio.Event()
+            seen_login_reqs = 0
+            saw_422 = False
+
+            async def _hold_many_logins(route):
+                nonlocal seen_login_reqs
+                if route.request.method == "POST":
+                    seen_login_reqs += 1
+                    if seen_login_reqs >= 18:
+                        held_18_event.set()
+                    await release_18_event.wait()
+                await route.continue_()
+
+            def _watch_422(resp):
+                nonlocal saw_422
+                if resp.status == 422:
+                    saw_422 = True
+
+            page.on("response", _watch_422)
+            await page.route("**/api/v1/auth/password/login", _hold_many_logins)
+
+            # Fire 18 concurrent loginPasswordCookie() calls, then click Logout while all 18 pending!
+            await page.evaluate(
+                """async ([mob, pw]) => {
+                  const m = await import('/phase3/js/auth_session.js');
+                  window.__pending18 = Array.from({ length: 18 }, () => m.loginPasswordCookie(mob, pw));
+                }""",
+                [mobile, pwd],
+            )
+            for _ in range(40):
+                if held_18_event.is_set():
+                    break
+                await asyncio.sleep(0.05)
+
+            logout_res = await page.evaluate(
+                """async () => {
+                  const m = await import('/phase3/js/auth_session.js');
+                  return m.logoutCookie();
+                }"""
+            )
+            release_18_event.set()
+            await page.evaluate("() => Promise.allSettled(window.__pending18 || [])")
+            await page.wait_for_timeout(200)
+
+            assert not saw_422, "Logout with >16 pending attempts triggered HTTP 422!"
+            assert logout_res["ok"] is True
+            assert logout_res["status"] == 200
+
+            conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                assert (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND status = 'ACTIVE';",
+                        uid,
+                    )
+                    == 0
+                )
+            finally:
+                await conn.close()
+
+            await context.close()
+            await browser.close()
+
+        # M04: Rate limit & Redis key-creation quota on unauthenticated /login-attempts/cancel
+        for rl_key in rd.keys("hc:rl:*"):
+            rd.delete(rl_key)
+
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            blocked_id = f"hc_rl_blocked_{uuid.uuid4().hex}"
+            statuses: list[int] = []
+            for i in range(25):
+                aid = blocked_id if i >= 20 else f"hc_rl_ok_{i}_{uuid.uuid4().hex}"
+                r_c = await client.post(
+                    "/api/v1/auth/login-attempts/cancel",
+                    json={"attempt_ids": [aid]},
+                    headers={"Origin": base_url},
+                )
+                statuses.append(r_c.status_code)
+            assert 429 in statuses, f"Expected 429 rate limit, got {statuses}"
+            assert rd.get(f"hc:cancelled_login_attempt:{blocked_id}") is None
+    finally:
+        for rl_key in rd.keys("hc:rl:*"):
+            rd.delete(rl_key)
+        rd.close()
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        await _cleanup_user(uid)

@@ -10,8 +10,11 @@
 const AUTH_HEADER_SCHEME = ['B', 'e', 'a', 'r', 'e', 'r'].join('');
 const CHANNEL_NAME = 'hamicard_phase3_auth';
 const LOCK_NAME = 'hamicard_phase3_refresh';
+const COORD_LOCK_NAME = 'hamicard_phase3_coord';
 const COORD_COOKIE_NAME = 'hc_coord';
 const COORD_COOKIE_MAX_AGE_SECONDS = 86400;
+const MAX_CANCEL_BATCH = 16;
+const MAX_PENDING_LOGIN_ATTEMPTS = 64;
 const authChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(CHANNEL_NAME) : null;
 
 let accessToken = null;
@@ -33,7 +36,14 @@ let canRetryLogout = false;
 let localCoordGlobalSeq = 0;
 let localCoordLogoutSeq = 0;
 let localCoordLoginSeq = 0;
+let localCoordLogoutPendingSeq = 0;
+let serverGlobalSeq = 0;
+let serverLogoutSeq = 0;
+let serverLoginSeq = 0;
 let activeSessionLoginSeq = 0;
+let activeSessionFamilyId = null;
+let coordInitPromise = null;
+let inFlightLogoutPromise = null;
 
 let cachedProfile = null;
 let authStatusLabel = 'UNAUTHENTICATED'; // UNAUTHENTICATED | LOGOUT_PENDING | AUTHENTICATED | EXPIRED | REMOTE_REVOKE_FAILED
@@ -58,12 +68,19 @@ function generateAttemptId() {
 
 function parseCoordCookie(raw) {
   if (!raw || typeof raw !== 'string') return null;
-  const match = /^g\.(\d+)\.lo\.(\d+)\.li\.(\d+)$/.exec(raw.trim());
+  const match =
+    /^g\.(\d+)\.lo\.(\d+)\.li\.(\d+)(?:\.sg\.(\d+)\.slo\.(\d+)\.sli\.(\d+))?(?:\.lp\.(\d+))?$/.exec(
+      raw.trim()
+    );
   if (!match) return null;
   return {
     g: Number(match[1]) || 0,
     lo: Number(match[2]) || 0,
     li: Number(match[3]) || 0,
+    sg: Number(match[4]) || 0,
+    slo: Number(match[5]) || 0,
+    sli: Number(match[6]) || 0,
+    lp: Number(match[7]) || 0,
   };
 }
 
@@ -73,77 +90,221 @@ function writeCoordCookie() {
     typeof window !== 'undefined' && window.location && window.location.protocol === 'https:'
       ? '; Secure'
       : '';
-  const val = `g.${localCoordGlobalSeq}.lo.${localCoordLogoutSeq}.li.${localCoordLoginSeq}`;
+  const val = `g.${localCoordGlobalSeq}.lo.${localCoordLogoutSeq}.li.${localCoordLoginSeq}.sg.${serverGlobalSeq}.slo.${serverLogoutSeq}.sli.${serverLoginSeq}.lp.${localCoordLogoutPendingSeq}`;
   document.cookie = `${COORD_COOKIE_NAME}=${val}; Path=/; Max-Age=${COORD_COOKIE_MAX_AGE_SECONDS}; SameSite=Lax${secureFlag}`;
 }
 
 function syncCoordFromCookie() {
   const parsed = parseCoordCookie(getCookieValue(COORD_COOKIE_NAME));
   if (parsed) {
-    if (parsed.g > localCoordGlobalSeq) localCoordGlobalSeq = parsed.g;
+    if (parsed.g > localCoordGlobalSeq) {
+      localCoordGlobalSeq = parsed.g;
+      localCoordLogoutPendingSeq = parsed.lp || 0;
+    } else if (parsed.g === localCoordGlobalSeq) {
+      if (parsed.lp > localCoordLogoutPendingSeq) {
+        localCoordLogoutPendingSeq = parsed.lp;
+      } else if (parsed.lp === 0 && parsed.g >= localCoordLogoutPendingSeq) {
+        localCoordLogoutPendingSeq = 0;
+      }
+    }
     if (parsed.lo > localCoordLogoutSeq) localCoordLogoutSeq = parsed.lo;
     if (parsed.li > localCoordLoginSeq) localCoordLoginSeq = parsed.li;
+    if (parsed.sg > serverGlobalSeq) serverGlobalSeq = parsed.sg;
+    if (parsed.slo > serverLogoutSeq) serverLogoutSeq = parsed.slo;
+    if (parsed.sli > serverLoginSeq) serverLoginSeq = parsed.sli;
   }
   return {
     g: localCoordGlobalSeq,
     lo: localCoordLogoutSeq,
     li: localCoordLoginSeq,
+    sg: serverGlobalSeq,
+    slo: serverLogoutSeq,
+    sli: serverLoginSeq,
+    lp: localCoordLogoutPendingSeq,
   };
 }
 
-function syncCoordFromSeq(seq, kind) {
+function syncServerCoord(serverCoord) {
+  if (!serverCoord || typeof serverCoord !== 'object') return false;
+  syncCoordFromCookie();
+  const sg = Number(serverCoord.global_seq || 0);
+  const slo = Number(serverCoord.logout_seq || 0);
+  const sli = Number(serverCoord.login_seq || 0);
+  let changed = false;
+  if (Number.isFinite(sg) && sg > serverGlobalSeq) {
+    serverGlobalSeq = sg;
+    changed = true;
+  }
+  if (Number.isFinite(slo) && slo > serverLogoutSeq) {
+    serverLogoutSeq = slo;
+    changed = true;
+  }
+  if (Number.isFinite(sli) && sli > serverLoginSeq) {
+    serverLoginSeq = sli;
+    changed = true;
+  }
+  if (changed) {
+    writeCoordCookie();
+  }
+  return changed;
+}
+
+function syncCoordFromSeq(seq, kind, serverCoord = null) {
   const n = Number(seq || 0);
-  if (!Number.isFinite(n) || n <= 0) return;
   syncCoordFromCookie();
   let changed = false;
-  if (n > localCoordGlobalSeq) {
-    localCoordGlobalSeq = n;
-    changed = true;
+  if (Number.isFinite(n) && n > 0) {
+    if (n > localCoordGlobalSeq) {
+      localCoordGlobalSeq = n;
+      changed = true;
+    }
+    if (kind === 'logout' && n > localCoordLogoutSeq) {
+      localCoordLogoutSeq = n;
+      changed = true;
+    }
+    if (kind === 'login' && n > localCoordLoginSeq) {
+      localCoordLoginSeq = n;
+      changed = true;
+    }
   }
-  if (kind === 'logout' && n > localCoordLogoutSeq) {
-    localCoordLogoutSeq = n;
-    changed = true;
-  }
-  if (kind === 'login' && n > localCoordLoginSeq) {
-    localCoordLoginSeq = n;
-    changed = true;
+  if (serverCoord && typeof serverCoord === 'object') {
+    const sg = Number(serverCoord.global_seq || 0);
+    const slo = Number(serverCoord.logout_seq || 0);
+    const sli = Number(serverCoord.login_seq || 0);
+    if (Number.isFinite(sg) && sg > serverGlobalSeq) {
+      serverGlobalSeq = sg;
+      changed = true;
+    }
+    if (Number.isFinite(slo) && slo > serverLogoutSeq) {
+      serverLogoutSeq = slo;
+      changed = true;
+    }
+    if (Number.isFinite(sli) && sli > serverLoginSeq) {
+      serverLoginSeq = sli;
+      changed = true;
+    }
   }
   if (changed) {
     writeCoordCookie();
   }
 }
 
-function bumpCoordLogoutSeq() {
+async function withCoordLock(fn) {
+  if (
+    typeof navigator !== 'undefined' &&
+    navigator.locks &&
+    typeof navigator.locks.request === 'function'
+  ) {
+    return navigator.locks.request(COORD_LOCK_NAME, { mode: 'exclusive' }, async () => {
+      syncCoordFromCookie();
+      return fn();
+    });
+  }
   syncCoordFromCookie();
-  localCoordGlobalSeq += 1;
-  localCoordLogoutSeq = localCoordGlobalSeq;
-  writeCoordCookie();
-  return localCoordLogoutSeq;
+  return fn();
 }
 
-function bumpCoordLoginSeq() {
-  syncCoordFromCookie();
-  localCoordGlobalSeq += 1;
-  localCoordLoginSeq = localCoordGlobalSeq;
-  writeCoordCookie();
-  return localCoordLoginSeq;
+async function bumpCoordLogoutSeqAtomic(minTargetSeq = 0, pending = false) {
+  return withCoordLock(() => {
+    const nextSeq = Math.max(localCoordGlobalSeq + 1, Number(minTargetSeq || 0));
+    localCoordGlobalSeq = nextSeq;
+    localCoordLogoutSeq = nextSeq;
+    if (pending) {
+      localCoordLogoutPendingSeq = nextSeq;
+    }
+    writeCoordCookie();
+    return localCoordLogoutSeq;
+  });
 }
 
-function isExplicitLoginSuperseded(startedEpoch, startedLogoutSeq, attemptId) {
+async function clearCoordLogoutPending(logoutSeq) {
+  return withCoordLock(() => {
+    if (localCoordLogoutPendingSeq > 0 && localCoordLogoutPendingSeq <= logoutSeq) {
+      localCoordLogoutPendingSeq = 0;
+      writeCoordCookie();
+    }
+  });
+}
+
+async function bumpCoordLoginSeqIfNotSuperseded(startedEpoch, startedLogoutSeq, startedServerLogoutSeq, attemptId) {
+  return withCoordLock(() => {
+    if (
+      isExplicitLoginSuperseded(
+        startedEpoch,
+        startedLogoutSeq,
+        attemptId,
+        startedServerLogoutSeq
+      )
+    ) {
+      return { superseded: true, seq: 0 };
+    }
+    localCoordGlobalSeq += 1;
+    localCoordLoginSeq = localCoordGlobalSeq;
+    localCoordLogoutPendingSeq = 0;
+    writeCoordCookie();
+    return { superseded: false, seq: localCoordLoginSeq };
+  });
+}
+
+async function fetchLiveBrowserCoord() {
+  try {
+    const resp = await fetch('/api/v1/auth/coord/session', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.coord) {
+        await withCoordLock(() => {
+          syncServerCoord(data.coord);
+        });
+      }
+    }
+  } catch {
+    // Non-fatal init fallback; server /otp/verify and /password/login also issue hc_browser
+  }
+  return syncCoordFromCookie();
+}
+
+async function ensureBrowserCoordInitialized() {
+  if (coordInitPromise) {
+    return coordInitPromise;
+  }
+  coordInitPromise = fetchLiveBrowserCoord();
+  return coordInitPromise;
+}
+
+function isExplicitLoginSuperseded(
+  startedEpoch,
+  startedLogoutSeq,
+  attemptId,
+  startedServerLogoutSeq = null
+) {
   syncCoordFromCookie();
+  const serverSuperseded =
+    startedServerLogoutSeq !== null &&
+    startedServerLogoutSeq !== undefined &&
+    serverLogoutSeq > Number(startedServerLogoutSeq);
   return Boolean(
     authEpoch !== startedEpoch ||
       localCoordLogoutSeq > startedLogoutSeq ||
+      serverSuperseded ||
       (attemptId && cancelledAttemptIds.has(attemptId))
   );
 }
 
-function isNonLoginInvalidated(startedEpoch, startedLogoutSeq) {
+function isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq = null) {
   syncCoordFromCookie();
+  const serverSuperseded =
+    startedServerLogoutSeq !== null &&
+    startedServerLogoutSeq !== undefined &&
+    serverLogoutSeq > Number(startedServerLogoutSeq);
   return Boolean(
     logoutBarrierActive ||
       authEpoch !== startedEpoch ||
-      localCoordLogoutSeq > startedLogoutSeq
+      localCoordLogoutSeq > startedLogoutSeq ||
+      serverSuperseded
   );
 }
 
@@ -222,6 +383,7 @@ export function getAuthSnapshot() {
     hasAccessTokenInClosure: Boolean(accessToken),
     accessExpiresAtMs,
     refreshCallsThisTab,
+    pendingAttemptCount: pendingLoginAttempts.size,
     visibleCookieNames: listVisibleCookieNames(),
     hasSessionHintCookie: hasSessionHintCookie(),
     canRetryLogout,
@@ -242,6 +404,7 @@ export function clearPrivateState(reasonMessage, options = {}) {
     retryableLogout = false,
     logoutSeq = null,
     suppressBump = false,
+    preservePendingAttempts = false,
   } = options;
   authEpoch += 1;
   if (typeof logoutBarrier === 'boolean') {
@@ -254,16 +417,23 @@ export function clearPrivateState(reasonMessage, options = {}) {
   cachedProfile = null;
   inFlightRefresh = null;
   activeSessionLoginSeq = 0;
+  activeSessionFamilyId = null;
   authStatusLabel = statusLabel;
   sessionVersion += 1;
 
   let effectiveLogoutSeq = Number(logoutSeq || 0);
   if (!effectiveLogoutSeq && broadcastLogout && !suppressBump) {
-    effectiveLogoutSeq = bumpCoordLogoutSeq();
+    syncCoordFromCookie();
+    localCoordGlobalSeq += 1;
+    localCoordLogoutSeq = localCoordGlobalSeq;
+    effectiveLogoutSeq = localCoordLogoutSeq;
+    bumpCoordLogoutSeqAtomic(effectiveLogoutSeq).catch(() => {});
   }
 
-  pendingLoginAttempts.forEach((aid) => cancelledAttemptIds.add(aid));
-  abortActiveControllers();
+  if (!preservePendingAttempts) {
+    pendingLoginAttempts.forEach((aid) => cancelledAttemptIds.add(aid));
+    abortActiveControllers();
+  }
   drainSyncResolvers(null);
 
   lastEventMessage = reasonMessage || 'نشست پاک‌سازی شد.';
@@ -275,13 +445,18 @@ export function clearPrivateState(reasonMessage, options = {}) {
       reason: reasonMessage || 'LOGOUT',
       authEpoch,
       authGenSeq: effectiveLogoutSeq || localCoordLogoutSeq,
+      serverCoord: {
+        global_seq: serverGlobalSeq,
+        logout_seq: serverLogoutSeq,
+        login_seq: serverLoginSeq,
+      },
     });
   }
   notifyChange();
 }
 
 function setActiveAccessToken(token, ttlSeconds, sourceNote, options = {}) {
-  const { explicitLogin = false, sessionLoginSeq = 0 } = options;
+  const { explicitLogin = false, sessionLoginSeq = 0, familyId = null } = options;
   if (explicitLogin) {
     logoutBarrierActive = false;
     canRetryLogout = false;
@@ -293,6 +468,9 @@ function setActiveAccessToken(token, ttlSeconds, sourceNote, options = {}) {
   accessTtlMs = Math.max(1000, Number(ttlSeconds || 300) * 1000);
   accessExpiresAtMs = Date.now() + accessTtlMs;
   lastRefreshAtMs = Date.now();
+  if (familyId) {
+    activeSessionFamilyId = String(familyId);
+  }
   if (sessionLoginSeq > 0) {
     activeSessionLoginSeq = Math.max(activeSessionLoginSeq, sessionLoginSeq);
   } else if (activeSessionLoginSeq === 0 && localCoordLoginSeq > localCoordLogoutSeq) {
@@ -307,14 +485,94 @@ function setActiveAccessToken(token, ttlSeconds, sourceNote, options = {}) {
   return Boolean(accessToken);
 }
 
+async function postCancelAttemptChunks(attemptIds = []) {
+  if (!attemptIds.length) {
+    return { allOk: true, lastStatus: 200, lastDetail: '' };
+  }
+  let allOk = true;
+  let lastStatus = 200;
+  let lastDetail = '';
+  for (let i = 0; i < attemptIds.length; i += MAX_CANCEL_BATCH) {
+    const chunk = attemptIds.slice(i, i + MAX_CANCEL_BATCH);
+    try {
+      const resp = await fetch('/api/v1/auth/login-attempts/cancel', {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attempt_ids: chunk }),
+      });
+      lastStatus = resp.status;
+      if (!resp.ok) {
+        allOk = false;
+        try {
+          const errData = await resp.json();
+          lastDetail = errData.detail || lastDetail;
+        } catch {
+          // ignore json parse failure
+        }
+      } else {
+        try {
+          const okData = await resp.json();
+          if (okData && okData.auth_coord) {
+            await withCoordLock(() => {
+              syncServerCoord(okData.auth_coord);
+            });
+          }
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      allOk = false;
+      lastStatus = 0;
+    }
+  }
+  return { allOk, lastStatus, lastDetail };
+}
+
 async function revokeSupersededLoginOnServer(lateAccessToken = null, attemptId = null) {
   const cancelledIds = attemptId ? [attemptId] : [];
   if (attemptId) {
     cancelledAttemptIds.add(attemptId);
   }
+
+  let bearerRevoked = false;
+  if (lateAccessToken) {
+    try {
+      const bearerResp = await fetch('/api/v1/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Auth-Mode': 'bearer',
+          Authorization: `${AUTH_HEADER_SCHEME} ${lateAccessToken}`,
+        },
+        body: JSON.stringify({ cancelled_login_attempt_ids: cancelledIds }),
+      });
+      bearerRevoked = Boolean(bearerResp.ok);
+    } catch {
+      bearerRevoked = false;
+    }
+  }
+
+  // Always run targeted attempt-id cancellation if bearer logout did not succeed or if attemptId exists,
+  // ensuring a network error on /logout NEVER skips /login-attempts/cancel (R2-T50-H01).
+  if (cancelledIds.length > 0 && !bearerRevoked) {
+    await postCancelAttemptChunks(cancelledIds);
+  }
+
+  // Clear resurrected late Set-Cookies via cookie /logout ONLY when browser is still logged out;
+  // NEVER call cookie /logout if a newer explicit login has taken over (prevents clobbering newer cookies).
+  syncCoordFromCookie();
+  const stillLoggedOut =
+    logoutBarrierActive &&
+    localCoordLoginSeq <= localCoordLogoutSeq &&
+    serverLoginSeq <= serverLogoutSeq;
   const csrf = getCookieValue('hc_csrf') || '';
-  try {
-    if (csrf) {
+  if (stillLoggedOut && (csrf || hasSessionHintCookie())) {
+    try {
       const headers = {
         'Content-Type': 'application/json',
         'X-Auth-Mode': 'cookie',
@@ -331,36 +589,20 @@ async function revokeSupersededLoginOnServer(lateAccessToken = null, attemptId =
         body: JSON.stringify({ cancelled_login_attempt_ids: cancelledIds }),
       });
       if (resp.ok) {
-        return;
+        try {
+          const data = await resp.json();
+          if (data && data.auth_coord) {
+            await withCoordLock(() => {
+              syncServerCoord(data.auth_coord);
+            });
+          }
+        } catch {
+          // ignore
+        }
       }
+    } catch {
+      // Targeted bearer/attempt revocation above already executed independently
     }
-    if (lateAccessToken) {
-      const bearerResp = await fetch('/api/v1/auth/logout', {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Auth-Mode': 'bearer',
-          Authorization: `${AUTH_HEADER_SCHEME} ${lateAccessToken}`,
-        },
-        body: JSON.stringify({ cancelled_login_attempt_ids: cancelledIds }),
-      });
-      if (bearerResp.ok) {
-        return;
-      }
-    }
-    if (cancelledIds.length > 0) {
-      await fetch('/api/v1/auth/login-attempts/cancel', {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ attempt_ids: cancelledIds }),
-      });
-    }
-  } catch {
-    // Keep fail-closed local barrier active if cleanup network call fails
   }
 }
 
@@ -380,6 +622,9 @@ async function executeCookieRefreshRequest() {
 
   const startedEpoch = authEpoch;
   const startedLogoutSeq = coord.lo;
+  const startedServerLogoutSeq = coord.slo;
+  const startedLoginSeq = activeSessionLoginSeq || coord.li;
+  const startedFamilyId = activeSessionFamilyId;
   const ctrl = new AbortController();
   activeControllers.add(ctrl);
   refreshCallsThisTab += 1;
@@ -402,7 +647,7 @@ async function executeCookieRefreshRequest() {
     activeControllers.delete(ctrl);
   }
 
-  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     if (resp.ok) {
       let lateTok = null;
       try {
@@ -424,7 +669,7 @@ async function executeCookieRefreshRequest() {
     } catch {
       detail = '';
     }
-    if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+    if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
       return null;
     }
     if (resp.status === 401 || resp.status === 403) {
@@ -448,17 +693,28 @@ async function executeCookieRefreshRequest() {
     return null;
   }
 
-  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     await revokeSupersededLoginOnServer(data.access_token || null, null);
     return null;
   }
 
+  syncCoordFromCookie();
+  if (
+    (startedLoginSeq > 0 && localCoordLoginSeq > startedLoginSeq) ||
+    (startedFamilyId && data.family_id && String(data.family_id) !== startedFamilyId)
+  ) {
+    return null;
+  }
+
+  const effectiveLoginSeq = startedLoginSeq || localCoordLoginSeq || 1;
+  const effectiveFamilyId = data.family_id ? String(data.family_id) : startedFamilyId;
   const applied = setActiveAccessToken(
     data.access_token || null,
     data.expires_in || 300,
-    'نشست از طریق کوکی HttpOnly در حافظه RAM تازه‌سازی شد.'
+    'نشست از طریق کوکی HttpOnly در حافظه RAM تازه‌سازی شد.',
+    { sessionLoginSeq: effectiveLoginSeq, familyId: effectiveFamilyId }
   );
-  if (!applied || isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+  if (!applied || isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     return null;
   }
 
@@ -470,21 +726,24 @@ async function executeCookieRefreshRequest() {
       accessTtlMs,
       explicitLogin: false,
       authEpoch,
-      authGenSeq: activeSessionLoginSeq || localCoordLoginSeq,
+      authGenSeq: effectiveLoginSeq,
+      familyId: effectiveFamilyId,
       startedLogoutSeq,
     });
     await delay(30);
   }
 
-  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+  if (isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     return null;
   }
 
   await hydrateProfileInternal(startedEpoch, startedLogoutSeq);
-  if (!isNonLoginInvalidated(startedEpoch, startedLogoutSeq)) {
+  if (!isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     notifyChange();
   }
-  return isNonLoginInvalidated(startedEpoch, startedLogoutSeq) ? null : accessToken;
+  return isNonLoginInvalidated(startedEpoch, startedLogoutSeq, startedServerLogoutSeq)
+    ? null
+    : accessToken;
 }
 
 export async function refreshSessionCoordinated(options = {}) {
@@ -717,9 +976,27 @@ export async function requestOtp(mobile) {
 }
 
 async function performExplicitCookieLogin(endpoint, payload, successMessage, failPrefix) {
-  const coord = syncCoordFromCookie();
+  if (inFlightLogoutPromise) {
+    try {
+      await inFlightLogoutPromise;
+    } catch {
+      // Proceed after prior logout request settles
+    }
+  }
+  await ensureBrowserCoordInitialized();
+  const coord = await fetchLiveBrowserCoord();
   const startedEpoch = authEpoch;
   const startedLogoutSeq = coord.lo;
+  const startedServerLogoutSeq = coord.slo;
+
+  while (pendingLoginAttempts.size >= MAX_PENDING_LOGIN_ATTEMPTS) {
+    const oldestId = pendingLoginAttempts.values().next().value;
+    if (!oldestId) break;
+    pendingLoginAttempts.delete(oldestId);
+    cancelledAttemptIds.add(oldestId);
+    postCancelAttemptChunks([oldestId]).catch(() => {});
+  }
+
   const attemptId = generateAttemptId();
   const ctrl = new AbortController();
 
@@ -737,12 +1014,23 @@ async function performExplicitCookieLogin(endpoint, payload, successMessage, fai
         'Content-Type': 'application/json',
         'X-Auth-Mode': 'cookie',
       },
-      body: JSON.stringify({ ...payload, attempt_id: attemptId }),
+      body: JSON.stringify({
+        ...payload,
+        attempt_id: attemptId,
+        started_server_logout_seq: startedServerLogoutSeq,
+      }),
     });
   } catch {
     pendingLoginAttempts.delete(attemptId);
     activeControllers.delete(ctrl);
-    if (isExplicitLoginSuperseded(startedEpoch, startedLogoutSeq, attemptId)) {
+    if (
+      isExplicitLoginSuperseded(
+        startedEpoch,
+        startedLogoutSeq,
+        attemptId,
+        startedServerLogoutSeq
+      )
+    ) {
       await revokeSupersededLoginOnServer(null, attemptId);
       return { ok: false, status: 0, superseded: true, data: {} };
     }
@@ -762,8 +1050,15 @@ async function performExplicitCookieLogin(endpoint, payload, successMessage, fai
     data = {};
   }
 
-  if (isExplicitLoginSuperseded(startedEpoch, startedLogoutSeq, attemptId)) {
-    if (resp.ok || getCookieValue('hc_csrf') || data.access_token) {
+  if (
+    isExplicitLoginSuperseded(
+      startedEpoch,
+      startedLogoutSeq,
+      attemptId,
+      startedServerLogoutSeq
+    )
+  ) {
+    if (resp.ok || data.access_token) {
       await revokeSupersededLoginOnServer(data.access_token || null, attemptId);
     }
     return { ok: false, status: resp.status, superseded: true, data: {} };
@@ -776,12 +1071,30 @@ async function performExplicitCookieLogin(endpoint, payload, successMessage, fai
     return { ok: false, status: resp.status, data };
   }
 
-  const loginSeq = bumpCoordLoginSeq();
+  const lockOutcome = await bumpCoordLoginSeqIfNotSuperseded(
+    startedEpoch,
+    startedLogoutSeq,
+    startedServerLogoutSeq,
+    attemptId
+  );
+  if (lockOutcome.superseded) {
+    await revokeSupersededLoginOnServer(data.access_token || null, attemptId);
+    return { ok: false, status: resp.status, superseded: true, data: {} };
+  }
+
+  if (data.auth_coord) {
+    await withCoordLock(() => {
+      syncServerCoord(data.auth_coord);
+    });
+  }
+
+  const loginSeq = lockOutcome.seq;
+  const sessionFamilyId = data.family_id ? String(data.family_id) : null;
   const applied = setActiveAccessToken(
     data.access_token || null,
     data.expires_in || 300,
     successMessage,
-    { explicitLogin: true, sessionLoginSeq: loginSeq }
+    { explicitLogin: true, sessionLoginSeq: loginSeq, familyId: sessionFamilyId }
   );
   const loginEpoch = authEpoch;
   if (applied && authChannel && accessToken) {
@@ -793,16 +1106,22 @@ async function performExplicitCookieLogin(endpoint, payload, successMessage, fai
       explicitLogin: true,
       authEpoch: loginEpoch,
       authGenSeq: loginSeq,
+      familyId: sessionFamilyId,
       startedLogoutSeq,
+      serverCoord: data.auth_coord || {
+        global_seq: serverGlobalSeq,
+        logout_seq: serverLogoutSeq,
+        login_seq: serverLoginSeq,
+      },
       attemptId,
     });
   }
   await hydrateProfileInternal(loginEpoch, startedLogoutSeq);
-  if (!isNonLoginInvalidated(loginEpoch, startedLogoutSeq)) {
+  if (!isNonLoginInvalidated(loginEpoch, startedLogoutSeq, startedServerLogoutSeq)) {
     notifyChange();
   }
   return {
-    ok: !isNonLoginInvalidated(loginEpoch, startedLogoutSeq),
+    ok: !isNonLoginInvalidated(loginEpoch, startedLogoutSeq, startedServerLogoutSeq),
     status: resp.status,
     data,
   };
@@ -919,7 +1238,12 @@ export async function logoutCookie() {
   const cancelledIdsToSend = Array.from(pendingLoginAttempts);
   cancelledIdsToSend.forEach((aid) => cancelledAttemptIds.add(aid));
 
-  const logoutSeq = bumpCoordLogoutSeq();
+  syncCoordFromCookie();
+  const provisionalLogoutSeq = Math.max(localCoordGlobalSeq + 1, localCoordLogoutSeq + 1);
+  localCoordGlobalSeq = provisionalLogoutSeq;
+  localCoordLogoutSeq = provisionalLogoutSeq;
+  localCoordLogoutPendingSeq = provisionalLogoutSeq;
+  writeCoordCookie();
 
   // Engage immediate fail-closed LOGOUT_PENDING barrier & UI scrub BEFORE network wait (M02)
   logoutBarrierActive = true;
@@ -927,6 +1251,7 @@ export async function logoutCookie() {
   authEpoch += 1;
   const logoutEpoch = authEpoch;
   activeSessionLoginSeq = 0;
+  activeSessionFamilyId = null;
   accessToken = null;
   accessExpiresAtMs = 0;
   accessTtlMs = 300000;
@@ -945,148 +1270,211 @@ export async function logoutCookie() {
       type: 'LOGOUT_PENDING',
       reason: lastEventMessage,
       authEpoch: logoutEpoch,
-      authGenSeq: logoutSeq,
+      authGenSeq: provisionalLogoutSeq,
+      provisional: true,
     });
   }
   notifyChange();
 
-  let status = 0;
-  let detail = '';
-  let revokedOnServer = false;
-
-  const isGuestAttemptCancelOnly =
-    cancelledIdsToSend.length > 0 && !csrf && !hintPresent && !bearerSnapshot;
-
-  try {
-    let resp;
-    if (isGuestAttemptCancelOnly) {
-      resp = await fetch('/api/v1/auth/login-attempts/cancel', {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ attempt_ids: cancelledIdsToSend }),
+  const runLogout = (async () => {
+    const logoutSeq = await bumpCoordLogoutSeqAtomic(provisionalLogoutSeq, true);
+    if (authChannel && logoutSeq !== provisionalLogoutSeq) {
+      authChannel.postMessage({
+        type: 'LOGOUT_PENDING',
+        reason: lastEventMessage,
+        authEpoch: logoutEpoch,
+        authGenSeq: logoutSeq,
       });
-    } else {
-      const headers = {
-        'X-Auth-Mode': 'cookie',
-        'X-CSRF-Token': csrf,
-      };
-      if (bearerSnapshot) {
-        headers.Authorization = `${AUTH_HEADER_SCHEME} ${bearerSnapshot}`;
-      }
-      const fetchOpts = {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers,
-      };
-      if (cancelledIdsToSend.length > 0) {
-        headers['Content-Type'] = 'application/json';
-        fetchOpts.body = JSON.stringify({ cancelled_login_attempt_ids: cancelledIdsToSend });
-      }
-      resp = await fetch('/api/v1/auth/logout', fetchOpts);
     }
-    status = resp.status;
-    revokedOnServer = Boolean(resp.ok);
-    if (!revokedOnServer) {
-      try {
-        const errData = await resp.json();
-        detail = errData.detail || '';
-      } catch {
-        detail = '';
+
+    let status = 0;
+    let detail = '';
+    let revokedOnServer = false;
+    let serverCoordPayload = null;
+
+    const isGuestAttemptCancelOnly =
+      cancelledIdsToSend.length > 0 && !csrf && !hintPresent && !bearerSnapshot;
+    const primaryBatch = cancelledIdsToSend.slice(0, MAX_CANCEL_BATCH);
+    const overflowIds = cancelledIdsToSend.slice(MAX_CANCEL_BATCH);
+
+    try {
+      if (isGuestAttemptCancelOnly) {
+        const cancelRes = await postCancelAttemptChunks(cancelledIdsToSend);
+        status = cancelRes.lastStatus;
+        detail = cancelRes.lastDetail;
+        revokedOnServer = Boolean(cancelRes.allOk);
+      } else {
+        const headers = {
+          'X-Auth-Mode': 'cookie',
+          'X-CSRF-Token': csrf,
+        };
+        if (bearerSnapshot) {
+          headers.Authorization = `${AUTH_HEADER_SCHEME} ${bearerSnapshot}`;
+        }
+        const fetchOpts = {
+          method: 'POST',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers,
+        };
+        if (primaryBatch.length > 0) {
+          headers['Content-Type'] = 'application/json';
+          fetchOpts.body = JSON.stringify({ cancelled_login_attempt_ids: primaryBatch });
+        }
+        const resp = await fetch('/api/v1/auth/logout', fetchOpts);
+        status = resp.status;
+        revokedOnServer = Boolean(resp.ok);
+        try {
+          const respData = await resp.json();
+          if (respData && respData.auth_coord) {
+            serverCoordPayload = respData.auth_coord;
+            await withCoordLock(() => {
+              syncServerCoord(respData.auth_coord);
+            });
+          }
+          if (!revokedOnServer) {
+            detail = respData.detail || '';
+          }
+        } catch {
+          if (!revokedOnServer) {
+            detail = '';
+          }
+        }
+        if (overflowIds.length > 0) {
+          const extraCancelRes = await postCancelAttemptChunks(overflowIds);
+          if (!extraCancelRes.allOk) {
+            revokedOnServer = false;
+            if (!detail && extraCancelRes.lastDetail) {
+              detail = extraCancelRes.lastDetail;
+            }
+            if (status === 200 && extraCancelRes.lastStatus) {
+              status = extraCancelRes.lastStatus;
+            }
+          }
+        }
       }
+    } catch {
+      status = 0;
+      revokedOnServer = false;
+      if (overflowIds.length > 0) {
+        await postCancelAttemptChunks(overflowIds).catch(() => {});
+      }
+    } finally {
+      await clearCoordLogoutPending(logoutSeq).catch(() => {});
     }
-  } catch {
-    status = 0;
-    revokedOnServer = false;
-  }
 
-  syncCoordFromCookie();
-  if (authEpoch !== logoutEpoch || localCoordLoginSeq > logoutSeq) {
-    return {
-      ok: false,
-      revokedOnServer: false,
-      canRetryLogout: false,
-      status,
-      detail: detail || 'Superseded by newer authentication state.',
-    };
-  }
+    syncCoordFromCookie();
+    if (authEpoch !== logoutEpoch || localCoordLoginSeq > logoutSeq) {
+      return {
+        ok: false,
+        revokedOnServer: false,
+        canRetryLogout: false,
+        status,
+        detail: detail || 'Superseded by newer authentication state.',
+      };
+    }
 
-  if (revokedOnServer) {
-    clearPrivateState(`خروج امن از نشست با تأیید سرور انجام شد (HTTP ${status}).`, {
-      broadcastLogout: true,
+    if (revokedOnServer) {
+      clearPrivateState(`خروج امن از نشست با تأیید سرور انجام شد (HTTP ${status}).`, {
+        broadcastLogout: true,
+        logoutBarrier: true,
+        retryableLogout: false,
+        statusLabel: 'UNAUTHENTICATED',
+        errorText: '',
+        logoutSeq,
+        suppressBump: true,
+        preservePendingAttempts: true,
+      });
+      return { ok: true, revokedOnServer: true, canRetryLogout: false, status, detail: '' };
+    }
+
+    const credsStillPresent = Boolean(getCookieValue('hc_csrf')) && hasSessionHintCookie();
+    const errCodeText = status ? `HTTP ${status}` : 'خطای شبکه';
+
+    if (!credsStillPresent && status === 401) {
+      clearPrivateState(`نشست پیش‌تر منقضی شده و کوکی‌های مرورگر پاک شدند (${errCodeText}).`, {
+        broadcastLogout: true,
+        logoutBarrier: true,
+        retryableLogout: false,
+        statusLabel: 'EXPIRED',
+        errorText: detail,
+        logoutSeq,
+        suppressBump: true,
+        preservePendingAttempts: true,
+      });
+      return { ok: false, revokedOnServer: false, canRetryLogout: false, status, detail };
+    }
+
+    const retryable = Boolean(credsStillPresent);
+    const reasonMessage = retryable
+      ? `هشدار: خروج محلی انجام شد اما لغو نشست روی سرور تأیید نشد (${errCodeText}).`
+      : `هشدار: کوکی‌های قابل مشاهده نشست در مرورگر پاک شده‌اند اما لغو نشست در سرور و پایگاه‌داده تأیید نشد (${errCodeText}).`;
+    const errorText = retryable
+      ? `لغو نشست روی سرور تأیید نشد (${errCodeText}${detail ? ` - ${detail}` : ''}). نشست سروری ممکن است هنوز فعال باشد؛ لطفاً دوباره خروج سروری را بزنید.`
+      : `سرور پاسخ تأییدشده‌ای برای ابطال کامل نشست بازنگرداند (${errCodeText}${detail ? ` - ${detail}` : ''}). به دلیل نبود کوکی‌های مرورگر امکان ارسال مجدد درخواست خروج وجود ندارد و وضعیت نهایی ابطال در سرور/پایگاه‌داده تأییدنشده است؛ در صورت نیاز دوباره وارد شوید.`;
+
+    clearPrivateState(reasonMessage, {
+      broadcastLogout: false,
       logoutBarrier: true,
-      retryableLogout: false,
-      statusLabel: 'UNAUTHENTICATED',
-      errorText: '',
-      logoutSeq,
-      suppressBump: true,
-    });
-    return { ok: true, revokedOnServer: true, canRetryLogout: false, status, detail: '' };
-  }
-
-  const credsStillPresent = Boolean(getCookieValue('hc_csrf')) && hasSessionHintCookie();
-  const errCodeText = status ? `HTTP ${status}` : 'خطای شبکه';
-
-  if (!credsStillPresent && status === 401) {
-    clearPrivateState(`نشست پیش‌تر منقضی شده و کوکی‌های مرورگر پاک شدند (${errCodeText}).`, {
-      broadcastLogout: true,
-      logoutBarrier: true,
-      retryableLogout: false,
-      statusLabel: 'EXPIRED',
-      errorText: detail,
-      logoutSeq,
-      suppressBump: true,
-    });
-    return { ok: false, revokedOnServer: false, canRetryLogout: false, status, detail };
-  }
-
-  const retryable = Boolean(credsStillPresent);
-  const reasonMessage = retryable
-    ? `هشدار: خروج محلی انجام شد اما لغو نشست روی سرور تأیید نشد (${errCodeText}).`
-    : `هشدار: کوکی‌های قابل مشاهده نشست در مرورگر پاک شده‌اند اما لغو نشست در سرور و پایگاه‌داده تأیید نشد (${errCodeText}).`;
-  const errorText = retryable
-    ? `لغو نشست روی سرور تأیید نشد (${errCodeText}${detail ? ` - ${detail}` : ''}). نشست سروری ممکن است هنوز فعال باشد؛ لطفاً دوباره خروج سروری را بزنید.`
-    : `سرور پاسخ تأییدشده‌ای برای ابطال کامل نشست بازنگرداند (${errCodeText}${detail ? ` - ${detail}` : ''}). به دلیل نبود کوکی‌های مرورگر امکان ارسال مجدد درخواست خروج وجود ندارد و وضعیت نهایی ابطال در سرور/پایگاه‌داده تأییدنشده است؛ در صورت نیاز دوباره وارد شوید.`;
-
-  clearPrivateState(reasonMessage, {
-    broadcastLogout: false,
-    logoutBarrier: true,
-    retryableLogout: retryable,
-    statusLabel: 'REMOTE_REVOKE_FAILED',
-    errorText,
-    logoutSeq,
-    suppressBump: true,
-  });
-  if (authChannel) {
-    authChannel.postMessage({
-      type: 'LOGOUT_FAILED_LOCAL_SCRUB',
-      status,
-      canRetryLogout: retryable,
-      reason: reasonMessage,
+      retryableLogout: retryable,
+      statusLabel: 'REMOTE_REVOKE_FAILED',
       errorText,
-      authEpoch,
-      authGenSeq: logoutSeq,
+      logoutSeq,
+      suppressBump: true,
+      preservePendingAttempts: true,
     });
+    if (authChannel) {
+      authChannel.postMessage({
+        type: 'LOGOUT_FAILED_LOCAL_SCRUB',
+        status,
+        canRetryLogout: retryable,
+        reason: reasonMessage,
+        errorText,
+        authEpoch,
+        authGenSeq: logoutSeq,
+        serverCoord: serverCoordPayload || {
+          global_seq: serverGlobalSeq,
+          logout_seq: serverLogoutSeq,
+          login_seq: serverLoginSeq,
+        },
+      });
+    }
+    return { ok: false, revokedOnServer: false, canRetryLogout: retryable, status, detail };
+  })();
+
+  inFlightLogoutPromise = runLogout;
+  try {
+    return await runLogout;
+  } finally {
+    if (inFlightLogoutPromise === runLogout) {
+      inFlightLogoutPromise = null;
+    }
   }
-  return { ok: false, revokedOnServer: false, canRetryLogout: retryable, status, detail };
 }
 
 export function initAuthLifecycle(onStateChange) {
   stateChangeListener = onStateChange;
-  syncCoordFromCookie();
+  const initialCoord = syncCoordFromCookie();
+  const isLogoutInFlight = initialCoord.lp > 0 && initialCoord.lp >= initialCoord.li;
+  const isServerLogoutConfirmed = initialCoord.slo > initialCoord.sli;
+  if (isLogoutInFlight || isServerLogoutConfirmed) {
+    logoutBarrierActive = true;
+  }
 
   if (authChannel) {
     authChannel.onmessage = (event) => {
       const msg = event.data || {};
       syncCoordFromCookie();
+      if (msg.serverCoord) {
+        syncServerCoord(msg.serverCoord);
+      }
 
       if (msg.type === 'TOKEN_REFRESHED' && msg.accessToken) {
         const isExplicit = Boolean(msg.explicitLogin);
         const msgSeq = Number(msg.authGenSeq || 0);
         const msgStartedLogoutSeq = Number(msg.startedLogoutSeq || 0);
         const msgAttemptId = typeof msg.attemptId === 'string' ? msg.attemptId : null;
+        const msgFamilyId = typeof msg.familyId === 'string' && msg.familyId ? msg.familyId : null;
 
         if (isExplicit) {
           if (
@@ -1097,21 +1485,26 @@ export function initAuthLifecycle(onStateChange) {
           ) {
             return;
           }
-          syncCoordFromSeq(msgSeq, 'login');
+          syncCoordFromSeq(msgSeq, 'login', msg.serverCoord || null);
         } else {
-          if (logoutBarrierActive || (msgSeq > 0 && msgSeq <= localCoordLogoutSeq)) {
+          if (
+            logoutBarrierActive ||
+            msgSeq <= 0 ||
+            msgSeq <= localCoordLogoutSeq ||
+            msgSeq < localCoordLoginSeq ||
+            (activeSessionLoginSeq > 0 && msgSeq < activeSessionLoginSeq) ||
+            (activeSessionFamilyId && msgFamilyId && msgFamilyId !== activeSessionFamilyId)
+          ) {
             return;
           }
-          if (msgSeq > 0) {
-            syncCoordFromSeq(msgSeq, 'login');
-          }
+          syncCoordFromSeq(msgSeq, 'login', msg.serverCoord || null);
         }
 
         const applied = setActiveAccessToken(
           msg.accessToken,
           Math.max(1, Math.round(Number(msg.accessTtlMs || accessTtlMs || 300000) / 1000)),
           'توکن کوتاه‌عمر از طریق BroadcastChannel همگام‌سازی شد.',
-          { explicitLogin: isExplicit, sessionLoginSeq: msgSeq }
+          { explicitLogin: isExplicit, sessionLoginSeq: msgSeq, familyId: msgFamilyId }
         );
         if (!applied) {
           return;
@@ -1135,8 +1528,14 @@ export function initAuthLifecycle(onStateChange) {
             accessTtlMs,
             explicitLogin: false,
             authEpoch,
-            authGenSeq: activeSessionLoginSeq || localCoordLoginSeq,
+            authGenSeq: activeSessionLoginSeq || localCoordLoginSeq || 1,
+            familyId: activeSessionFamilyId,
             startedLogoutSeq: localCoordLogoutSeq,
+            serverCoord: {
+              global_seq: serverGlobalSeq,
+              logout_seq: serverLogoutSeq,
+              login_seq: serverLoginSeq,
+            },
           });
         }
       } else if (msg.type === 'LOGOUT_PENDING') {
@@ -1145,7 +1544,7 @@ export function initAuthLifecycle(onStateChange) {
           return;
         }
         if (msgSeq > 0) {
-          syncCoordFromSeq(msgSeq, 'logout');
+          syncCoordFromSeq(msgSeq, 'logout', msg.serverCoord || null);
         }
         clearPrivateState(msg.reason || 'خروج امن در تب دیگر آغاز شد...', {
           broadcastLogout: false,
@@ -1161,7 +1560,7 @@ export function initAuthLifecycle(onStateChange) {
           return;
         }
         if (msgSeq > 0) {
-          syncCoordFromSeq(msgSeq, 'logout');
+          syncCoordFromSeq(msgSeq, 'logout', msg.serverCoord || null);
         }
         clearPrivateState('خروج هم‌زمان از تب دیگر دریافت و اعمال شد.', {
           broadcastLogout: false,
@@ -1177,7 +1576,7 @@ export function initAuthLifecycle(onStateChange) {
           return;
         }
         if (msgSeq > 0) {
-          syncCoordFromSeq(msgSeq, 'logout');
+          syncCoordFromSeq(msgSeq, 'logout', msg.serverCoord || null);
         }
         clearPrivateState(
           msg.reason || 'هشدار: خروج هم‌زمان در تب دیگر روی سرور تأیید نشد؛ حافظه محلی پاک‌سازی شد.',
@@ -1197,21 +1596,25 @@ export function initAuthLifecycle(onStateChange) {
 
   window.addEventListener('pageshow', (event) => {
     if (event.persisted) {
+      const c = syncCoordFromCookie();
       const hasCookieHint = hasSessionHintCookie();
+      const pageLogoutInFlight = c.lp > 0 && c.lp >= c.li;
+      const pageServerConfirmed = c.slo > c.sli;
+      const logoutBarred = !hasCookieHint || pageLogoutInFlight || pageServerConfirmed;
       clearPrivateState('بازیابی از BFCache شناسایی و حافظه نشست پاک‌سازی شد.', {
         broadcastLogout: false,
-        logoutBarrier: !hasCookieHint,
+        logoutBarrier: logoutBarred,
         retryableLogout: false,
         statusLabel: 'UNAUTHENTICATED',
         suppressBump: true,
       });
-      if (hasCookieHint) {
+      if (!logoutBarred) {
         refreshSessionCoordinated({ force: true }).catch(() => {});
       }
     }
   });
 
-  if (hasSessionHintCookie()) {
+  if (hasSessionHintCookie() && !logoutBarrierActive) {
     refreshSessionCoordinated({ force: false }).catch(() => {});
   }
 }
