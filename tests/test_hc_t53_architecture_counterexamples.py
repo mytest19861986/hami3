@@ -1,14 +1,14 @@
 """
 Pre-Implementation Deterministic Counterexample Suite for HC-T52 / HC-T53 (HC-CMD-053 / HC-CMD-054).
 Baseline: BL-HAMICARD-PRD-V1 | Base SHA: e7c2bb81f7278e1d9a0fe8ca75e56d06fec753fb
-Revision: HC-T52 Revision 2 (closes R2-T52-REV1-H01..H07, REV1-M01..M04, R2-T52-V4-F01..F08)
+Revision: HC-T52 Revision 2.1 (closes Reviewer #2 HIGH-01..05, MEDIUM M-01..05, plus REV1 & V4)
 
-RED_TEST_MATRIX (`CE-01..CE-14`):
+RED_TEST_MATRIX (`CE-01..CE-16`):
 - CE-01  (C2-H01): Delayed attempt cancellation `[B1]` never advances logout_seq or revokes newer `F3`.
 - CE-02  (C2-H02/H04/REV1-H03): Deterministic Phase A->Phase B PG fence barrier racing `/logout` + reverse post-logout schedule.
-- CE-03a (C2-H02/F06/REV1-H02): PG outage mid-revocation fails 503, preserves ACTIVE rows; retry revokes F1 while separate device F2 stays ACTIVE.
+- CE-03a (C2-H02/F06/HIGH-03): PG outage injected mid-tx AFTER real DB UPDATE mutation fails 503 & rolls back cleanly; retry revokes F1 while separate device F2 stays ACTIVE.
 - CE-03b (C2-H02/F06/REV1-M01): Redis outage leaves PENDING_REVOKE durable; forced overlapping dual workers (`SKIP LOCKED`) partition disjoint batches.
-- CE-04  (C2-H03): Two fresh Playwright tabs concurrently clicking Login converge to 1 `hc_browser`; logout revokes all.
+- CE-04  (C2-H03/HIGH-02): Two fresh Playwright tabs initialized & logged in concurrently under deterministic server-side `/coord/session` boundary barrier converge to 1 `hc_browser`.
 - CE-05  (C2-H04): Every `hc_coord` write runs strictly inside `navigator.locks('hamicard_phase3_coord')`.
 - CE-06  (C2-M01/L01): Forged `Authorization: Bearer fake` cannot elevate `/login-attempts/cancel` quota above 20 reqs/120s.
 - CE-07a (C2-M01/F02): Cross-user AND anonymous same-browser (no capability) cancel against bound session blocked (403); capability succeeds.
@@ -17,16 +17,18 @@ RED_TEST_MATRIX (`CE-01..CE-14`):
 - CE-08b (F04/F05/REV1-H04): Normal-TTL (120s) `/session/rebind-cookie` adversarial matrix (old family, bad origin, missing/wrong browser, refresh & logout race).
 - CE-08c (F04/F05/REV1-H04): Isolated expired-bearer JWT rejected 401 on `/session/rebind-cookie`.
 - CE-09  (C2-M03): Both 429 & 503 cancellation failures preserve `canRetryLogout`, `unresolvedAttemptCount >= 1`, and error copy.
-- CE-10  (C2-H01/AC-15): Browser A logout/cancel keeps multi-device Browser B and unrelated User B sessions ACTIVE.
-- CE-11a (F01/REV1-M04): Forged `started_server_logout_seq=999` bypass rejected 409 on `/password/login`.
-- CE-11b (F01/REV1-M04): Forged `started_server_logout_seq=999` bypass rejected 409 on `/otp/verify`.
+- CE-10  (C2-H01/AC-15/M-01): Browser A logout/cancel keeps multi-device Browser B and unrelated User B sessions ACTIVE (strict 200 attempt registration).
+- CE-11a (F01/HIGH-04): Pre-logout registered attempt -> logout -> delayed `/password/login` with forged `started_server_logout_seq=999` rejected 409.
+- CE-11b (F01/HIGH-04): Pre-logout registered OTP attempt -> logout -> delayed `/otp/verify` with forged `started_server_logout_seq=999` rejected 409.
 - CE-11c (F03/REV1-H05/M04): Concurrent duplicate `attempt_id` creates <= 1 family & rejects duplicate 409; PG FK rejects mismatched `(attempt_id, family_id)`.
-- CE-12a (F08/REV1-M04): Continuous Lua ZSET sliding-window boundary pruning & 429 non-pollution.
+- CE-12a (F08/M-02): Continuous Lua ZSET sliding-window boundary pruning & 429 non-pollution verified across all 4 `:anon:` buckets.
 - CE-12b (REV1-H06): Mixed `:anon:` (120s) and `:auth:` (300s) namespace isolation prevents anonymous pruning/shortening of authenticated entries.
-- CE-12c (F08/REV1-M04): Weighted attempt-ID quota (`64` unauth IDs) & Redis outage 503 fail-closed.
+- CE-12c (F08/M-02): Weighted attempt-ID quota (`64` unauth IDs) & Redis outage 503 fail-closed with 0 PG write mutations.
 - CE-13a (F07): Missing `navigator.locks` fails closed (`WEB_LOCKS_UNAVAILABLE`) with zero login traffic.
 - CE-13b (F07/REV1-M02): Forged `hc_coord.bi=1` WITH normal `navigator.locks` still triggers `/coord/session` & cannot bypass validation.
 - CE-14  (REV1-H07/H01): Pre-Phase-A delayed `/password/login` after `/login-attempts/start` rejected 409, unregistered `hc_browser` login rejected 409, & competing lock-order stress completes with 0 deadlocks.
+- CE-15  (M-05): Unregistered & pre-Phase-A delayed `/otp/verify` rejected 409 strictly BEFORE `AuthService.authenticate_via_otp` / OTP consumption.
+- CE-16  (REV1-M03/M-03): Adversarial GC preserves `STARTED`/`IN_FLIGHT`/`ACTIVE`/`PENDING_REVOKE` and unexpired tombstones while safely purging expired tombstones & >10d revoked families.
 """
 
 import asyncio
@@ -152,6 +154,7 @@ async def _start_test_server(
     access_ttl: int = 300,
     thread_name: str = "hc-t53-uvicorn",
     allowed_origins: list[str] | None = None,
+    asgi_wrapper=None,
 ):
     await _reset_deps()
     port = _find_free_port()
@@ -165,8 +168,10 @@ async def _start_test_server(
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", ",".join(origins))
     monkeypatch.delenv("COOKIE_SECURE", raising=False)
 
+    app = create_app()
+    asgi_app = asgi_wrapper(app) if asgi_wrapper else app
     server = uvicorn.Server(
-        uvicorn.Config(create_app(), host="127.0.0.1", port=port, log_level="warning")
+        uvicorn.Config(asgi_app, host="127.0.0.1", port=port, log_level="warning")
     )
     thread = threading.Thread(target=server.run, name=thread_name, daemon=True)
     thread.start()
@@ -231,19 +236,18 @@ def _clear_rate_limit_keys() -> None:
         r.close()
 
 
-async def _register_attempt_if_supported(
+async def _register_attempt_required(
     client: httpx.AsyncClient, attempt_id: str, *, flow: str = "PASSWORD"
-) -> dict | None:
+) -> dict:
     resp = await client.post(
         "/api/v1/auth/login-attempts/start",
         json={"attempt_id": attempt_id, "flow": flow},
     )
-    if resp.status_code == 200:
-        return resp.json()
-    assert resp.status_code == 404, (
-        f"Unexpected /login-attempts/start status={resp.status_code}: {resp.text}"
+    assert resp.status_code == 200, (
+        f"M-01: Mandatory /login-attempts/start failed (no 404 fallback permitted): "
+        f"status={resp.status_code} body={resp.text}"
     )
-    return None
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +272,7 @@ async def test_ce01_delayed_attempt_cancel_preserves_newer_session(monkeypatch):
 
                 # 1. Tab B creates session F1 via attempt B1
                 b1 = f"hc_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client, b1)
+                await _register_attempt_required(client, b1)
                 r1 = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -288,7 +292,7 @@ async def test_ce01_delayed_attempt_cancel_preserves_newer_session(monkeypatch):
 
                 # 3. Tab A logs in again with new attempt B3 -> creates valid session F3
                 b3 = f"hc_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client, b3)
+                await _register_attempt_required(client, b3)
                 r3 = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -487,7 +491,7 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                 await client1.post("/api/v1/auth/coord/session")
                 shared_bid = client1.cookies.get("hc_browser")
                 a1_id = f"hc_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client1, a1_id)
+                await _register_attempt_required(client1, a1_id)
                 r1 = await client1.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -503,7 +507,7 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                 bid2 = client2.cookies.get("hc_browser")
                 assert bid2 and bid2 != shared_bid
                 a2_id = f"hc_dev2_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client2, a2_id)
+                await _register_attempt_required(client2, a2_id)
                 r2 = await client2.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -513,13 +517,8 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                 f2 = uuid.UUID(r2.json()["family_id"])
 
                 fail_pg = {"active": True}
-                orig_revoke = SessionService.revoke_session_family
+                tx_mutations: list[str] = []
                 app_pool = await deps.get_db_pool()
-
-                async def faulty_revoke(self, family_id, reason="LOGOUT"):
-                    if fail_pg["active"]:
-                        raise asyncpg.PostgresConnectionError("Simulated transient PG revocation error")
-                    return await orig_revoke(self, family_id, reason=reason)
 
                 class _FaultyConnWrapper:
                     def __init__(self, conn):
@@ -529,9 +528,26 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                         return getattr(self._conn, item)
 
                     async def execute(self, query, *args, **kwargs):
-                        if fail_pg["active"] and "refresh_tokens" in query and "REVOKED" in query:
-                            raise asyncpg.PostgresConnectionError("Simulated transient PG revocation error")
-                        return await self._conn.execute(query, *args, **kwargs)
+                        q_upper = " ".join(str(query).upper().split())
+                        is_write = any(
+                            kw in q_upper for kw in ("UPDATE ", "INSERT ", "DELETE ")
+                        )
+                        if fail_pg["active"] and "UPDATE REFRESH_TOKENS" in q_upper and "REVOKED" in q_upper:
+                            if not tx_mutations:
+                                # Execute this real SQL UPDATE inside the open tx FIRST, then crash before commit
+                                await self._conn.execute(query, *args, **kwargs)
+                                tx_mutations.append(f"EXECUTED_BEFORE_CRASH:{q_upper[:80]}")
+                                raise asyncpg.PostgresConnectionError(
+                                    "Simulated mid-tx PG crash immediately after refresh_tokens UPDATE"
+                                )
+                            tx_mutations.append(f"CRASH_AFTER_PRIOR_MUTATION:{q_upper[:80]}")
+                            raise asyncpg.PostgresConnectionError(
+                                "Simulated mid-tx PG crash after prior DB mutation"
+                            )
+                        res = await self._conn.execute(query, *args, **kwargs)
+                        if fail_pg["active"] and is_write:
+                            tx_mutations.append(f"EXECUTED:{q_upper[:80]}")
+                        return res
 
                 class _FaultyAcquireCtx:
                     def __init__(self, ctx):
@@ -553,7 +569,6 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                     def acquire(self, *args, **kwargs):
                         return _FaultyAcquireCtx(self._inner.acquire(*args, **kwargs))
 
-                monkeypatch.setattr(SessionService, "revoke_session_family", faulty_revoke)
                 monkeypatch.setattr(deps, "_pool", _FaultyPoolProxy(app_pool))
 
                 async with httpx.AsyncClient(
@@ -564,13 +579,16 @@ async def test_ce03a_pg_revocation_outage_remains_durable_and_fails_closed(monke
                     fail_lo = await f1_client.post("/api/v1/auth/logout")
                     assert fail_lo.status_code == 503
 
-                # PG discovery state MUST still preserve BOTH F1 & F2 as ACTIVE until retry commits!
+                assert any(m.startswith("EXECUTED") for m in tx_mutations), (
+                    f"HIGH-03: Injected PG fault raised without executing an actual SQL mutation first: {tx_mutations}"
+                )
+
+                # Rolled-back transaction MUST preserve both F1 & F2 as ACTIVE and keep logout_seq=0!
                 assert await svc.verify_active_family(f1, uid) is True
                 assert await svc.verify_active_family(f2, uid) is True
 
                 fail_pg["active"] = False
                 monkeypatch.setattr(deps, "_pool", app_pool)
-                monkeypatch.setattr(SessionService, "revoke_session_family", orig_revoke)
 
                 async with httpx.AsyncClient(
                     base_url=base_url,
@@ -608,7 +626,7 @@ async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(mon
                 await client.post("/api/v1/auth/coord/session")
                 shared_bid = client.cookies.get("hc_browser")
                 a3_id = f"hc_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client, a3_id)
+                await _register_attempt_required(client, a3_id)
                 r_login = await client.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -800,57 +818,87 @@ async def test_ce03b_redis_outage_durable_pending_and_concurrent_reconcilers(mon
 async def test_ce04_two_fresh_tabs_concurrent_bootstrap_converge_to_one_browser_id(monkeypatch):
     _clear_rate_limit_keys()
     uid, mobile = await _create_test_user(["USER"])
-    server, thread, base_url = await _start_test_server(monkeypatch)
+    server_coord_hits: list[dict] = []
+    barrier_second_unbootstrapped = asyncio.Event()
+
+    def _coord_barrier_wrapper(app):
+        async def _wrapped(scope, receive, send):
+            if (
+                scope.get("type") == "http"
+                and scope.get("method") == "POST"
+                and scope.get("path") == "/api/v1/auth/coord/session"
+            ):
+                hdrs = {k.lower(): v for k, v in scope.get("headers", [])}
+                cookie_val = hdrs.get(b"cookie", b"").decode("latin-1")
+                has_browser = "hc_browser=" in cookie_val
+                server_coord_hits.append(
+                    {"has_browser": has_browser, "idx": len(server_coord_hits) + 1, "t": time.monotonic()}
+                )
+                if not has_browser:
+                    if sum(1 for h in server_coord_hits if not h["has_browser"]) == 1:
+                        # Hold the first unbootstrapped request deterministically at server /coord/session boundary
+                        try:
+                            await asyncio.wait_for(barrier_second_unbootstrapped.wait(), timeout=1.2)
+                        except TimeoutError:
+                            pass
+                    else:
+                        barrier_second_unbootstrapped.set()
+            await app(scope, receive, send)
+
+        return _wrapped
+
+    server, thread, base_url = await _start_test_server(
+        monkeypatch, asgi_wrapper=_coord_barrier_wrapper
+    )
     try:
         async with async_playwright() as p:
             browser = await _launch_headless_chromium(p)
             context = await browser.new_context()
             coord_calls = []
-            second_unbootstrapped_seen = asyncio.Event()
 
             async def handle_coord(route):
                 cookie_hdr = route.request.headers.get("cookie", "")
                 coord_calls.append(cookie_hdr)
-                if "hc_browser=" not in cookie_hdr and len(coord_calls) == 1:
-                    try:
-                        await asyncio.wait_for(second_unbootstrapped_seen.wait(), timeout=2.0)
-                    except TimeoutError:
-                        pass
-                elif "hc_browser=" not in cookie_hdr:
-                    second_unbootstrapped_seen.set()
                 await route.continue_()
 
             await context.route("**/api/v1/auth/coord/session", handle_coord)
 
-            page_a = await context.new_page()
-            page_b = await context.new_page()
+            page_a, page_b = await asyncio.gather(context.new_page(), context.new_page())
             try:
-                await page_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
-                await page_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle")
-                await page_a.wait_for_function(
-                    "() => document.getElementById('hc-pwd-form')?.dataset.hcBound === '1'"
+                await asyncio.gather(
+                    page_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle"),
+                    page_b.goto(f"{base_url}/phase3/#/auth/shell", wait_until="networkidle"),
                 )
-                await page_b.wait_for_function(
-                    "() => document.getElementById('hc-pwd-form')?.dataset.hcBound === '1'"
+                await asyncio.gather(
+                    page_a.wait_for_function(
+                        "() => document.getElementById('hc-pwd-form')?.dataset.hcBound === '1'"
+                    ),
+                    page_b.wait_for_function(
+                        "() => document.getElementById('hc-pwd-form')?.dataset.hcBound === '1'"
+                    ),
                 )
-                await page_a.fill("#hc-pwd-mobile", mobile)
-                await page_a.fill("#hc-pwd-input", "HamiCounter!901")
-                await page_b.fill("#hc-pwd-mobile", mobile)
-                await page_b.fill("#hc-pwd-input", "HamiCounter!901")
+                await asyncio.gather(
+                    page_a.fill("#hc-pwd-mobile", mobile),
+                    page_b.fill("#hc-pwd-mobile", mobile),
+                )
+                await asyncio.gather(
+                    page_a.fill("#hc-pwd-input", "HamiCounter!901"),
+                    page_b.fill("#hc-pwd-input", "HamiCounter!901"),
+                )
 
                 await asyncio.gather(
-                    page_a.click("#hc-pwd-login-btn"),
-                    page_b.click("#hc-pwd-login-btn"),
+                    page_a.evaluate("() => document.getElementById('hc-pwd-login-btn').click()"),
+                    page_b.evaluate("() => document.getElementById('hc-pwd-login-btn').click()"),
                 )
                 await asyncio.gather(
                     _wait_selector_text(page_a, "#hc-auth-status-badge", "AUTHENTICATED"),
                     _wait_selector_text(page_b, "#hc-auth-status-badge", "AUTHENTICATED"),
                 )
 
-                unbootstrapped_calls = [c for c in coord_calls if "hc_browser=" not in c]
-                assert len(unbootstrapped_calls) == 1, (
-                    f"C2-H03: Two fresh tabs split browser bootstrap! Sent {len(unbootstrapped_calls)} "
-                    f"unbootstrapped /coord/session calls without hc_browser (calls={coord_calls})"
+                server_unbootstrapped = [h for h in server_coord_hits if not h["has_browser"]]
+                assert len(server_unbootstrapped) == 1, (
+                    f"C2-H03/HIGH-02: Server /coord/session barrier caught {len(server_unbootstrapped)} "
+                    f"concurrent unbootstrapped requests! server_trace={server_coord_hits}, client_calls={coord_calls}"
                 )
 
                 await page_a.click("#hc-logout-btn")
@@ -999,11 +1047,8 @@ async def test_ce07a_cross_user_and_anonymous_same_browser_cancel_blocked(monkey
                 assert shared_bid_a
 
                 attempt_a = f"hc_usera_{uuid.uuid4().hex}"
-                start_a = await client_a.post(
-                    "/api/v1/auth/login-attempts/start",
-                    json={"attempt_id": attempt_a, "flow": "PASSWORD"},
-                )
-                cap_a = start_a.json().get("cancel_capability") if start_a.status_code == 200 else None
+                reg_a = await _register_attempt_required(client_a, attempt_a)
+                cap_a = reg_a["cancel_capability"]
 
                 ra = await client_a.post(
                     "/api/v1/auth/password/login",
@@ -1017,7 +1062,7 @@ async def test_ce07a_cross_user_and_anonymous_same_browser_cancel_blocked(monkey
             async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_b:
                 await client_b.post("/api/v1/auth/coord/session")
                 attempt_b = f"hc_userb_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client_b, attempt_b)
+                await _register_attempt_required(client_b, attempt_b)
                 rb = await client_b.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -1284,7 +1329,7 @@ async def test_ce08b_rebind_cookie_adversarial_matrix(monkeypatch):
 
                 # Login F1 -> superseded by newer login F2 on SAME browser (LATEST_FAMILY_WINS)
                 f1_aid = f"hc_f1_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client_a, f1_aid)
+                await _register_attempt_required(client_a, f1_aid)
                 r1 = await client_a.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -1295,7 +1340,7 @@ async def test_ce08b_rebind_cookie_adversarial_matrix(monkeypatch):
                 f1 = uuid.UUID(r1.json()["family_id"])
 
                 f2_aid = f"hc_f2_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(client_a, f2_aid)
+                await _register_attempt_required(client_a, f2_aid)
                 r2 = await client_a.post(
                     "/api/v1/auth/password/login",
                     headers={"X-Auth-Mode": "cookie"},
@@ -1393,7 +1438,7 @@ async def test_ce08c_rebind_cookie_rejects_expired_bearer_jwt(monkeypatch):
         async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client_a:
             await client_a.post("/api/v1/auth/coord/session")
             exp_aid = f"hc_exp_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client_a, exp_aid)
+            await _register_attempt_required(client_a, exp_aid)
             r_login = await client_a.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
@@ -1539,9 +1584,9 @@ async def test_ce10_logout_isolates_multidevice_and_unrelated_user(monkeypatch):
                 a1_id = f"hc_a1_{uuid.uuid4().hex}"
                 a2_id = f"hc_a2_{uuid.uuid4().hex}"
                 ub_id = f"hc_ub_{uuid.uuid4().hex}"
-                await _register_attempt_if_supported(dev_a1, a1_id)
-                await _register_attempt_if_supported(dev_a2, a2_id)
-                await _register_attempt_if_supported(user_b, ub_id)
+                await _register_attempt_required(dev_a1, a1_id)
+                await _register_attempt_required(dev_a2, a2_id)
+                await _register_attempt_required(user_b, ub_id)
 
                 r_a1 = await dev_a1.post(
                     "/api/v1/auth/password/login",
@@ -1608,21 +1653,24 @@ async def test_ce11a_forged_logout_seq_password_login_rejected(monkeypatch):
             await client.post("/api/v1/auth/coord/session")
 
             init_aid = f"hc_init_pwd_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client, init_aid)
+            await _register_attempt_required(client, init_aid)
             r1 = await client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
                 json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": init_aid},
             )
             assert r1.status_code == 200
+            # Register delayed attempt BEFORE logout (started_logout_seq == 0) -> then logout -> then delayed forged 999
+            forged_aid = f"hc_forge_pwd_{uuid.uuid4().hex}"
+            st_forged = await _register_attempt_required(client, forged_aid)
+            assert st_forged["started_logout_seq"] == 0
+
             lo1 = await client.post(
                 "/api/v1/auth/logout",
                 headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
             )
             assert lo1.status_code == 200
 
-            forged_aid = f"hc_forge_pwd_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client, forged_aid)
             forged_pwd = await client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
@@ -1634,7 +1682,7 @@ async def test_ce11a_forged_logout_seq_password_login_rejected(monkeypatch):
                 },
             )
             assert forged_pwd.status_code == 409, (
-                f"F01: Forged started_server_logout_seq=999 bypassed password login rejection! "
+                f"F01/HIGH-04: Pre-logout attempt with forged started_server_logout_seq=999 bypassed password rejection! "
                 f"status={forged_pwd.status_code}"
             )
             assert await _count_active_refresh_tokens(uid) == 0
@@ -1657,24 +1705,27 @@ async def test_ce11b_forged_logout_seq_otp_verify_rejected(monkeypatch):
             await client.post("/api/v1/auth/coord/session")
 
             init_aid = f"hc_init_otp_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client, init_aid)
+            await _register_attempt_required(client, init_aid)
             r1 = await client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
                 json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": init_aid},
             )
             assert r1.status_code == 200
+            # Register OTP attempt BEFORE logout (started_logout_seq == 0), execute logout, then submit delayed forged 999
+            await OtpService(r).request_otp(mobile)
+            otp_code = r.get(f"otp:code:{mobile}")
+            assert otp_code
+            forged_otp_aid = f"hc_forge_otp_{uuid.uuid4().hex}"
+            st_forged_otp = await _register_attempt_required(client, forged_otp_aid, flow="OTP")
+            assert st_forged_otp["started_logout_seq"] == 0
+
             lo1 = await client.post(
                 "/api/v1/auth/logout",
                 headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
             )
             assert lo1.status_code == 200
 
-            await OtpService(r).request_otp(mobile)
-            otp_code = r.get(f"otp:code:{mobile}")
-            assert otp_code
-            forged_otp_aid = f"hc_forge_otp_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client, forged_otp_aid, flow="OTP")
             forged_otp = await client.post(
                 "/api/v1/auth/otp/verify",
                 headers={"X-Auth-Mode": "cookie"},
@@ -1686,7 +1737,8 @@ async def test_ce11b_forged_logout_seq_otp_verify_rejected(monkeypatch):
                 },
             )
             assert forged_otp.status_code == 409, (
-                f"F01: OTP verify accepted forged started_server_logout_seq=999! status={forged_otp.status_code}"
+                f"F01/HIGH-04: Pre-logout OTP attempt with forged started_server_logout_seq=999 bypassed rejection! "
+                f"status={forged_otp.status_code}"
             )
             assert await _count_active_refresh_tokens(uid) == 0
     finally:
@@ -1709,7 +1761,7 @@ async def test_ce11c_concurrent_duplicate_attempt_id_and_binding_fk_enforced(mon
             await client.post("/api/v1/auth/coord/session")
 
             dup_aid = f"hc_dup_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(client, dup_aid)
+            await _register_attempt_required(client, dup_aid)
             d1, d2 = await asyncio.gather(
                 client.post(
                     "/api/v1/auth/password/login",
@@ -1793,9 +1845,19 @@ async def test_ce12a_sliding_window_zset_boundary_and_429_non_pollution(monkeypa
             )
             assert r429.status_code == 429
 
-            ip_req_key = "hc:rl:cancel:anon:ip:127.0.0.1:req"
-            assert r.type(ip_req_key) == "zset", f"F08: Expected ZSET bucket, got type={r.type(ip_req_key)!r}"
-            assert r.zcard(ip_req_key) == 20, f"F08: 429 request polluted ZSET count={r.zcard(ip_req_key)}"
+            expected_anon_buckets = (
+                "hc:rl:cancel:anon:ip:127.0.0.1:req",
+                "hc:rl:cancel:anon:ip:127.0.0.1:ids",
+                "hc:rl:cancel:anon:global:req",
+                "hc:rl:cancel:anon:global:ids",
+            )
+            for bkey in expected_anon_buckets:
+                assert r.type(bkey) == "zset", (
+                    f"F08/M-02: Expected ZSET bucket {bkey}, got type={r.type(bkey)!r}"
+                )
+                assert r.zcard(bkey) == 20, (
+                    f"F08/M-02: 429 request polluted ZSET bucket {bkey}: zcard={r.zcard(bkey)}"
+                )
 
             await asyncio.sleep(1.05)
             post_statuses = []
@@ -1828,7 +1890,7 @@ async def test_ce12b_mixed_anon_and_auth_namespace_isolation(monkeypatch):
         ):
             await auth_client.post("/api/v1/auth/coord/session")
             a1 = f"hc_rl_auth_{uuid.uuid4().hex}"
-            await _register_attempt_if_supported(auth_client, a1)
+            await _register_attempt_required(auth_client, a1)
             login_r = await auth_client.post(
                 "/api/v1/auth/password/login",
                 headers={"X-Auth-Mode": "cookie"},
@@ -1924,11 +1986,63 @@ async def test_ce12c_weighted_ids_cap_and_redis_503_fail_closed(monkeypatch):
                     raise redis.ConnectionError("Redis ZSET evalsha outage")
 
             monkeypatch.setattr(deps, "_redis", _EvalBoomRedis(real_rd))
+            app_pool = await deps.get_db_pool()
+            pg_writes_during_503: list[str] = []
+
+            class _WriteSpyConn:
+                def __init__(self, conn):
+                    self._conn = conn
+
+                def __getattr__(self, item):
+                    return getattr(self._conn, item)
+
+                async def execute(self, query, *args, **kwargs):
+                    q_up = " ".join(str(query).upper().split())
+                    if any(kw in q_up for kw in ("INSERT ", "UPDATE ", "DELETE ")):
+                        pg_writes_during_503.append(q_up[:100])
+                    return await self._conn.execute(query, *args, **kwargs)
+
+            class _WriteSpyAcquire:
+                def __init__(self, ctx):
+                    self._ctx = ctx
+
+                async def __aenter__(self):
+                    return _WriteSpyConn(await self._ctx.__aenter__())
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return await self._ctx.__aexit__(exc_type, exc, tb)
+
+            class _WriteSpyPool:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __getattr__(self, item):
+                    return getattr(self._inner, item)
+
+                def acquire(self, *args, **kwargs):
+                    return _WriteSpyAcquire(self._inner.acquire(*args, **kwargs))
+
+            monkeypatch.setattr(deps, "_pool", _WriteSpyPool(app_pool))
+            probe_503_aid = f"hc_rl503_{uuid.uuid4().hex[:8]}"
             r503 = await client.post(
                 "/api/v1/auth/login-attempts/cancel",
-                json={"attempt_ids": [f"hc_rl503_{uuid.uuid4().hex[:8]}"]},
+                json={"attempt_ids": [probe_503_aid]},
             )
+            monkeypatch.setattr(deps, "_pool", app_pool)
             assert r503.status_code == 503
+            assert len(pg_writes_during_503) == 0, (
+                f"M-02: Rate-limiter Redis 503 executed PG write mutations: {pg_writes_during_503}"
+            )
+            conn_chk = await asyncpg.connect(DATABASE_URL)
+            try:
+                if await conn_chk.fetchval("SELECT to_regclass('public.login_attempt_states') IS NOT NULL;"):
+                    row_cnt = await conn_chk.fetchval(
+                        "SELECT COUNT(*) FROM login_attempt_states WHERE attempt_id = $1;",
+                        probe_503_aid,
+                    )
+                    assert row_cnt == 0, f"M-02: Redis 503 leaked PG attempt row {probe_503_aid}"
+            finally:
+                await conn_chk.close()
     finally:
         r.close()
         await _stop_server(server, thread)
@@ -2227,4 +2341,245 @@ async def test_ce14_pre_phase_a_delayed_login_unregistered_reject_and_lock_stres
             await pool.close()
     finally:
         await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-15 (M-05): Unregistered & pre-Phase-A delayed /otp/verify rejected 409
+# strictly BEFORE AuthService.authenticate_via_otp / OTP consumption
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce15_unregistered_and_pre_phase_a_otp_verify_rejected(monkeypatch):
+    _clear_rate_limit_keys()
+    uid, mobile = await _create_test_user(["USER"])
+    server, thread, base_url = await _start_test_server(monkeypatch)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        async with httpx.AsyncClient(base_url=base_url, headers={"Origin": base_url}) as client:
+            assert (await client.post("/api/v1/auth/coord/session")).status_code == 200
+
+            # Request real OTP and keep it unused in Redis
+            await OtpService(r).request_otp(mobile)
+            otp_code = r.get(f"otp:code:{mobile}")
+            assert otp_code
+
+            # 1. Pre-Phase-A delayed OTP registration at logout_seq=0, then logout before /otp/verify reaches Phase A
+            delayed_otp_aid = f"hc_ce15_pre_otp_{uuid.uuid4().hex}"
+            st_otp = await _register_attempt_required(client, delayed_otp_aid, flow="OTP")
+            assert st_otp["started_logout_seq"] == 0
+
+            # Log in & out quickly via password to advance server logout_seq >= 1 cleanly
+            pw_aid = f"hc_ce15_pw_{uuid.uuid4().hex}"
+            await _register_attempt_required(client, pw_aid, flow="PASSWORD")
+            # Actually re-registering/logging in pw_aid increments nothing until logout; logout invalidates delayed_otp_aid
+            r_pw = await client.post(
+                "/api/v1/auth/password/login",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "password": "HamiCounter!901", "attempt_id": pw_aid},
+            )
+            assert r_pw.status_code == 200
+            lo = await client.post(
+                "/api/v1/auth/logout",
+                headers={"X-Auth-Mode": "cookie", "X-CSRF-Token": client.cookies.get("hc_csrf")},
+            )
+            assert lo.status_code == 200
+            assert await _count_active_refresh_tokens(uid) == 0
+
+            # Spy on AuthService.authenticate_via_otp to prove Phase A rejects BEFORE OTP verification/consume!
+            otp_calls = {"count": 0}
+            orig_auth_otp = AuthService.authenticate_via_otp
+
+            async def _spy_auth_otp(self, *args, **kwargs):
+                otp_calls["count"] += 1
+                return await orig_auth_otp(self, *args, **kwargs)
+
+            monkeypatch.setattr(AuthService, "authenticate_via_otp", _spy_auth_otp)
+
+            late_otp = await client.post(
+                "/api/v1/auth/otp/verify",
+                headers={"X-Auth-Mode": "cookie"},
+                json={"mobile": mobile, "code": otp_code, "attempt_id": delayed_otp_aid},
+            )
+            assert late_otp.status_code == 409, (
+                f"M-05: Pre-Phase-A delayed /otp/verify bypassed post-registration logout! status={late_otp.status_code}"
+            )
+            assert otp_calls["count"] == 0, "M-05: Rejected OTP Phase A executed authenticate_via_otp!"
+            assert r.get(f"otp:code:{mobile}") == otp_code, "M-05: Rejected /otp/verify consumed OTP!"
+
+            # 2. Completely unregistered OTP attempt on coordinated browser MUST fail 409 BEFORE authenticate_via_otp!
+            unreg_otp = await client.post(
+                "/api/v1/auth/otp/verify",
+                headers={"X-Auth-Mode": "cookie"},
+                json={
+                    "mobile": mobile,
+                    "code": otp_code,
+                    "attempt_id": f"hc_ce15_unreg_otp_{uuid.uuid4().hex}",
+                },
+            )
+            assert unreg_otp.status_code == 409, (
+                f"M-05: Coordinated browser accepted unregistered /otp/verify! status={unreg_otp.status_code}"
+            )
+            assert otp_calls["count"] == 0, "M-05: Unregistered /otp/verify executed authenticate_via_otp!"
+            assert r.get(f"otp:code:{mobile}") == otp_code
+            assert await _count_active_refresh_tokens(uid) == 0
+    finally:
+        r.close()
+        await _stop_server(server, thread)
+        await _cleanup_user(uid)
+
+
+# ---------------------------------------------------------------------------
+# CE-16 (REV1-M03/M-03): Adversarial Garbage Collection preserves STARTED,
+# IN_FLIGHT, ACTIVE, PENDING_REVOKE, unexpired tombstones & <10d REVOKED families
+# while safely collecting expired tombstones & >10d REVOKED families child-first
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ce16_gc_adversarial_preserves_live_records_and_tombstones(monkeypatch):
+    _clear_rate_limit_keys()
+    assert hasattr(SessionService, "purge_expired_auth_records"), (
+        "M-03: SessionService.purge_expired_auth_records missing from baseline!"
+    )
+    uid, _mobile = await _create_test_user(["USER"])
+    bid = f"b_gc_{uuid.uuid4().hex}"
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
+    svc = SessionService(pool, redis_client=deps.get_redis())
+
+    fid_active = uuid.uuid4()
+    fid_pending = uuid.uuid4()
+    fid_recent_rev = uuid.uuid4()
+    fid_old_rev = uuid.uuid4()
+
+    aid_active = f"hc_gc_act_{uuid.uuid4().hex}"
+    aid_pending = f"hc_gc_pnd_{uuid.uuid4().hex}"
+    aid_recent_rev = f"hc_gc_rcr_{uuid.uuid4().hex}"
+    aid_old_rev = f"hc_gc_oldr_{uuid.uuid4().hex}"
+    aid_started = f"hc_gc_str_{uuid.uuid4().hex}"
+    aid_inflight = f"hc_gc_inf_{uuid.uuid4().hex}"
+    aid_tomb_keep = f"hc_gc_tk_{uuid.uuid4().hex}"
+    aid_tomb_purge = f"hc_gc_tp_{uuid.uuid4().hex}"
+
+    try:
+        async with pool.acquire() as conn:
+            has_tables = await conn.fetchval(
+                "SELECT to_regclass('public.browser_session_families') IS NOT NULL "
+                "AND to_regclass('public.login_attempt_states') IS NOT NULL;"
+            )
+            assert has_tables, "M-03: Coordination tables missing from schema!"
+
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO browser_coord_state (browser_id, coordinated, global_seq, logout_seq, login_seq) "
+                    "VALUES ($1, TRUE, 10, 1, 10);",
+                    bid,
+                )
+                # 1. ACTIVE family + child attempt + ACTIVE token (even old timestamps -> NEVER purged!)
+                await conn.execute(
+                    "INSERT INTO browser_session_families (family_id, browser_id, user_id, attempt_id, created_seq, status, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, 10, 'ACTIVE', NOW() - INTERVAL '15 days', NOW() - INTERVAL '15 days');",
+                    fid_active, bid, uid, aid_active,
+                )
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, family_id, browser_id, user_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, $3, $4, 'ACTIVE', 0, NOW() - INTERVAL '12 days', NOW() - INTERVAL '12 days');",
+                    aid_active, fid_active, bid, uid,
+                )
+                await conn.execute(
+                    "INSERT INTO refresh_tokens (family_id, user_id, token_hash, status, expires_at) "
+                    "VALUES ($1, $2, $3, 'ACTIVE', NOW() + INTERVAL '7 days');",
+                    fid_active, uid, uuid.uuid4().hex * 2,
+                )
+
+                # 2. PENDING_REVOKE family + child attempt + REVOKED token (unconfirmed by Redis -> NEVER purged!)
+                await conn.execute(
+                    "INSERT INTO browser_session_families (family_id, browser_id, user_id, attempt_id, created_seq, status, revoke_reason, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, 9, 'PENDING_REVOKE', 'LOGOUT', NOW() - INTERVAL '15 days', NOW() - INTERVAL '15 days');",
+                    fid_pending, bid, uid, aid_pending,
+                )
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, family_id, browser_id, user_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, $3, $4, 'PENDING_REVOKE', 0, NOW() - INTERVAL '12 days', NOW() - INTERVAL '12 days');",
+                    aid_pending, fid_pending, bid, uid,
+                )
+                await conn.execute(
+                    "INSERT INTO refresh_tokens (family_id, user_id, token_hash, status, expires_at) "
+                    "VALUES ($1, $2, $3, 'REVOKED', NOW() - INTERVAL '1 day');",
+                    fid_pending, uid, uuid.uuid4().hex * 2,
+                )
+
+                # 3. Recent REVOKED family (2 days old < 10d retention -> PRESERVED!)
+                await conn.execute(
+                    "INSERT INTO browser_session_families (family_id, browser_id, user_id, attempt_id, created_seq, status, revoke_reason, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, 8, 'REVOKED', 'LOGOUT', NOW() - INTERVAL '3 days', NOW() - INTERVAL '2 days');",
+                    fid_recent_rev, bid, uid, aid_recent_rev,
+                )
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, family_id, browser_id, user_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, $3, $4, 'REVOKED', 0, NOW() - INTERVAL '2 days', NOW() + INTERVAL '600 seconds');",
+                    aid_recent_rev, fid_recent_rev, bid, uid,
+                )
+
+                # 4. Old REVOKED family (11 days old > 10d retention) + expired attempt + REVOKED token -> PURGED safely child-first!
+                await conn.execute(
+                    "INSERT INTO browser_session_families (family_id, browser_id, user_id, attempt_id, created_seq, status, revoke_reason, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, 7, 'REVOKED', 'LOGOUT', NOW() - INTERVAL '15 days', NOW() - INTERVAL '11 days');",
+                    fid_old_rev, bid, uid, aid_old_rev,
+                )
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, family_id, browser_id, user_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, $3, $4, 'REVOKED', 0, NOW() - INTERVAL '11 days', NOW() - INTERVAL '10 days');",
+                    aid_old_rev, fid_old_rev, bid, uid,
+                )
+                await conn.execute(
+                    "INSERT INTO refresh_tokens (family_id, user_id, token_hash, status, expires_at) "
+                    "VALUES ($1, $2, $3, 'REVOKED', NOW() - INTERVAL '4 days');",
+                    fid_old_rev, uid, uuid.uuid4().hex * 2,
+                )
+
+                # 5. Live STARTED & IN_FLIGHT attempts -> NEVER deleted!
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, browser_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, 'STARTED', 1, NOW() + INTERVAL '25 seconds', NOW() + INTERVAL '3600 seconds'), "
+                    "($3, $2, 'IN_FLIGHT', 1, NOW() + INTERVAL '25 seconds', NOW() + INTERVAL '3600 seconds');",
+                    aid_started, bid, aid_inflight,
+                )
+
+                # 6. Unexpired CANCELLED tombstone (attempt_expires_at expired -60s ago, tombstone expires_at +1800s ahead -> KEPT!)
+                #    vs fully expired CANCELLED tombstone (expires_at -60s -> PURGED!)
+                await conn.execute(
+                    "INSERT INTO login_attempt_states (attempt_id, browser_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                    "VALUES ($1, $2, 'CANCELLED', 1, NOW() - INTERVAL '60 seconds', NOW() + INTERVAL '1800 seconds'), "
+                    "($3, $2, 'CANCELLED', 1, NOW() - INTERVAL '4000 seconds', NOW() - INTERVAL '60 seconds');",
+                    aid_tomb_keep, bid, aid_tomb_purge,
+                )
+
+        purged_count = await svc.purge_expired_auth_records(batch_size=200)
+        assert purged_count >= 2
+
+        async with pool.acquire() as conn:
+            # Preserved entities
+            assert await conn.fetchval("SELECT status FROM browser_session_families WHERE family_id = $1;", fid_active) == "ACTIVE"
+            assert await conn.fetchval("SELECT status FROM login_attempt_states WHERE attempt_id = $1;", aid_active) == "ACTIVE"
+            assert await conn.fetchval("SELECT status FROM browser_session_families WHERE family_id = $1;", fid_pending) == "PENDING_REVOKE"
+            assert await conn.fetchval("SELECT status FROM login_attempt_states WHERE attempt_id = $1;", aid_pending) == "PENDING_REVOKE"
+            assert await conn.fetchval("SELECT status FROM browser_session_families WHERE family_id = $1;", fid_recent_rev) == "REVOKED"
+            assert await conn.fetchval("SELECT status FROM login_attempt_states WHERE attempt_id = $1;", aid_started) == "STARTED"
+            assert await conn.fetchval("SELECT status FROM login_attempt_states WHERE attempt_id = $1;", aid_inflight) == "IN_FLIGHT"
+            assert await conn.fetchval("SELECT status FROM login_attempt_states WHERE attempt_id = $1;", aid_tomb_keep) == "CANCELLED"
+
+            # Collected expired entities
+            assert await conn.fetchval("SELECT COUNT(*) FROM login_attempt_states WHERE attempt_id = $1;", aid_tomb_purge) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM login_attempt_states WHERE attempt_id = $1;", aid_old_rev) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM refresh_tokens WHERE family_id = $1;", fid_old_rev) == 0
+            assert await conn.fetchval("SELECT COUNT(*) FROM browser_session_families WHERE family_id = $1;", fid_old_rev) == 0
+    finally:
+        async with pool.acquire() as conn:
+            for tbl, col, vals in (
+                ("login_attempt_states", "browser_id", bid),
+                ("refresh_tokens", "user_id", uid),
+                ("browser_session_families", "browser_id", bid),
+                ("browser_coord_state", "browser_id", bid),
+            ):
+                if await conn.fetchval("SELECT to_regclass($1) IS NOT NULL;", f"public.{tbl}"):
+                    await conn.execute(f"DELETE FROM {tbl} WHERE {col} = $1;", vals)
+        await pool.close()
         await _cleanup_user(uid)

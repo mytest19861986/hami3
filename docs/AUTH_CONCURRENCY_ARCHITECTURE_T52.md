@@ -1,8 +1,8 @@
-# HamiCard Phase 3 Authentication Concurrency Architecture & Failure-Recovery Specification (`HC-T52` Revision 2)
+# HamiCard Phase 3 Authentication Concurrency Architecture & Failure-Recovery Specification (`HC-T52` Revision 2.1)
 
-- **Command**: `HC-CMD-053` / `HC-T52` (Design-and-Test-First Gate prior to `HC-T53` implementation; Final Design Revision under `MAX_DESIGN_REVISIONS=2`)
+- **Command**: `HC-CMD-053` / `HC-T52` (Bounded Final Revision 2.1 authorized by `HC-COMMANDER-014` prior to `HC-T53`)
 - **Base Commit (`OLD_CANDIDATE`)**: `e7c2bb81f7278e1d9a0fe8ca75e56d06fec753fb`
-- **Review Alignment**: Completely closes `R2-T52-REV1-H01` through `R2-T52-REV1-H07` (`HIGH`), `REV1-M01` through `REV1-M04` (`MEDIUM`), and all prior `R2-T52-V4-F01` through `R2-T52-V4-F08` items.
+- **Review Alignment**: Closes Reviewer #2 Revision 2 findings `HIGH-01`..`HIGH-05` & `MEDIUM M-01`..`M-05`, alongside `R2-T52-REV1-H01`..`H07`, `REV1-M01`..`M04`, and `R2-T52-V4-F01`..`F08`.
 - **Target Scope**: Remediate all `4` HIGH (`R2-T50-C2-H01..H04`), `3` MEDIUM (`R2-T50-C2-M01..M03`), and `1` LOW (`R2-T50-C2-L01`) defects by centering concurrency control on PostgreSQL ACID linearization + durable `PENDING_REVOKE` bookkeeping + server-owned epoch fencing + capability-scoped attempt cancellation.
 - **Invariant Constraint**: Zero application behavior edits (`src/`, `db/`, `scripts/`, `Dockerfile`) in `HC-T52`. Implementation runs in `HC-T53` only after explicit independent Design Gate `PASS`.
 
@@ -158,6 +158,97 @@ Every mutating auth transaction in `SessionService` and `auth.py` obeys a strict
   - **`L4/L5/L6` (`/logout`, `/refresh`, `/session/rebind-cookie`, `/coord/session`)**: Pre-resolves `browser_id` via unlocked read from `refresh_tokens JOIN browser_session_families` BEFORE acquiring locks, then acquires strictly `Level 1 -> [Level 2 if /logout carries cancelled_login_attempt_ids] -> Level 3 -> Level 4`.
 
 All wait-for edges point strictly forward (`1 -> 2 -> 3 -> 4`) and ascending by PK within every level; therefore deadlock cycles (`AB-BA`) are mathematically impossible across all concurrent endpoints and background reconcilers.
+
+#### 3.2.1 Endpoint & Background Task SQL Lock-Acquisition Matrix (`HIGH-01`)
+
+| Operation / Endpoint | Ordered Lock Sequence | Permitted Skipped Levels | Prohibited Acquisitions | Retry / Rollback Contract |
+|---|---|---|---|---|
+| `POST /api/v1/auth/coord/session` | `L1 (browser_coord_state)` | Skips `L2`, `L3`, `L4` | Any lock on `L2..L4` before `L1` | `INSERT ... ON CONFLICT DO UPDATE`, single short commit |
+| `POST /api/v1/auth/login-attempts/start` | `L1 -> L2 (login_attempt_states)` | Skips `L3`, `L4` | Locking `L1` after `L2` | Rejects `409` on seq mismatch or duplicate `attempt_id` |
+| `/password/login` & `/otp/verify` Phase A | `L1 -> L2` | Skips `L3`, `L4` | Holding ANY DB lock across Argon2id / OTP check | Commits `STARTED -> IN_FLIGHT` before slow verification |
+| `/password/login` & `/otp/verify` Phase B (`L1`) | `L1 -> L2 -> L3 -> L4` | None (or skips `L4` if no active superseded token rows) | Acquiring `L1/L2` after `L3/L4`, descending PK order | Rejects `409` cleanly (marks `CANCELLED`) if fenced |
+| `POST /api/v1/auth/login-attempts/cancel` (`L2`) | `L1 (sorted known_bids) -> L2 (sorted attempt_ids) -> L3 (sorted family_ids) -> L4 (sorted token ids)` | Skips `L1` only if `known_bids` empty; skips `L3`/`L4` if no bound `family_id` | Acquiring `L1` after `L2` (even for newly discovered `browser_id`); locking `L2` before `L1` | **Pre-scan/rollback/retry** (`max_retries=2`): rolls back entire tx if any locked `L2` row carries `browser_id` outside `known_bids` |
+| `POST /api/v1/auth/logout` (`L4`) | `L1 -> [L2 optional] -> L3 -> L4` | Skips `L2` if `cancelled_login_attempt_ids` is empty | Acquiring `L1` after `L2/L3/L4` | Pre-resolves `browser_id` read-only from token/family before locking |
+| `POST /api/v1/auth/refresh` (`L5`) | `L1 -> L3 -> L4` | Skips `L2` | Acquiring `L1/L2` after `L3/L4` | Pre-resolves `browser_id` read-only from `refresh_tokens JOIN browser_session_families` |
+| `POST /api/v1/auth/session/rebind-cookie` (`L6`) | `L1 -> L3 -> L4` | Skips `L2` | Acquiring `L1/L2` after `L3/L4` | Pre-resolves `browser_id` read-only; verifies `family.created_seq == login_seq > logout_seq` |
+| `reconcile_pending_revocations` Phase 1 (`L3`) | `L3 (SKIP LOCKED) -> L4` | Skips `L1`, `L2` | Strictly NEVER locks `L1` or `L2` | Non-blocking `FOR UPDATE SKIP LOCKED`; rolls back to preserve `PENDING_REVOKE` on `RedisError` |
+| `reconcile_pending_revocations` Phase 2 (`L3`) | `L2 (SKIP LOCKED)` | Skips `L1`, `L3`, `L4` | Strictly NEVER locks `L1`, `L3`, or `L4` after `L2` | Non-blocking leaf tx; keeps `PENDING_REVOKE` on `RedisError` |
+| `purge_expired_auth_records` (GC) | `Tx A: L2 (SKIP LOCKED)`; `Tx B: L2 -> L3 (REVOKED >10d FOR UPDATE SKIP LOCKED) -> L4` | Skips `L1` | Strictly NEVER locks `L1`; NEVER locks `L2` after `L3/L4` | Sweeps expired leaf attempts (`Tx A`), then locks frozen `>10d` revoked families strictly in `L2 -> L3 -> L4` order (`Tx B`) before deleting in child->parent order (`L2 -> L4 -> L3`) |
+
+#### 3.2.2 Executable Algorithm for `L2` (`/login-attempts/cancel` Pre-Scan / Rollback / Retry)
+
+```python
+async def cancel_attempts_l2(conn, caller_browser_id: str | None, attempt_ids: list[str], verified_uid: UUID | None, caps: dict[str, str]):
+    sorted_aids = sorted(set(attempt_ids))
+    extra_bids: set[str] = {caller_browser_id} if caller_browser_id else set()
+    for retry in range(3):  # initial try + max_retries=2
+        # 1. Unlocked pre-scan BEFORE acquiring any row lock in this attempt
+        prescan = await conn.fetch(
+            "SELECT DISTINCT browser_id FROM login_attempt_states "
+            "WHERE attempt_id = ANY($1::varchar[]) AND browser_id IS NOT NULL;",
+            sorted_aids,
+        )
+        known_bids = sorted(extra_bids | {r["browser_id"] for r in prescan})
+
+        async with conn.transaction():
+            # 2. LEVEL 1: browser_coord_state (ASC PK order) — ONLY here, NEVER after L2!
+            if known_bids:
+                await conn.execute(
+                    "INSERT INTO browser_coord_state (browser_id) SELECT unnest($1::varchar[]) ON CONFLICT DO NOTHING;",
+                    known_bids,
+                )
+                await conn.fetch(
+                    "SELECT browser_id FROM browser_coord_state "
+                    "WHERE browser_id = ANY($1::varchar[]) ORDER BY browser_id ASC FOR UPDATE;",
+                    known_bids,
+                )
+
+            # 3. LEVEL 2: insert tombstones idempotently, then lock in ASC PK order
+            await conn.execute(
+                "INSERT INTO login_attempt_states (attempt_id, browser_id, user_id, status, started_logout_seq, attempt_expires_at, expires_at) "
+                "SELECT aid, $2, NULL, 'CANCELLED', 0, NOW(), NOW() + INTERVAL '3600 seconds' "
+                "FROM unnest($1::varchar[]) AS aid ON CONFLICT (attempt_id) DO NOTHING;",
+                sorted_aids, caller_browser_id,
+            )
+            rows = await conn.fetch(
+                "SELECT attempt_id, family_id, browser_id, user_id, status, cancel_token_hash "
+                "FROM login_attempt_states WHERE attempt_id = ANY($1::varchar[]) ORDER BY attempt_id ASC FOR UPDATE;",
+                sorted_aids,
+            )
+
+            # 4. Dynamic race guard: did concurrent Phase A bind an unseen browser_id?
+            unseen_bids = {r["browser_id"] for r in rows if r["browser_id"] and r["browser_id"] not in known_bids}
+            if unseen_bids:
+                extra_bids.update(known_bids)
+                extra_bids.update(unseen_bids)
+                # Exit async with conn.transaction() cleanly via controlled exception -> immediate ROLLBACK!
+                raise _RetryCancelWithExpandedBids()
+
+            # 5. LEVEL 3: browser_session_families (ASC PK order)
+            fids = sorted({r["family_id"] for r in rows if r["family_id"] is not None})
+            fam_map = {}
+            if fids:
+                fams = await conn.fetch(
+                    "SELECT family_id, browser_id, user_id, attempt_id, status FROM browser_session_families "
+                    "WHERE family_id = ANY($1::uuid[]) ORDER BY family_id ASC FOR UPDATE;",
+                    fids,
+                )
+                fam_map = {f["family_id"]: f for f in fams}
+
+            # 6. Verify 1:1 binding invariant & evaluate all-or-nothing ownership (ROLLBACK -> 403 if any denied)
+            enforce_exact_binding_and_authorization(rows, fam_map, caller_browser_id, verified_uid, caps)
+
+            # 7. LEVEL 4: refresh_tokens (ASC PK order) -> revoke & transition L2/L3 to PENDING_REVOKE/CANCELLED
+            if fids:
+                await conn.fetch(
+                    "SELECT id FROM refresh_tokens WHERE family_id = ANY($1::uuid[]) ORDER BY id ASC FOR UPDATE;",
+                    fids,
+                )
+                await conn.execute("UPDATE refresh_tokens SET status = 'REVOKED' WHERE family_id = ANY($1::uuid[]) AND status != 'REVOKED';", fids)
+                await conn.execute("UPDATE browser_session_families SET status = 'PENDING_REVOKE', updated_at = NOW() WHERE family_id = ANY($1::uuid[]) AND status != 'REVOKED';", fids)
+            return apply_attempt_state_updates_and_commit(conn, rows, fids)
+    raise ConcurrentRetryExhausted409()
+```
 
 ---
 
@@ -358,7 +449,14 @@ return {1, 0, 0}
 ```
 - **Zero Worker Clock Skew**: Timestamps derive solely from Redis `TIME`, eliminating inter-worker wall-clock skew across Uvicorn/Gunicorn workers.
 - **Zero `429` Bucket Pollution**: Rejected `429` requests NEVER insert ZSET members and NEVER burn sibling global or ID buckets.
-- **Unique Members & Fail-Closed**: Concurrent sub-millisecond requests get distinct `now_ms:nonce:idx:j` members; any `redis.RedisError` fails closed `HTTP 503` (zero PG mutations).
+- **Unique Members & Fail-Closed**: Concurrent sub-millisecond requests receive distinct server-generated 96-bit CSPRNG nonces (`secrets.token_hex(12)` -> `now_ms:nonce:idx:j` members); any `redis.RedisError` fails closed `HTTP 503` (zero PG mutations).
+
+#### 4.6.1 Operational Scope & Deployment Assumptions (`MEDIUM-04`)
+1. **Quota Key Scopes**:
+   - **Anonymous (`anon`) Class**: Enforced strictly **per client IP (`hc:rl:cancel:anon:ip:{client_ip}:{req|ids}`) + global (`hc:rl:cancel:anon:global:{req|ids}`)** (`120s` window).
+   - **Authenticated (`auth`) Class**: Granted **ONLY** after full cryptographic token verification + Redis non-revocation check + PostgreSQL `verify_active_family` check, and isolated inside **`hc:rl:cancel:auth:ip:{client_ip}:{req|ids}` + `hc:rl:cancel:auth:global:{req|ids}`** (`300s` window). Because unauthenticated callers cannot enter `:auth:` keys and cross-user cancellations remain blocked by PG ownership checks (`403`), `:auth:` buckets enforce bounded per-IP and global throughput isolation without sharing expiry/pruning state with `:anon:`.
+2. **Unique Lua Request Nonces**: Every Python rate-limit invocation passes `nonce = secrets.token_hex(12)` into `ARGV[8]` so simultaneous requests within the same Redis millisecond NEVER collide on ZSET member strings.
+3. **Standalone Redis Topology Assumption**: The multi-key atomic `EVAL` script (`KEYS[1..4]`) assumes HamiCard deploys a **standalone Redis** (or primary-replica Sentinel) topology where all keys reside in one keyspace. Should HamiCard later migrate to Redis Cluster, keys MUST be hash-tagged to a single common slot (or split cleanly per shard) to prevent `CROSSSLOT` errors.
 
 ---
 
@@ -385,9 +483,9 @@ return {1, 0, 0}
 |---------|---------|-----------------------|-------------------------------|---------------------------------|
 | `CE-01` | `C2-H01` | Delayed `[B1]` cancellation after logout & newer `F3` login | **FAILS**: revokes `F3`, `/refresh` `401` | `F3` stays `ACTIVE`, `/refresh` `200`, `B1` revoked |
 | `CE-02` | `C2-H02/H04/REV1-H03` | Deterministic Phase A->Phase B PG fence barrier (`verify_password` hook) racing `/logout` + reverse post-logout registration (`started_logout_seq == 1`) | **FAILS**: `/login-attempts/start` missing (`404`) / inverted seq | Unconditional `200` start (`seq=0`); pre-logout delayed Phase B rejected `409` (`0` active); post-logout registered login commits `200` (`login_seq > logout_seq`) |
-| `CE-03a` | `C2-H02/F06/REV1-H02` | PG failure injected mid-revocation during `client1` logout while separate-device `client2` (`bid_2`) holds `F2` | **FAILS**: `500 != 503` / loses tracking | Fails `503`, `F1` remains `'ACTIVE'`; healed `client1` logout revokes `F1` (`False`) while **separate device `F2` remains `'ACTIVE'` (`True`)** |
+| `CE-03a` | `C2-H02/F06/HIGH-03` | Mid-transaction PG failure injected *after* actual DB `UPDATE` mutation executes inside `client1` logout tx while separate-device `client2` (`bid_2`) holds `F2` | **FAILS**: `500 != 503` / loses tracking | Verifies actual SQL mutation executed before crash; rollback restores `logout_seq=0`, `F1` & `F2` `'ACTIVE'`; healed retry revokes `F1` (`False`) while **`F2` stays `'ACTIVE'` (`True`)** |
 | `CE-03b` | `C2-H02/F06/REV1-M01` | Redis outage AFTER PG commit + forced overlapping barrier across dual `reconcile_pending_revocations(batch_size=2)` workers (`SKIP LOCKED`) | **FAILS**: missing `PENDING_REVOKE` & reconciler | Returns `503`, PG `PENDING_REVOKE` durable; overlapping barrier forces `c1 >= 2 and c2 >= 2` disjoint batches; all 6 rows become `'REVOKED'` + Redis (`TTL > 7d`) |
-| `CE-04` | `C2-H03` | Two fresh tabs concurrently click Login with held `/coord/session` (`2.0s` barrier) | **FAILS**: splits `hc_browser` | `hamicard_phase3_browser_init` converges to 1 `hc_browser`; logout leaves `0` active tokens |
+| `CE-04` | `C2-H03/HIGH-02` | Concurrent initial tab navigation (`asyncio.gather`) + concurrent Login + deterministic **server-side `/coord/session` ASGI boundary barrier** holding unbootstrapped entry | **FAILS**: both unbootstrapped tabs enter `/coord/session` barrier (`len == 2`) | `hamicard_phase3_browser_init` holds Tab B client-side across server barrier (`1` unbootstrapped `/coord/session` server entry); logout leaves `0` active tokens |
 | `CE-05` | `C2-H04` | Web Lock `withCoordLock` discipline audit on `hc_coord` mutations | **FAILS**: unlocked `hc_coord` write | 100% `hc_coord` writes strictly inside `navigator.locks('hamicard_phase3_coord')` |
 | `CE-06` | `C2-M01` | 21 rapid `/login-attempts/cancel` requests with forged `Bearer` | **FAILS**: elevates to `60` req quota | Enforces `20` req unauth quota -> `429` by call 21 |
 | `CE-07a` | `C2-M01/F02` | Cross-user AND anonymous same-browser (no capability) `/login-attempts/cancel` against bound `user_a` attempt | **FAILS**: anonymous same-browser or weak ownership leaks revocation | Both blocked `403`; `fam_a` stays `ACTIVE`; valid `cancel_capability` / owning `user_a` succeeds `200` |
@@ -396,13 +494,15 @@ return {1, 0, 0}
 | `CE-08b` | `F04/F05/REV1-H04` | Rebind adversarial matrix with normal TTL (`120s`): missing/wrong `hc_browser`, older `F1`, bad `Origin`, revoked family, & `/rebind-cookie` vs `/logout` race | **FAILS**: `404` (endpoint absent) | All invalid/stale/wrong-browser/post-logout rebind attempts rejected (`401`/`403`); `/logout` + `/rebind` never resurrects `REVOKED` family |
 | `CE-08c` | `F04/F05/REV1-H04` | Isolated expired-bearer JWT (`exp = now - 60`) on `/session/rebind-cookie` | **FAILS**: `404` (endpoint absent) | Deterministically rejected `401` (`allow_expired=False`) |
 | `CE-09` | `C2-M03` | `[429, 503]` cancellation failures in `revokeSupersededLoginOnServer()` | **FAILS**: drops failure silently | UI surfaces error + `REMOTE_REVOKE_FAILED` + preserves `canRetryLogout` & `unresolvedAttemptCount` |
-| `CE-10` | `C2-H01/AC-15` | Multi-device Browser B & unrelated User B isolation | Baseline PASS | Both remain `ACTIVE` after Browser A logout/cancel |
-| `CE-11a` | `F01/REV1-M04` | Forged `started_server_logout_seq=999` on `/password/login` rejected | **FAILS**: `e7c2bb81` accepts `999` (`200`) | Rejected `409` (`0` active tokens) |
-| `CE-11b` | `F01/REV1-M04` | Forged `started_server_logout_seq=999` on `/otp/verify` rejected | **FAILS**: `e7c2bb81` accepts `999` (`200`) | Rejected `409` (`0` active tokens) |
+| `CE-10` | `C2-H01/AC-15/M-01` | Multi-device Browser B & unrelated User B isolation (unconditional HTTP 200 registration, zero `404` masking) | **FAILS**: `/login-attempts/start` absent (`404 != 200`) | Both remain `ACTIVE` after Browser A logout/cancel |
+| `CE-11a` | `F01/HIGH-04` | **Pre-logout** `/login-attempts/start` (`started_logout_seq=0`) -> `/logout` (`seq >= 1`) -> delayed `/password/login` with forged `started_server_logout_seq=999` | **FAILS**: `/login-attempts/start` `404` & `e7c2bb81` trusts forged `999` | Rejected `409` (`0` active tokens) |
+| `CE-11b` | `F01/HIGH-04` | **Pre-logout** `/login-attempts/start` (`flow="OTP"`, `seq=0`) -> `/logout` (`seq >= 1`) -> delayed `/otp/verify` with forged `started_server_logout_seq=999` | **FAILS**: `/login-attempts/start` `404` & `e7c2bb81` trusts forged `999` | Rejected `409` (`0` active tokens) |
 | `CE-11c` | `F03/REV1-H05/M04` | Concurrent duplicate `attempt_id` creates <= 1 family + PG negative test rejecting mismatched `(attempt_id, family_id)` binding | **FAILS**: mints 2 families / missing composite FK | At most `1` family created + loser `409`; PG rejects mismatched binding (`ForeignKeyViolationError`) |
-| `CE-12a` | `F08/REV1-M04` | Continuous Lua ZSET sliding-window recovery + `429` non-pollution | **FAILS**: fixed-window `string` bucket instead of `zset` | ZSET sliding boundary prunes oldest entry & `429` never pollutes any bucket |
+| `CE-12a` | `F08/M-02` | Continuous Lua ZSET sliding-window recovery + `429` non-pollution verified across **all 4 `:anon:` buckets** (`ip:req`, `ip:ids`, `global:req`, `global:ids`) | **FAILS**: fixed-window `string` bucket instead of `zset` | ZSET sliding boundary prunes oldest entry & `429` leaves all `4` `:anon:` buckets at exact `20` |
 | `CE-12b` | `REV1-H06` | Mixed `:anon:` (`120s`) & `:auth:` (`300s`) namespace isolation (`anon` never prunes/shortens `auth`) | **FAILS**: shared keys / non-ZSET bucket | Disjoint `:anon:` & `:auth:` keys preserve authenticated entries & `300s` TTL across anonymous bursts |
-| `CE-12c` | `F08/REV1-M04` | Weighted attempt-ID cap (`64` unauth IDs) & Redis `503` fail-closed | **FAILS**: unweighted / shared fixed keys | Weighted IDs capped cleanly (`429` > `64`); Redis error fails closed `503` |
+| `CE-12c` | `F08/M-02` | Weighted attempt-ID cap (`64` unauth IDs) + Redis `503` fail-closed verifying **zero PostgreSQL write mutations** during outage | **FAILS**: unweighted / shared fixed keys | Weighted IDs capped cleanly (`429` > `64`); Redis `503` performs `0` PG mutations |
 | `CE-13a` | `F07` | Missing `navigator.locks` fails closed (`WEB_LOCKS_UNAVAILABLE`) | **FAILS**: runs unlocked & logs in (`200`) | Blocked locally (`authenticated=False`), zero network login sent |
 | `CE-13b` | `F07/REV1-M02` | Forged `hc_coord.bi=1` cookie WITH normal `navigator.locks` still triggers `/coord/session` & cannot bypass validation | **FAILS**: trusts client `bi=1` / no server fence | Client calls `/coord/session`, gets signed `hc_browser`, forged `hc_coord` ignored |
-| `CE-14` | `REV1-H07/H01` | Pre-Phase-A delayed `/password/login` after `/login-attempts/start`, unregistered `hc_browser` login rejected `409`, & concurrent competing lock-order stress (`0` deadlocks) | **FAILS**: missing `/login-attempts/start` (`404`) / permits unregistered cookie login | Pre-Phase-A delayed attempt rejected `409`; unregistered `hc_browser` login rejected `409`; concurrent `L1`/`L2`/`L6`/`L3` tasks complete with `0` deadlocks |
+| `CE-14` | `REV1-H07/H01` | Pre-Phase-A delayed `/password/login` after `/login-attempts/start`, unregistered `hc_browser` login rejected `409` (`0` Argon2 calls), & concurrent `L1/L2/L4/L6/L3` lock-order stress (`0` deadlocks) | **FAILS**: missing `/login-attempts/start` (`404`) / permits unregistered cookie login | Pre-Phase-A delayed & unregistered password attempts rejected `409` (`pwd_calls==0`); stress completes with `0` deadlocks |
+| `CE-15` | `M-05` | Unregistered & pre-Phase-A delayed `/otp/verify` on coordinated browser rejected `409` strictly BEFORE `AuthService.authenticate_via_otp` / OTP consumption | **FAILS**: missing `/login-attempts/start` (`404`) / permits unregistered cookie OTP | Both rejected `409` with `otp_calls == 0`, OTP code preserved unconsumed in Redis, `0` active tokens |
+| `CE-16` | `REV1-M03/M-03` | Adversarial GC (`purge_expired_auth_records`) preserving `STARTED`, `IN_FLIGHT`, `ACTIVE`, `PENDING_REVOKE`, unexpired tombstones, and `<10d` revoked families while safely child-before-parent purging truly expired records | **FAILS**: `purge_expired_auth_records` & coord tables absent | Live/pending/unexpired rows 100% preserved; truly expired tombstones & `>10d` revoked families purged cleanly without FK error |
