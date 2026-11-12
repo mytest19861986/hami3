@@ -251,6 +251,26 @@ async def test_ce_b2_01_simultaneous_first_tab_bootstrap() -> None:
             context = await browser.new_context()
             page_a = await context.new_page()
             page_b = await context.new_page()
+            # Deterministic Web Lock contention spy for Tab B (M-02)
+            await page_b.add_init_script(
+                """
+                window.__tab_b_lock_waiting = false;
+                window.__tab_b_lock_acquired = false;
+                if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
+                  const origReq = navigator.locks.request.bind(navigator.locks);
+                  navigator.locks.request = function(name, ...args) {
+                    if (name === 'hamicard_auth_op') {
+                      window.__tab_b_lock_waiting = true;
+                    }
+                    return origReq(name, async (lock) => {
+                      window.__tab_b_lock_acquired = true;
+                      if (typeof args[0] === 'function') return args[0](lock);
+                      if (typeof args[1] === 'function') return args[1](lock);
+                    });
+                  };
+                }
+                """
+            )
             try:
                 async def _open_tab_a():
                     resp_a = await page_a.goto(f"{base_url}/phase3/#/auth/shell", wait_until="domcontentloaded")
@@ -267,7 +287,22 @@ async def test_ce_b2_01_simultaneous_first_tab_bootstrap() -> None:
 
                 task_a = asyncio.create_task(_open_tab_a())
                 task_b = asyncio.create_task(_open_tab_b())
-                await asyncio.sleep(0.25)
+                # Replace sleep with deterministic contention barrier (M-02):
+                # Poll until Tab B has actually called navigator.locks.request('hamicard_auth_op')
+                # and is actively queued waiting for Tab A to release the lock!
+                deadline = time.monotonic() + 5.0
+                b_waited = False
+                while time.monotonic() < deadline:
+                    try:
+                        b_waited = await page_b.evaluate("() => window.__tab_b_lock_waiting === true")
+                        if b_waited:
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.02)
+                assert b_waited, (
+                    "Deterministic contention failure: Tab B did not enter 'hamicard_auth_op' queue before release."
+                )
                 release_first.set()
                 await asyncio.gather(task_a, task_b)
 
@@ -573,6 +608,78 @@ async def test_ce_b2_03_login_response_racing_with_logout() -> None:
                 )
             assert otp_active == 0, f"Expected 0 active tokens after fenced OTP login, found {otp_active}"
 
+            # 3. Late Login HTTP Response Arrival After Logout (M-06)
+            # Scenario: Login Phase B commits on server, but response stream is delayed in flight.
+            # While the response is delayed, Logout completes on server (bumping generation and revoking families).
+            # The delayed Login response then arrives, setting the old Set-Cookie: hc_refresh in the browser jar.
+            # Browser attempts /refresh and protected resource -> MUST be rejected, ZERO session resurrection!
+            cookies3, boot3 = await _bootstrap_cookie_session(client, base_url)
+            g3 = boot3["auth_generation"]
+            login_commit_ok = await client.post(
+                "/api/v1/auth/password/login",
+                headers={
+                    "Origin": base_url,
+                    "X-Auth-Mode": "cookie",
+                    "X-CSRF-Token": cookies3["hc_csrf"],
+                },
+                cookies=cookies3,
+                json={"mobile": mobile, "password": password, "expected_auth_generation": g3},
+            )
+            assert login_commit_ok.status_code == 200
+            stale_login_cookies = _extract_cookies_dict(login_commit_ok)
+            stale_refresh_token = stale_login_cookies.get("hc_refresh")
+            stale_access_tok = login_commit_ok.json().get("access_token")
+            stale_fid = login_commit_ok.json()["session"]["family_id"]
+
+            # Intervening Logout executes BEFORE client uses that session
+            cookies3.update(stale_login_cookies)
+            intervening_logout = await client.post(
+                "/api/v1/auth/logout",
+                headers={
+                    "Origin": base_url,
+                    "X-Auth-Mode": "cookie",
+                    "X-CSRF-Token": cookies3["hc_csrf"],
+                },
+                cookies=cookies3,
+            )
+            assert intervening_logout.status_code == 200
+            cookies3.update(_extract_cookies_dict(intervening_logout))
+
+            # Late arrival: client now receives the delayed response and sets the stale cookie in jar
+            late_arrival_cookies = dict(cookies3)
+            late_arrival_cookies["hc_refresh"] = stale_refresh_token
+
+            # Client attempts /refresh using the late-arrived cookie -> MUST be rejected!
+            late_refresh_resp = await client.post(
+                "/api/v1/auth/refresh",
+                headers={
+                    "Origin": base_url,
+                    "X-Auth-Mode": "cookie",
+                    "X-CSRF-Token": late_arrival_cookies["hc_csrf"],
+                },
+                cookies=late_arrival_cookies,
+                json={},
+            )
+            assert late_refresh_resp.status_code in (401, 409), (
+                f"Late-arriving login cookie must be rejected on /refresh, got {late_refresh_resp.status_code}"
+            )
+
+            # Protected endpoint with stale access token must also fail 401
+            late_me = await client.get(
+                "/api/v1/profile/me",
+                headers={"Authorization": f"Bearer {stale_access_tok}"},
+            )
+            assert late_me.status_code == 401, (
+                f"Stale access token from late response must return 401, got {late_me.status_code}"
+            )
+
+            async with pool.acquire() as conn:
+                surviving_tokens = await conn.fetchval(
+                    "SELECT COUNT(*) FROM refresh_tokens WHERE family_id = $1 AND status = 'ACTIVE';",
+                    uuid.UUID(stale_fid),
+                )
+            assert surviving_tokens == 0, f"Late-arrived family must have 0 active tokens, got {surviving_tokens}"
+
 
 # =============================================================================
 # CE-B2-04: Logout Followed By A New Login (4.B)
@@ -754,6 +861,7 @@ async def test_ce_b2_06_missing_web_locks_support() -> None:
                 if any(
                     ep in req.url
                     for ep in (
+                        "/api/v1/auth/browser/bootstrap",
                         "/api/v1/auth/password/login",
                         "/api/v1/auth/otp/verify",
                         "/api/v1/auth/refresh",
@@ -975,15 +1083,46 @@ async def test_ce_b2_09_postgres_and_redis_revocation_failure() -> None:
                 def __getattr__(self, name):
                     return getattr(self._inner, name)
 
-                async def execute(self, query: str, *args, **kwargs):
+                async def _maybe_fault(self, is_dml: bool):
                     nonlocal dml_executed_before_crash, crash_armed
-                    upper = query.strip().upper()
-                    is_dml = upper.startswith(("INSERT", "UPDATE", "DELETE"))
-                    res = await self._inner.execute(query, *args, **kwargs)
                     if crash_armed and is_dml:
                         dml_executed_before_crash += 1
                         if dml_executed_before_crash >= 1:
-                            raise asyncpg.PostgresConnectionError("Simulated mid-tx PG crash after real SQL DML")
+                            try:
+                                if hasattr(self._inner, "_protocol") and hasattr(self._inner._protocol, "abort"):
+                                    self._inner._protocol.abort()
+                            except Exception:
+                                pass
+                            raise asyncpg.ConnectionDoesNotExistError("Simulated mid-tx socket disconnection after DML")
+
+                async def execute(self, query: str, *args, **kwargs):
+                    is_dml = any(query.strip().upper().startswith(t) for t in ("INSERT", "UPDATE", "DELETE", "MERGE"))
+                    res = await self._inner.execute(query, *args, **kwargs)
+                    await self._maybe_fault(is_dml)
+                    return res
+
+                async def executemany(self, command: str, *args, **kwargs):
+                    is_dml = any(command.strip().upper().startswith(t) for t in ("INSERT", "UPDATE", "DELETE", "MERGE"))
+                    res = await self._inner.executemany(command, *args, **kwargs)
+                    await self._maybe_fault(is_dml)
+                    return res
+
+                async def fetch(self, query: str, *args, **kwargs):
+                    is_dml = any(query.strip().upper().startswith(t) for t in ("INSERT", "UPDATE", "DELETE", "MERGE"))
+                    res = await self._inner.fetch(query, *args, **kwargs)
+                    await self._maybe_fault(is_dml)
+                    return res
+
+                async def fetchrow(self, query: str, *args, **kwargs):
+                    is_dml = any(query.strip().upper().startswith(t) for t in ("INSERT", "UPDATE", "DELETE", "MERGE"))
+                    res = await self._inner.fetchrow(query, *args, **kwargs)
+                    await self._maybe_fault(is_dml)
+                    return res
+
+                async def fetchval(self, query: str, *args, **kwargs):
+                    is_dml = any(query.strip().upper().startswith(t) for t in ("INSERT", "UPDATE", "DELETE", "MERGE"))
+                    res = await self._inner.fetchval(query, *args, **kwargs)
+                    await self._maybe_fault(is_dml)
                     return res
 
             @asynccontextmanager
@@ -1218,6 +1357,15 @@ async def test_ce_b2_10_csrf_origin_replay_and_rate_limit() -> None:
             try:
                 statuses = []
                 for _ in range(25):
+                    # Immediately before each request, snapshot ZSET state across all buckets (M-05)
+                    rl_keys = [
+                        k
+                        for k in (r_inst.keys("*rl*") + r_inst.keys("*rate*") + r_inst.keys("*auth*"))
+                        if r_inst.type(k) == "zset"
+                    ]
+                    pre_cards = {k: r_inst.zcard(k) for k in rl_keys}
+                    pre_members = {k: set(r_inst.zrange(k, 0, -1)) for k in rl_keys}
+
                     resp_rl = await client.post(
                         "/api/v1/auth/password/login",
                         headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": cookies["hc_csrf"]},
@@ -1226,16 +1374,20 @@ async def test_ce_b2_10_csrf_origin_replay_and_rate_limit() -> None:
                     )
                     statuses.append(resp_rl.status_code)
                     if resp_rl.status_code == 429:
+                        # Immediately afterward: capture both again and assert exact equality (M-05)
+                        post_cards = {k: r_inst.zcard(k) for k in rl_keys}
+                        post_members = {k: set(r_inst.zrange(k, 0, -1)) for k in rl_keys}
+                        assert post_cards == pre_cards, (
+                            f"ZSET cardinality was polluted by 429 request! pre={pre_cards}, post={post_cards}"
+                        )
+                        assert post_members == pre_members, (
+                            f"ZSET members were polluted by 429 request! pre={pre_members}, post={post_members}"
+                        )
                         break
                 assert 429 in statuses, f"Expected 429 from Lua ZSET rate limiter, saw {statuses}"
                 assert any("TIME" in s and "ZADD" in s for s in eval_scripts), (
                     "Expected atomic Lua ZSET script using Redis TIME + ZADD."
                 )
-                # Ensure 429 did not pollute ZSET buckets beyond limit
-                rl_keys = r_inst.keys("*rl*") or r_inst.keys("*rate*")
-                for k in rl_keys:
-                    if r_inst.type(k) == "zset":
-                        assert r_inst.zcard(k) < len(statuses)
             finally:
                 r_inst.eval = orig_eval
 
@@ -1451,3 +1603,126 @@ async def test_ce_b2_11_adversarial_garbage_collection() -> None:
             ), "GC must preserve child refresh_tokens while parent revocation_outbox row is still PENDING_REVOKE!"
     finally:
         await pool.close()
+
+
+# =============================================================================
+# CE-B2-12: Dual-Mode Logout (Bearer vs Cookie) & Secure Cookie Attributes (H-01, H-02)
+# =============================================================================
+async def test_ce_b2_12_dual_mode_logout_and_cookie_security() -> None:
+    # 1. Test Production Secure Cookie Attributes (H-02)
+    async with _running_b2_server(extra_env={"COOKIE_SECURE": "true"}) as (base_url, _):
+        pool = await deps.get_db_pool()
+        await _require_b2_schema(pool)
+        mobile_u1 = f"0912{secrets.randbelow(9000000) + 1000000}"
+        mobile_u2 = f"0912{secrets.randbelow(9000000) + 1000000}"
+        password = "HamiB2DualMode!2026"
+        uid1 = await _create_test_user(pool, mobile_u1, password=password)
+        uid2 = await _create_test_user(pool, mobile_u2, password=password)
+
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            # Bootstrap: check Set-Cookie for hc_browser & hc_csrf has ; Secure
+            boot_resp = await client.post(
+                "/api/v1/auth/browser/bootstrap",
+                headers={"Origin": base_url},
+                json={},
+            )
+            assert boot_resp.status_code == 200
+            boot_hdrs = _set_cookie_headers(boot_resp)
+            assert any("hc_browser=" in h and "; secure" in h.lower() for h in boot_hdrs), (
+                f"hc_browser cookie must have Secure attribute when COOKIE_SECURE=true: {boot_hdrs}"
+            )
+            assert any("hc_csrf=" in h and "; secure" in h.lower() for h in boot_hdrs), (
+                f"hc_csrf cookie must have Secure attribute when COOKIE_SECURE=true: {boot_hdrs}"
+            )
+            cookies = _extract_cookies_dict(boot_resp)
+            gen = boot_resp.json()["auth_generation"]
+
+            # Cookie Login: check Set-Cookie for hc_refresh has ; Secure
+            cookie_login = await client.post(
+                "/api/v1/auth/password/login",
+                headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": cookies["hc_csrf"]},
+                cookies=cookies,
+                json={"mobile": mobile_u1, "password": password, "expected_auth_generation": gen},
+            )
+            assert cookie_login.status_code == 200
+            login_hdrs = _set_cookie_headers(cookie_login)
+            assert any("hc_refresh=" in h and "; secure" in h.lower() for h in login_hdrs), (
+                f"hc_refresh cookie must have Secure attribute when COOKIE_SECURE=true: {login_hdrs}"
+            )
+            cookies.update(_extract_cookies_dict(cookie_login))
+
+            # Cookie Logout: check Set-Cookie expiration has ; Secure
+            cookie_logout = await client.post(
+                "/api/v1/auth/logout",
+                headers={"Origin": base_url, "X-Auth-Mode": "cookie", "X-CSRF-Token": cookies["hc_csrf"]},
+                cookies=cookies,
+            )
+            assert cookie_logout.status_code == 200
+            lo_hdrs = _set_cookie_headers(cookie_logout)
+            assert any("hc_refresh=" in h and "max-age=0" in h.lower() and "; secure" in h.lower() for h in lo_hdrs)
+
+            # 2. Test Non-Cookie Bearer Logout (H-01)
+            # Positive Bearer Logout: caller has browser_id = NULL, no browser_sessions row
+            bearer_login = await client.post(
+                "/api/v1/auth/password/login",
+                headers={"Origin": base_url},  # Omit X-Auth-Mode: cookie -> standard Bearer mode
+                json={"mobile": mobile_u2, "password": password},
+            )
+            assert bearer_login.status_code == 200
+            bearer_data = bearer_login.json()
+            tok_u2 = bearer_data["access_token"]
+            fam_u2 = uuid.UUID(bearer_data["session"]["family_id"])
+
+            # Call Bearer logout with Authorization header and ZERO cookies
+            bearer_lo_resp = await client.post(
+                "/api/v1/auth/logout",
+                headers={"Authorization": f"Bearer {tok_u2}"},
+            )
+            assert bearer_lo_resp.status_code == 200
+            lo_data = bearer_lo_resp.json()
+            assert lo_data.get("success") is True
+            assert lo_data.get("mode") == "bearer"
+            assert lo_data.get("auth_generation") is None, "Bearer logout must not return browser auth_generation"
+            assert len(_set_cookie_headers(bearer_lo_resp)) == 0, "Bearer logout must not emit cookie headers"
+
+            # Assert in database: family is REVOKED and outbox entry has browser_id IS NULL
+            async with pool.acquire() as conn:
+                fam_st = await conn.fetchval(
+                    "SELECT status FROM refresh_tokens WHERE family_id = $1;",
+                    fam_u2,
+                )
+                outbox_row = await conn.fetchrow(
+                    "SELECT user_id, browser_id, reason, status FROM revocation_outbox WHERE family_id = $1;",
+                    fam_u2,
+                )
+            assert fam_st == "REVOKED"
+            assert outbox_row is not None
+            assert outbox_row["user_id"] == uid2
+            assert outbox_row["browser_id"] is None, "Bearer logout must store browser_id = NULL in revocation_outbox"
+
+            # Immediate token revocation check: subsequent Bearer request must return 401
+            me_after = await client.get("/api/v1/profile/me", headers={"Authorization": f"Bearer {tok_u2}"})
+            assert me_after.status_code == 401
+
+            # 3. Negative Bearer Logout: Cross-User Family Injection Defense (H-01)
+            # Fresh login for User 1 (Bearer) and User 2 (Bearer)
+            l_u1 = await client.post("/api/v1/auth/password/login", json={"mobile": mobile_u1, "password": password})
+            l_u2 = await client.post("/api/v1/auth/password/login", json={"mobile": mobile_u2, "password": password})
+            assert l_u1.status_code == 200 and l_u2.status_code == 200
+            tok1 = l_u1.json()["access_token"]
+            rt2 = l_u2.json()["session"]["refresh_token"]
+            fam2 = uuid.UUID(l_u2.json()["session"]["family_id"])
+
+            # User 1 calls logout carrying User 2's refresh token in body
+            attack_resp = await client.post(
+                "/api/v1/auth/logout",
+                headers={"Authorization": f"Bearer {tok1}"},
+                json={"refresh_token": rt2},
+            )
+            # Must either reject 403 or silently ignore unowned token without revoking User 2's family
+            async with pool.acquire() as conn:
+                fam2_active = await conn.fetchval(
+                    "SELECT COUNT(*) FROM refresh_tokens WHERE family_id = $1 AND status = 'ACTIVE';",
+                    fam2,
+                )
+            assert fam2_active == 1, "Cross-user Bearer logout injection must NEVER revoke victim's token family!"
