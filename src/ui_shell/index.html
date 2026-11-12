@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>حامی‌کارت | پیش‌نمایش یکپارچه فاز ۳ (HC-T39)</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./styles/tokens.css" />
+  <link rel="stylesheet" href="./styles/shell.css" />
+</head>
+<body>
+  <a href="#main-content" class="hc-skip-link">پرش به محتوای اصلی</a>
+
+  <!-- Persistent Synthetic Data & Proposed Policy Notice Banner -->
+  <div class="hc-governance-bar" role="region" aria-label="اعلان محیط آزمایشی و وضعیت طراحی">
+    <div class="hc-governance-inner">
+      <span>⚠️ داده‌های آزمایشی مصنوعی (Synthetic Demo Data) — نشست امن کوکی بدون اتصال به درگاه پرداخت یا پیامک زنده</span>
+      <span class="hc-badge hc-badge--proposed">تم و فونت پیشنهادی OPEN-15 (در انتظار تایید مالک)</span>
+    </div>
+  </div>
+
+  <!-- Header & Primary Public/Shell Navigation -->
+  <header class="hc-header">
+    <div class="hc-container hc-header-inner">
+      <a href="#/home" class="hc-brand">
+        <span class="hc-brand-mark" aria-hidden="true">ح</span>
+        <span>
+          <span class="hc-brand-title">حامی‌کارت</span>
+          <span class="hc-brand-sub">شِل یکپارچه فاز ۳ با نشست امن (HC-T39)</span>
+        </span>
+      </a>
+
+      <nav class="hc-nav-desktop" aria-label="منوی اصلی">
+        <a href="#/home" class="hc-nav-link" data-nav-route="#/home">صفحه اصلی</a>
+        <a href="#/doctors" class="hc-nav-link" data-nav-route="#/doctors">شبکه پزشکان</a>
+        <a href="#/plans" class="hc-nav-link" data-nav-route="#/plans">طرح‌های تخفیف</a>
+        <a href="#/panel/user" class="hc-nav-link" data-nav-route="#/panel/user">پنل‌های ۶گانه</a>
+        <a href="#/content/faq" class="hc-nav-link" data-nav-route="#/content/faq">پرسش‌های متداول</a>
+        <a href="#/auth/shell" class="hc-nav-link" data-nav-route="#/auth/shell">ورود و نشست امن</a>
+      </nav>
+
+      <button
+        type="button"
+        id="hc-menu-toggle"
+        class="hc-menu-toggle"
+        aria-expanded="false"
+        aria-controls="hc-mobile-drawer"
+        aria-label="باز و بسته کردن منوی موبایل"
+      >
+        منو ☰
+      </button>
+    </div>
+
+    <nav id="hc-mobile-drawer" class="hc-mobile-drawer" aria-label="منوی موبایل" aria-hidden="true">
+      <button type="button" id="hc-drawer-close" class="hc-nav-link hc-drawer-close" aria-label="بستن منوی موبایل">بستن منو ✕</button>
+      <a href="#/home" class="hc-nav-link" data-nav-route="#/home">صفحه اصلی</a>
+      <a href="#/doctors" class="hc-nav-link" data-nav-route="#/doctors">شبکه پزشکان (داده مصنوعی)</a>
+      <a href="#/plans" class="hc-nav-link" data-nav-route="#/plans">طرح‌های تخفیف (تومان)</a>
+      <a href="#/panel/user" class="hc-nav-link" data-nav-route="#/panel/user">پنل‌های ۶گانه نقش‌ها</a>
+      <a href="#/content/about" class="hc-nav-link" data-nav-route="#/content/about">درباره ما</a>
+      <a href="#/content/contact" class="hc-nav-link" data-nav-route="#/content/contact">تماس با ما</a>
+      <a href="#/content/terms" class="hc-nav-link" data-nav-route="#/content/terms">قوانین و شرایط</a>
+      <a href="#/content/privacy" class="hc-nav-link" data-nav-route="#/content/privacy">حریم خصوصی</a>
+      <a href="#/content/faq" class="hc-nav-link" data-nav-route="#/content/faq">پرسش‌های متداول</a>
+      <a href="#/auth/shell" class="hc-nav-link" data-nav-route="#/auth/shell">ورود و نشست امن</a>
+    </nav>
+  </header>
+
+  <!-- Interactive UI State & 6-Role Panel Switcher (Inspection Only, No Auth Claims) -->
+  <section class="hc-simulator-strip" aria-label="ابزار بازبینی وضعیت‌های UI و پنل‌های ۶گانه">
+    <div class="hc-container hc-simulator-grid">
+      <div class="hc-pill-group" role="radiogroup" aria-labelledby="hc-role-group-label">
+        <span id="hc-role-group-label" class="hc-pill-label">پنل نقش (نمایشی):</span>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/user" aria-checked="false" tabindex="0">USER</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/doctor" aria-checked="false" tabindex="-1">DOCTOR</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/agent" aria-checked="false" tabindex="-1">AGENT</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/support" aria-checked="false" tabindex="-1">SUPPORT</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/admin" aria-checked="false" tabindex="-1">ADMIN</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-role-route="#/panel/super-admin" aria-checked="false" tabindex="-1">SUPER_ADMIN</button>
+      </div>
+
+      <div class="hc-pill-group" role="radiogroup" aria-labelledby="hc-state-group-label">
+        <span id="hc-state-group-label" class="hc-pill-label">وضعیت UI:</span>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="NORMAL" aria-checked="true" tabindex="0">عادی</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="LOADING" aria-checked="false" tabindex="-1">بارگذاری</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="EMPTY" aria-checked="false" tabindex="-1">داده خالی</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="ERROR" aria-checked="false" tabindex="-1">خطا</button>
+        <button type="button" class="hc-pill-btn" role="radio" data-ui-state="DISABLED_GATE" aria-checked="false" tabindex="-1">غیرفعال/قفل</button>
+      </div>
+    </div>
+  </section>
+
+  <div id="hc-live-status" class="hc-sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- Main Workspace -->
+  <main id="main-content" class="hc-main" tabindex="-1">
+    <div class="hc-container" id="app-root">
+      <noscript>
+        <div class="hc-card">برای مشاهده تعاملی اسکلت فاز ۳، لطفاً جاوااسکریپت مرورگر را فعال نمایید.</div>
+      </noscript>
+    </div>
+  </main>
+
+  <!-- Public Footer (Section 20 CONTENT-002 Links) -->
+  <footer class="hc-footer">
+    <div class="hc-container">
+      <div class="hc-footer-links">
+        <a href="#/content/about">درباره ما</a>
+        <a href="#/content/contact">تماس با ما</a>
+        <a href="#/content/terms">قوانین و شرایط</a>
+        <a href="#/content/privacy">حریم خصوصی</a>
+        <a href="#/content/faq">پرسش‌های متداول</a>
+      </div>
+      <div>
+        حامی‌کارت — خروجی مستقل طراحی فاز ۳ (<code>HC-T16</code>) | تمامی تم‌ها (<code>OPEN-15</code>) و سیاست‌ها (<code>OPEN-01..18</code>) در وضعیت <strong>PROPOSED</strong> هستند.
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

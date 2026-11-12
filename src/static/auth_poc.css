@@ -1,0 +1,119 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 24px;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f6f8;
+  color: #111827;
+  line-height: 1.5;
+}
+
+.poc-main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.poc-header {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+
+.poc-header h1 {
+  margin: 0 0 8px;
+  font-size: 1.25rem;
+}
+
+.poc-note {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.poc-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.poc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.poc-card {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.poc-card h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+input {
+  padding: 8px 10px;
+  border: 1px solid #9ca3af;
+  border-radius: 6px;
+  font-size: 0.95rem;
+}
+
+button {
+  cursor: pointer;
+  padding: 9px 14px;
+  border: 1px solid #1d4ed8;
+  background: #1d4ed8;
+  color: #ffffff;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+button.danger {
+  border-color: #b91c1c;
+  background: #b91c1c;
+}
+
+.poc-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+pre {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+

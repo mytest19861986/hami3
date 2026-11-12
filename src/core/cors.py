@@ -11,6 +11,7 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import PlainTextResponse, Response
@@ -32,11 +33,17 @@ ALLOWED_CORS_HEADERS = [
     "Origin",
     "X-Requested-With",
     "Idempotency-Key",
+    "X-CSRF-Token",
+    "X-Auth-Mode",
 ]
 
 
 class CorsConfigurationError(ValueError):
     """Raised when CORS environment configuration violates security invariants."""
+
+
+class CorsOriginRejectedError(ValueError):
+    """Raised when a credentialed request originates from an untrusted or missing Origin/Referer."""
 
 
 def is_production_environment() -> bool:
@@ -158,3 +165,57 @@ class StrictCORSMiddleware(CORSMiddleware):
             await send(message)
             return
         await super().send(message, send, request_headers)
+
+
+def validate_cookie_request_origin(request: Request) -> str:
+    """
+    Fail-closed Origin / Referer enforcement for cookie-authenticated endpoints (CSRF barrier #1).
+    Accepts strictly verified origins matching `resolve_cors_settings()["allow_origins"]`
+    (plus exact local `127.0.0.1`/`localhost` ephemeral port only in non-restricted env when
+    explicit `CORS_ALLOWED_ORIGINS` is unset).
+    Rejects missing `Origin`+`Referer`, `null`, wildcards, and lookalike/untrusted origins.
+    """
+    cfg = resolve_cors_settings()
+    allowed_origins = set(cfg["allow_origins"])
+
+    explicit_env = (os.getenv("CORS_ALLOWED_ORIGINS") is not None) or (
+        os.getenv("ALLOWED_CORS_ORIGINS") is not None
+    )
+    if not explicit_env and not is_production_environment():
+        host_hdr = (request.headers.get("host") or "").strip().lower()
+        scheme = (request.url.scheme or "http").lower()
+        if host_hdr and scheme in ("http", "https"):
+            candidate_self = f"{scheme}://{host_hdr}"
+            try:
+                normalized_self = validate_cors_origin(candidate_self)
+                parsed_self = urlparse(normalized_self)
+                if parsed_self.hostname in ("127.0.0.1", "localhost"):
+                    allowed_origins.add(normalized_self)
+            except CorsConfigurationError:
+                pass
+
+    raw_origin = request.headers.get("origin")
+    if raw_origin is not None:
+        try:
+            normalized = validate_cors_origin(raw_origin)
+        except CorsConfigurationError as exc:
+            raise CorsOriginRejectedError(f"Invalid request Origin header: {exc}") from exc
+        if normalized not in allowed_origins:
+            raise CorsOriginRejectedError(f"Untrusted request Origin: {normalized}")
+        return normalized
+
+    raw_referer = request.headers.get("referer")
+    if raw_referer is not None:
+        parsed = urlparse(raw_referer.strip())
+        if not parsed.scheme or not parsed.netloc:
+            raise CorsOriginRejectedError("Malformed request Referer header.")
+        candidate = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            normalized_ref = validate_cors_origin(candidate)
+        except CorsConfigurationError as exc:
+            raise CorsOriginRejectedError(f"Invalid request Referer origin: {exc}") from exc
+        if normalized_ref not in allowed_origins:
+            raise CorsOriginRejectedError(f"Untrusted request Referer origin: {normalized_ref}")
+        return normalized_ref
+
+    raise CorsOriginRejectedError("Missing Origin or Referer header on cookie-authenticated request.")
