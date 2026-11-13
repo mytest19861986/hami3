@@ -107,6 +107,10 @@
             <div id="user-mobile-disp" class="text-xs font-bold text-slate-800"></div>
             <div id="user-role-badge" class="text-[10px] text-brand-600 font-semibold bg-brand-50 px-1.5 py-0.5 rounded"></div>
           </div>
+          <button id="doctor-portal-btn" onclick="openDoctorPortalModal()" class="hidden px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors items-center gap-1.5 shadow-sm shadow-emerald-600/20">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-3-3v6m-7 4h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+            <span>پرتابل مطب و ثبت خدمت</span>
+          </button>
           <button onclick="openDashboardModal()" class="px-3 py-1.5 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors flex items-center gap-1.5">
             <span>پنل کاربری</span>
           </button>
@@ -395,6 +399,225 @@
       <div class="text-xs text-slate-500 leading-relaxed text-center">
         تمامی تراکنش‌ها و نوبت‌های ویزیت بر مبنای قرارداد رسمی و استانداردهای PRD v1.0 ثبت و ممیزی می‌شوند.
       </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- DOCTOR PORTAL & SERVICE RECORDING MODAL (HC-T54) -->
+  <!-- ========================================================================= -->
+  <div id="doctor-portal-modal" class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm hidden items-center justify-center p-4">
+    <div class="bg-white rounded-3xl p-6 sm:p-8 max-w-4xl w-full max-h-[92vh] overflow-y-auto shadow-2xl relative">
+      <button onclick="closeDoctorPortalModal()" class="absolute left-4 top-4 p-2 text-slate-400 hover:text-slate-600 rounded-full">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+      </button>
+
+      <!-- Header & Status -->
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-slate-100 mb-6">
+        <div>
+          <div class="flex items-center gap-2 mb-1">
+            <span class="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></span>
+            <h3 class="text-xl font-extrabold text-slate-900">پرتابل مطب و ثبت خدمات درمانی</h3>
+          </div>
+          <p class="text-xs text-slate-500" id="doc-portal-clinic-info">در حال بارگذاری اطلاعات مطب و قراردادها...</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="doc-portal-status-badge" class="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-bold">
+            در انتظار بررسی
+          </span>
+          <span class="text-xs text-slate-400 font-mono" id="doc-portal-mc-code">نظام پزشکی: -</span>
+        </div>
+      </div>
+
+      <!-- Active Contracts Banner -->
+      <div class="bg-emerald-50/60 border border-emerald-100 rounded-2xl p-4 mb-6">
+        <div class="flex items-center justify-between mb-2">
+          <div class="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+            <svg class="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            قراردادهای رسمی فعال حامی‌کارت
+          </div>
+          <span class="text-[11px] text-emerald-700" id="doc-contracts-count">۰ قرارداد فعال</span>
+        </div>
+        <div id="doc-contracts-container" class="space-y-2 text-xs text-emerald-800">
+          <div class="text-slate-400 text-xs">در حال بارگذاری لیست قراردادها...</div>
+        </div>
+      </div>
+
+      <!-- Live Performance Metrics -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+        <div class="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 text-center">
+          <div class="text-[11px] text-slate-500">کل خدمات ثبت‌شده</div>
+          <div class="text-lg font-black text-slate-800 mt-1" id="doc-metric-total">۰</div>
+        </div>
+        <div class="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 text-center">
+          <div class="text-[11px] text-slate-500">خدمات امروز</div>
+          <div class="text-lg font-black text-emerald-600 mt-1" id="doc-metric-today">۰</div>
+        </div>
+        <div class="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 text-center">
+          <div class="text-[11px] text-slate-500">مجموع تخفیف بیماران</div>
+          <div class="text-lg font-black text-brand-600 mt-1" id="doc-metric-discount">۰ ت</div>
+        </div>
+        <div class="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 text-center">
+          <div class="text-[11px] text-slate-500">دریافتی از بیماران</div>
+          <div class="text-lg font-black text-slate-800 mt-1" id="doc-metric-paid">۰ ت</div>
+        </div>
+      </div>
+
+      <!-- Two-Column Workflow: Patient Inquiry + Record Visit -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        
+        <!-- Step 1: Patient Eligibility Inquiry -->
+        <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5 flex flex-col justify-between">
+          <div>
+            <div class="flex items-center gap-2 mb-3">
+              <span class="w-6 h-6 rounded-full bg-brand-600 text-white flex items-center justify-center text-xs font-bold">۱</span>
+              <h4 class="font-bold text-slate-800 text-sm">استعلام اعتبار و سهمیه بیمار</h4>
+            </div>
+            <p class="text-xs text-slate-500 mb-4">برای استعلام، کد ملی یا شناسه عضویت حامی‌کارت بیمار را وارد کنید.</p>
+            
+            <div class="space-y-3 mb-4">
+              <div>
+                <label class="block text-xs font-semibold text-slate-700 mb-1">کد ملی بیمار یا شناسه عضویت</label>
+                <input id="doc-inquire-input" type="text" placeholder="مثال: 0012345678 یا کد عضویت"
+                       class="w-full h-10 px-3 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-brand-500">
+              </div>
+              <button id="doc-inquire-btn" onclick="inquirePatientEligibility()"
+                      class="w-full h-10 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm shadow-brand-600/20 flex items-center justify-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <span>استعلام اعتبار بیمار</span>
+              </button>
+            </div>
+
+            <div id="doc-inquire-alert" class="hidden p-3 rounded-xl text-xs mb-3"></div>
+
+            <!-- Inquiry Result Card -->
+            <div id="doc-inquire-result" class="hidden bg-white border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
+              <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <span class="text-slate-500">نام بیمار:</span>
+                <span class="font-bold text-slate-800" id="res-patient-name">-</span>
+              </div>
+              <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <span class="text-slate-500">کد ملی (محرمانه):</span>
+                <span class="font-mono font-bold text-slate-700" id="res-patient-nat">-</span>
+              </div>
+              <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <span class="text-slate-500">طرح عضویت:</span>
+                <span class="font-semibold text-brand-600" id="res-plan-title">-</span>
+              </div>
+              <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <span class="text-slate-500">سهمیه باقیمانده:</span>
+                <span class="font-bold text-emerald-600" id="res-remaining-visits">-</span>
+              </div>
+              <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <span class="text-slate-500">تخفیف موثر سامانه:</span>
+                <span class="font-bold text-indigo-600" id="res-effective-discount">-</span>
+              </div>
+              <div class="flex justify-between items-center">
+                <span class="text-slate-500">وضعیت اعتبار:</span>
+                <span class="font-bold" id="res-eligibility-badge">-</span>
+              </div>
+            </div>
+          </div>
+
+          <button id="doc-select-patient-btn" onclick="populateVisitFormWithInquiry()" class="hidden mt-3 w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all">
+            تأیید بیمار و انتقال به فرم ثبت خدمت ←
+          </button>
+        </div>
+
+        <!-- Step 2: Register Medical Service -->
+        <div class="bg-white border border-slate-200 rounded-2xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="w-6 h-6 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold">۲</span>
+            <h4 class="font-bold text-slate-800 text-sm">ثبت خدمت درمانی و کسر سهمیه</h4>
+          </div>
+
+          <div class="space-y-3">
+            <input type="hidden" id="visit-holder-id">
+            <input type="hidden" id="visit-mem-id">
+
+            <div>
+              <label class="block text-xs font-semibold text-slate-700 mb-1">بیمار انتخاب شده</label>
+              <input id="visit-patient-disp" type="text" readonly placeholder="ابتدا از بخش ۱ استعلام بگیرید"
+                     class="w-full h-9 px-3 text-xs bg-slate-100 text-slate-600 border border-slate-200 rounded-xl cursor-not-allowed">
+            </div>
+
+            <div>
+              <label class="block text-xs font-semibold text-slate-700 mb-1">عنوان خدمت پزشکی / دندانپزشکی</label>
+              <input id="visit-service-title" type="text" placeholder="مثال: ویزیت تخصصی، معاینه یا درمان ریشه"
+                     class="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-brand-500">
+            </div>
+
+            <div>
+              <label class="block text-xs font-semibold text-slate-700 mb-1">مبلغ آزاد خدمت (تومان)</label>
+              <input id="visit-total-amount" type="number" oninput="calculateVisitLiveBreakdown()" placeholder="مثال: 500000"
+                     class="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-brand-500">
+            </div>
+
+            <!-- Financial Live Breakdown -->
+            <div class="bg-slate-50 rounded-xl p-3 border border-slate-200/60 space-y-1.5 text-[11px]">
+              <div class="flex justify-between text-slate-600">
+                <span>تخفیف اعمال‌شده حامی‌کارت:</span>
+                <span class="font-bold text-emerald-600" id="live-discount-disp">۰ تومان (۰٪)</span>
+              </div>
+              <div class="flex justify-between text-slate-800 font-bold pt-1 border-t border-slate-200">
+                <span>مبلغ قابل پرداخت توسط بیمار:</span>
+                <span class="text-slate-900 font-black" id="live-patient-pay-disp">۰ تومان</span>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-xs font-semibold text-slate-700 mb-1">یادداشت داخلی مطب (اختیاری)</label>
+              <input id="visit-private-notes" type="text" placeholder="شرح مختصر معاینه یا تجویز..."
+                     class="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-brand-500">
+            </div>
+
+            <div id="doc-record-alert" class="hidden p-2.5 rounded-xl text-xs"></div>
+
+            <button id="doc-submit-visit-btn" onclick="submitDoctorVisitRecord()"
+                    class="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-emerald-600/20 flex items-center justify-center gap-1.5">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+              <span>ثبت قطعی خدمت درمانی و کسر سهمیه</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Registered Visits History Table -->
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <h4 class="font-bold text-slate-800 text-sm flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-slate-400"></span>
+            لیست خدمات و ویزیت‌های اخیر ثبت‌شده در این مطب
+          </h4>
+          <button onclick="loadDoctorRecentVisits()" class="text-xs text-brand-600 hover:text-brand-700 font-semibold flex items-center gap-1">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+            بروزرسانی جدول
+          </button>
+        </div>
+
+        <div class="overflow-x-auto border border-slate-200 rounded-2xl">
+          <table class="w-full text-right text-xs">
+            <thead class="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
+              <tr>
+                <th class="p-3">تاریخ و ساعت</th>
+                <th class="p-3">نام بیمار</th>
+                <th class="p-3">کد ملی (ماسک‌شده)</th>
+                <th class="p-3">عنوان خدمت</th>
+                <th class="p-3">مبلغ آزاد</th>
+                <th class="p-3">تخفیف حامی</th>
+                <th class="p-3">پرداختی بیمار</th>
+                <th class="p-3">وضعیت</th>
+              </tr>
+            </thead>
+            <tbody id="doc-visits-table-body" class="divide-y divide-slate-100 text-slate-700">
+              <tr>
+                <td colspan="8" class="text-center p-6 text-slate-400">در حال بارگذاری سوابق ویزیت...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -765,6 +988,18 @@
           document.getElementById('user-mobile-disp').textContent = profile.mobile || 'کاربر حامی‌کارت';
           document.getElementById('user-role-badge').textContent = (profile.roles && profile.roles[0]) || 'USER';
 
+          // Doctor portal button visibility
+          const docBtn = document.getElementById('doctor-portal-btn');
+          if (docBtn) {
+            if (profile.roles && (profile.roles.includes('DOCTOR') || profile.roles.includes('ADMIN') || profile.roles.includes('SUPER_ADMIN'))) {
+              docBtn.classList.remove('hidden');
+              docBtn.classList.add('flex');
+            } else {
+              docBtn.classList.add('hidden');
+              docBtn.classList.remove('flex');
+            }
+          }
+
           // Load wallet
           loadWallet();
         } else {
@@ -793,7 +1028,13 @@
       document.getElementById('login-btn').classList.remove('hidden');
       document.getElementById('user-info-bar').classList.add('hidden');
       document.getElementById('user-info-bar').classList.remove('flex');
+      const docBtn = document.getElementById('doctor-portal-btn');
+      if (docBtn) {
+        docBtn.classList.add('hidden');
+        docBtn.classList.remove('flex');
+      }
       closeDashboardModal();
+      closeDoctorPortalModal();
       if (tokenToRevoke) {
         try {
           await fetch(`${API_BASE}/auth/logout`, {
@@ -819,6 +1060,288 @@
       document.getElementById('dashboard-modal').classList.add('hidden');
       document.getElementById('dashboard-modal').classList.remove('flex');
     }
+
+    let currentDoctorPortalData = null;
+    let currentInquiredPatient = null;
+
+    function openDoctorPortalModal() {
+      document.getElementById('doctor-portal-modal').classList.remove('hidden');
+      document.getElementById('doctor-portal-modal').classList.add('flex');
+      loadDoctorPortalData();
+    }
+
+    function closeDoctorPortalModal() {
+      document.getElementById('doctor-portal-modal').classList.add('hidden');
+      document.getElementById('doctor-portal-modal').classList.remove('flex');
+    }
+
+    async function loadDoctorPortalData() {
+      try {
+        const res = await authenticatedFetch(`${API_BASE}/doctors/me/portal`);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          alert(err.detail || 'خطا در بارگذاری پرتابل پزشک. دسترسی مجاز نیست.');
+          closeDoctorPortalModal();
+          return;
+        }
+        const data = await res.json();
+        const portal = data.portal;
+        currentDoctorPortalData = portal;
+
+        // Populate Doctor Info
+        const doc = portal.doctor || {};
+        document.getElementById('doc-portal-clinic-info').textContent =
+          `${doc.clinic_name || 'مطب پزشک'} | ${doc.specialty || 'عمومی'} | ${doc.city_name || ''}، ${doc.clinic_address || ''} | تلفن: ${doc.clinic_phone || '-'}`;
+        document.getElementById('doc-portal-mc-code').textContent = `نظام پزشکی: ${doc.medical_council_code || '-'}`;
+
+        const badge = document.getElementById('doc-portal-status-badge');
+        if (doc.verification_status === 'APPROVED') {
+          badge.textContent = 'تایید شده رسمی (APPROVED)';
+          badge.className = 'px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-bold';
+        } else {
+          badge.textContent = `وضعیت: ${doc.verification_status}`;
+          badge.className = 'px-3 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded-full text-xs font-bold';
+        }
+
+        // Contracts
+        const contracts = portal.contracts || [];
+        document.getElementById('doc-contracts-count').textContent = `${contracts.length} قرارداد فعال`;
+        const contractsContainer = document.getElementById('doc-contracts-container');
+        if (contracts.length === 0) {
+          contractsContainer.innerHTML = '<div class="text-xs text-slate-500">هیچ قرارداد فعال ثبت‌شده‌ای یافت نشد.</div>';
+        } else {
+          contractsContainer.innerHTML = contracts.map(c => `
+            <div class="flex items-center justify-between p-2.5 bg-white border border-emerald-100 rounded-xl">
+              <div>
+                <span class="font-bold text-slate-800">شماره قرارداد: ${c.contract_number}</span>
+                <span class="mr-2 text-slate-500">اعتبار: از ${c.start_date} تا ${c.end_date}</span>
+              </div>
+              <span class="px-2 py-0.5 bg-emerald-100 text-emerald-800 font-bold rounded-lg text-[11px]">
+                تخفیف توافقی: ${c.agreed_discount_percent}٪
+              </span>
+            </div>
+          `).join('');
+        }
+
+        // Metrics
+        const m = portal.metrics || {};
+        document.getElementById('doc-metric-total').textContent = (m.total_visits_count || 0).toLocaleString('fa-IR');
+        document.getElementById('doc-metric-today').textContent = (m.today_visits_count || 0).toLocaleString('fa-IR');
+        document.getElementById('doc-metric-discount').textContent = `${parseInt(m.total_discount_toman || 0).toLocaleString('fa-IR')} ت`;
+        document.getElementById('doc-metric-paid').textContent = `${parseInt(m.total_patient_paid_toman || 0).toLocaleString('fa-IR')} ت`;
+
+        // Render visits
+        renderDoctorVisitsTable(portal.recent_visits || []);
+      } catch (e) {
+        console.error('Failed to load doctor portal data:', e);
+      }
+    }
+
+    async function loadDoctorRecentVisits() {
+      try {
+        const res = await authenticatedFetch(`${API_BASE}/visits/my-visits?limit=20`);
+        if (res.ok) {
+          const visits = await res.json();
+          renderDoctorVisitsTable(visits);
+        }
+      } catch (e) {
+        console.error('Failed to reload recent visits:', e);
+      }
+    }
+
+    function renderDoctorVisitsTable(visits) {
+      const tbody = document.getElementById('doc-visits-table-body');
+      if (!visits || visits.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="text-center p-6 text-slate-400">تاکنون خدمتی ثبت نشده است.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = visits.map(v => {
+        const d = new Date(v.visit_date || v.created_at);
+        const dateStr = d.toLocaleDateString('fa-IR') + ' ' + d.toLocaleTimeString('fa-IR', {hour: '2-digit', minute:'2-digit'});
+        return `
+          <tr class="hover:bg-slate-50 transition-colors">
+            <td class="p-3 font-mono text-[11px] text-slate-500">${dateStr}</td>
+            <td class="p-3 font-semibold text-slate-900">${v.patient_first_name || ''} ${v.patient_last_name || ''}</td>
+            <td class="p-3 font-mono text-slate-600">${v.patient_national_code || '-'}</td>
+            <td class="p-3 font-medium text-slate-800">${v.service_title}</td>
+            <td class="p-3 font-bold text-slate-700">${parseInt(v.total_amount_toman).toLocaleString('fa-IR')} ت</td>
+            <td class="p-3 font-bold text-emerald-600">${parseInt(v.discount_amount_toman).toLocaleString('fa-IR')} ت (${parseFloat(v.discount_percent)}٪)</td>
+            <td class="p-3 font-black text-slate-900">${parseInt(v.patient_paid_amount_toman).toLocaleString('fa-IR')} ت</td>
+            <td class="p-3">
+              <span class="px-2 py-0.5 rounded text-[10px] font-bold ${v.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">
+                ${v.status === 'COMPLETED' ? 'موفق' : 'لغوشده'}
+              </span>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function inquirePatientEligibility() {
+      const input = document.getElementById('doc-inquire-input').value.trim();
+      const alertBox = document.getElementById('doc-inquire-alert');
+      const resultCard = document.getElementById('doc-inquire-result');
+      const selectBtn = document.getElementById('doc-select-patient-btn');
+
+      alertBox.classList.add('hidden');
+      resultCard.classList.add('hidden');
+      selectBtn.classList.add('hidden');
+      currentInquiredPatient = null;
+
+      if (!input) {
+        alertBox.textContent = 'لطفاً کد ملی یا شناسه عضویت بیمار را وارد نمایید.';
+        alertBox.className = 'p-3 rounded-xl text-xs bg-rose-50 text-rose-700 mb-3';
+        alertBox.classList.remove('hidden');
+        return;
+      }
+
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input);
+      const payload = isUuid ? { membership_id: input } : { national_code: input };
+
+      try {
+        const res = await authenticatedFetch(`${API_BASE}/visits/inquire`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alertBox.textContent = data.detail || 'بیمار یا عضویتی با این مشخصات یافت نشد.';
+          alertBox.className = 'p-3 rounded-xl text-xs bg-rose-50 text-rose-700 mb-3';
+          alertBox.classList.remove('hidden');
+          return;
+        }
+
+        const el = data.eligibility;
+        currentInquiredPatient = el;
+
+        document.getElementById('res-patient-name').textContent = el.holder_full_name;
+        document.getElementById('res-patient-nat').textContent = el.patient_national_code;
+        document.getElementById('res-plan-title').textContent = el.plan_title;
+        document.getElementById('res-remaining-visits').textContent =
+          el.max_visits === null ? 'نامحدود (بدون سقف)' : `${el.remaining_visits} نوبت از ${el.max_visits}`;
+        document.getElementById('res-effective-discount').textContent = `${el.effective_discount_percent}٪ (${el.discount_source})`;
+
+        const badge = document.getElementById('res-eligibility-badge');
+        if (el.is_eligible) {
+          badge.textContent = 'معتبر و دارای سهمیه مجاز';
+          badge.className = 'font-bold text-emerald-600';
+          selectBtn.classList.remove('hidden');
+        } else {
+          badge.textContent = `غیرمجاز: ${el.ineligibility_reason || 'فاقد اعتبار'}`;
+          badge.className = 'font-bold text-rose-600';
+        }
+
+        resultCard.classList.remove('hidden');
+      } catch (e) {
+        alertBox.textContent = 'خطای ارتباط با سرور در استعلام سهمیه.';
+        alertBox.className = 'p-3 rounded-xl text-xs bg-rose-50 text-rose-700 mb-3';
+        alertBox.classList.remove('hidden');
+      }
+    }
+
+    function populateVisitFormWithInquiry() {
+      if (!currentInquiredPatient) return;
+      document.getElementById('visit-holder-id').value = currentInquiredPatient.holder_id;
+      document.getElementById('visit-mem-id').value = currentInquiredPatient.membership_id;
+      document.getElementById('visit-patient-disp').value =
+        `${currentInquiredPatient.holder_full_name} (${currentInquiredPatient.patient_national_code}) - طرح ${currentInquiredPatient.plan_title}`;
+      calculateVisitLiveBreakdown();
+    }
+
+    function calculateVisitLiveBreakdown() {
+      const amount = parseInt(document.getElementById('visit-total-amount').value) || 0;
+      const rate = currentInquiredPatient ? parseFloat(currentInquiredPatient.effective_discount_percent) : 0;
+      const discount = Math.floor((amount * rate) / 100);
+      const patientPay = Math.max(0, amount - discount);
+
+      document.getElementById('live-discount-disp').textContent =
+        `${discount.toLocaleString('fa-IR')} تومان (${rate}٪)`;
+      document.getElementById('live-patient-pay-disp').textContent =
+        `${patientPay.toLocaleString('fa-IR')} تومان`;
+    }
+
+    async function submitDoctorVisitRecord() {
+      const holderId = document.getElementById('visit-holder-id').value;
+      const memId = document.getElementById('visit-mem-id').value;
+      const serviceTitle = document.getElementById('visit-service-title').value.trim();
+      const amount = parseInt(document.getElementById('visit-total-amount').value);
+      const notes = document.getElementById('visit-private-notes').value.trim();
+      const alertBox = document.getElementById('doc-record-alert');
+      const submitBtn = document.getElementById('doc-submit-visit-btn');
+
+      alertBox.classList.add('hidden');
+
+      if (!holderId || !memId) {
+        alertBox.textContent = 'لطفاً ابتدا بیمار را استعلام و انتخاب نمایید.';
+        alertBox.className = 'p-2.5 rounded-xl text-xs bg-rose-50 text-rose-700';
+        alertBox.classList.remove('hidden');
+        return;
+      }
+      if (!serviceTitle) {
+        alertBox.textContent = 'لطفاً عنوان خدمت پزشکی را وارد کنید.';
+        alertBox.className = 'p-2.5 rounded-xl text-xs bg-rose-50 text-rose-700';
+        alertBox.classList.remove('hidden');
+        return;
+      }
+      if (isNaN(amount) || amount <= 0) {
+        alertBox.textContent = 'مبلغ خدمت باید یک عدد مثبت باشد.';
+        alertBox.className = 'p-2.5 rounded-xl text-xs bg-rose-50 text-rose-700';
+        alertBox.classList.remove('hidden');
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+      // Client idempotency key
+      const idempotencyKey = 'doc-visit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
+
+      try {
+        const res = await authenticatedFetch(`${API_BASE}/visits/record`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+          },
+          body: JSON.stringify({
+            holder_id: holderId,
+            membership_id: memId,
+            service_title: serviceTitle,
+            total_amount_toman: amount,
+            private_notes: notes || null,
+            idempotency_key: idempotencyKey,
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alertBox.textContent = 'خدمت درمانی با موفقیت ثبت شد و سهمیه بیمار کسر گردید.';
+          alertBox.className = 'p-2.5 rounded-xl text-xs bg-emerald-50 text-emerald-800';
+          alertBox.classList.remove('hidden');
+
+          // Reset form fields
+          document.getElementById('visit-service-title').value = '';
+          document.getElementById('visit-total-amount').value = '';
+          document.getElementById('visit-private-notes').value = '';
+          calculateVisitLiveBreakdown();
+
+          // Refresh portal data & recent visits
+          await loadDoctorPortalData();
+        } else {
+          alertBox.textContent = data.detail || 'خطا در ثبت خدمت درمانی.';
+          alertBox.className = 'p-2.5 rounded-xl text-xs bg-rose-50 text-rose-700';
+          alertBox.classList.remove('hidden');
+        }
+      } catch (e) {
+        alertBox.textContent = 'خطای ارتباط با سرور در ثبت خدمت.';
+        alertBox.className = 'p-2.5 rounded-xl text-xs bg-rose-50 text-rose-700';
+        alertBox.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+      }
+    }
+
 
     function handleBuyPlan(planId) {
       if (!currentAuthToken) {

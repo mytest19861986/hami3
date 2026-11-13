@@ -70,6 +70,11 @@ class VisitCancellationError(VisitError):
     pass
 
 
+class DuplicateVisitError(VisitError):
+    """Raised when duplicate visit registration or rapid replay is detected (409 Conflict)."""
+    pass
+
+
 def _resolve_actor_role_label(roles: Set[str]) -> str:
     for candidate in ("SUPER_ADMIN", "ADMIN", "DOCTOR", "SUPPORT", "AGENT", "USER"):
         if candidate in roles:
@@ -124,6 +129,7 @@ class VisitService:
         actor_user_id: uuid.UUID | None = None,
         doctor_id: uuid.UUID | None = None,
         private_notes: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Dict[str, Any]:
         """
         Records a medical visit with strict service-boundary actor/doctor authorization,
@@ -193,6 +199,42 @@ class VisitService:
                     resolved_doctor_id = actor_doc["id"]
                     doctor_custom_rate_raw = actor_doc["custom_discount_percent"]
                     admin_override = False
+
+                # Duplicate registration / Rapid replay prevention
+                if idempotency_key:
+                    clean_key = str(idempotency_key).strip()
+                    if clean_key:
+                        existing_idem = await conn.fetchrow(
+                            """
+                            SELECT entity_id FROM audit_logs
+                            WHERE action = 'VISIT_RECORDED'
+                              AND new_values->>'idempotency_key' = $1
+                            LIMIT 1
+                            """,
+                            clean_key,
+                        )
+                        if existing_idem:
+                            raise DuplicateVisitError(
+                                f"Duplicate visit submission detected for idempotency key '{clean_key}'."
+                            )
+
+                recent_dup = await conn.fetchrow(
+                    """
+                    SELECT id FROM visits
+                    WHERE doctor_id = $1 AND holder_id = $2 AND membership_id = $3
+                      AND service_title = $4 AND status = 'COMPLETED'
+                      AND created_at >= NOW() - INTERVAL '30 seconds'
+                    LIMIT 1
+                    """,
+                    resolved_doctor_id,
+                    holder_id,
+                    membership_id,
+                    title_clean,
+                )
+                if recent_dup:
+                    raise DuplicateVisitError(
+                        "Duplicate medical visit registration detected: identical visit submitted within 30 seconds. Rapid replay prevented."
+                    )
 
                 # Fail-closed policy checks BEFORE any membership lock or quota mutation (T25-AC3)
                 precedence_policy = await require_approved_policy(
@@ -366,6 +408,7 @@ class VisitService:
                             "patient_paid_amount_toman": int(patient_paid_amount),
                             "client_discount_ignored": discount_percent is not None,
                             "admin_override": admin_override,
+                            "idempotency_key": idempotency_key,
                         },
                         ensure_ascii=False,
                     ),
@@ -374,6 +417,7 @@ class VisitService:
                 visit_dict = dict(visit_row)
                 visit_dict["applied_discount_source"] = applied_source
                 visit_dict["discount_precedence_policy"] = precedence
+                visit_dict["idempotency_key"] = idempotency_key
                 return visit_dict
 
     async def cancel_visit(
@@ -649,3 +693,160 @@ class VisitService:
                     item["private_notes"] = None
                 results.append(item)
             return results
+
+    async def inquire_patient_eligibility(
+        self,
+        actor_user_id: uuid.UUID | None = None,
+        membership_id: uuid.UUID | None = None,
+        national_code: str | None = None,
+        card_number: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Authoritatively checks patient eligibility, quota, and effective discount rate
+        strictly for APPROVED doctors (`DOCTOR` role) or ADMINs.
+        Masks patient national code for clinical privacy.
+        """
+        if actor_user_id is None:
+            raise VisitAuthorizationError("Authenticated actor_user_id is required.")
+
+        if not membership_id and not national_code and not card_number:
+            raise VisitError("At least one search criterion (membership_id, national_code, or card_number) is required.")
+
+        async with self.pool.acquire() as conn:
+            try:
+                actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+            except RbacAccessDeniedError as exc:
+                raise VisitAuthorizationError(str(exc)) from exc
+
+            is_admin = bool(actor_roles & {"ADMIN", "SUPER_ADMIN"})
+            is_doctor = "DOCTOR" in actor_roles
+            if not is_admin and not is_doctor:
+                raise VisitAuthorizationError("Access denied: Only APPROVED doctors or administrators may inquire patient eligibility.")
+
+            doctor_row = None
+            if not is_admin:
+                doctor_row = await conn.fetchrow(
+                    "SELECT id, verification_status, custom_discount_percent FROM doctors WHERE user_id = $1",
+                    actor_user_id,
+                )
+                if not doctor_row:
+                    raise VisitAuthorizationError("Doctor profile not found for authenticated user.")
+                if doctor_row["verification_status"] != "APPROVED":
+                    raise VisitAuthorizationError(
+                        f"Doctor account is in '{doctor_row['verification_status']}' status; inquiry requires APPROVED status."
+                    )
+
+            # Query criteria
+            clauses = []
+            params: List[Any] = []
+            param_idx = 1
+
+            if membership_id:
+                clauses.append(f"m.id = ${param_idx}")
+                params.append(membership_id)
+                param_idx += 1
+            elif national_code:
+                clauses.append(f"ph.national_code = ${param_idx}")
+                params.append(national_code.strip())
+                param_idx += 1
+            elif card_number:
+                parts = card_number.strip().split("-")
+                if len(parts) == 3 and parts[0] == "HAMI":
+                    try:
+                        seq_int = int(parts[2])
+                        clauses.append(f"(m.id::text ILIKE ${param_idx})")
+                        params.append(f"%{seq_int:08d}%")
+                        param_idx += 1
+                    except ValueError:
+                        clauses.append(f"ph.national_code = ${param_idx}")
+                        params.append(card_number.strip())
+                        param_idx += 1
+                else:
+                    clauses.append(f"ph.national_code = ${param_idx}")
+                    params.append(card_number.strip())
+                    param_idx += 1
+
+            query = f"""
+                SELECT m.id AS membership_id, m.holder_id, m.plan_id, m.status AS membership_status,
+                       m.start_date, m.end_date, m.max_visits, m.remaining_visits, m.used_visits,
+                       ph.first_name, ph.last_name, ph.national_code,
+                       dp.title AS plan_title, dp.discount_percent AS plan_discount_percent
+                FROM memberships m
+                JOIN plan_holders ph ON m.holder_id = ph.id
+                JOIN discount_plans dp ON m.plan_id = dp.id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY m.created_at DESC
+                LIMIT 1
+            """
+            row = await conn.fetchrow(query, *params)
+            if not row:
+                raise VisitNotFoundError("Patient membership not found matching the provided criteria.")
+
+            # Resolve effective discount
+            precedence_policy = await require_approved_policy(conn, "OPEN_02_DOCTOR_DISCOUNT_PRECEDENCE")
+            precedence = str((precedence_policy or {}).get("precedence") or "CUSTOM_FIRST").strip().upper()
+
+            plan_rate = _parse_validated_rate(row["plan_discount_percent"], "plan discount_percent")
+            doc_rate = _parse_validated_rate(doctor_row["custom_discount_percent"] if doctor_row else None, "doctor custom_discount_percent")
+
+            if precedence == "CUSTOM_FIRST":
+                if doc_rate is not None:
+                    effective_rate = doc_rate
+                    applied_source = "DOCTOR_CUSTOM"
+                elif plan_rate is not None:
+                    effective_rate = plan_rate
+                    applied_source = "PLAN_DEFAULT"
+                else:
+                    effective_rate = Decimal("0.00")
+                    applied_source = "NONE"
+            else:
+                if plan_rate is not None:
+                    effective_rate = plan_rate
+                    applied_source = "PLAN_DEFAULT"
+                elif doc_rate is not None:
+                    effective_rate = doc_rate
+                    applied_source = "DOCTOR_CUSTOM"
+                else:
+                    effective_rate = Decimal("0.00")
+                    applied_source = "NONE"
+
+            # Check eligibility
+            is_active_status = row["membership_status"] == "ACTIVE"
+            now = datetime.now(row["end_date"].tzinfo)
+            is_unexpired = row["end_date"] > now
+            has_quota = row["max_visits"] is None or (row["remaining_visits"] is not None and row["remaining_visits"] > 0)
+
+            is_eligible = is_active_status and is_unexpired and has_quota
+            ineligibility_reason = None
+            if not is_active_status:
+                ineligibility_reason = f"MEMBERSHIP_STATUS_{row['membership_status']}"
+            elif not is_unexpired:
+                ineligibility_reason = "MEMBERSHIP_EXPIRED"
+            elif not has_quota:
+                ineligibility_reason = "QUOTA_EXHAUSTED"
+
+            masked_nat = mask_national_code(row["national_code"]) if not is_admin else row["national_code"]
+
+            return {
+                "is_eligible": is_eligible,
+                "ineligibility_reason": ineligibility_reason,
+                "holder_id": str(row["holder_id"]),
+                "membership_id": str(row["membership_id"]),
+                "holder_first_name": row["first_name"],
+                "holder_last_name": row["last_name"],
+                "holder_full_name": f"{row['first_name']} {row['last_name']}",
+                "patient_national_code": masked_nat,
+                "plan_id": str(row["plan_id"]),
+                "plan_title": row["plan_title"],
+                "plan_discount_percent": float(plan_rate) if plan_rate else 0.0,
+                "doctor_custom_discount_percent": float(doc_rate) if doc_rate else None,
+                "effective_discount_percent": float(effective_rate),
+                "discount_source": applied_source,
+                "max_visits": row["max_visits"],
+                "remaining_visits": row["remaining_visits"],
+                "used_visits": row["used_visits"],
+                "membership_status": row["membership_status"],
+                "start_date": row["start_date"].isoformat(),
+                "end_date": row["end_date"].isoformat(),
+            }
+

@@ -55,6 +55,50 @@ async def search_doctors(
     )
 
 
+@router.get("/me/portal")
+async def get_doctor_portal(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Retrieves the authenticated doctor's portal summary (profile, active contracts, metrics, recent visits).
+    Strictly restricted to approved doctors (Fail-Closed).
+    """
+    doc_svc = DoctorService(pool)
+    try:
+        summary = await doc_svc.get_doctor_portal_summary(actor_user_id=current_user["id"])
+        return {"success": True, "portal": summary}
+    except DoctorAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DoctorNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DoctorError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/me/contracts")
+async def get_my_doctor_contracts(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """Retrieves active authorized service contracts for the authenticated doctor."""
+    doc_svc = DoctorService(pool)
+    try:
+        doc = await doc_svc.get_doctor_by_user_id(current_user["id"])
+        if not doc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Doctor profile not found.")
+        contracts = await doc_svc.list_doctor_contracts(
+            doctor_id=doc["id"], actor_user_id=current_user["id"]
+        )
+        return {"success": True, "contracts": contracts}
+    except DoctorAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DoctorNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DoctorError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 @router.get("/{doctor_id}")
 async def get_doctor_profile(
     doctor_id: uuid.UUID,
@@ -104,3 +148,25 @@ async def get_doctor_reviews(
     """Retrieves approved reviews and average rating score for a doctor."""
     review_svc = DoctorReviewService(pool)
     return await review_svc.get_doctor_reviews(doctor_id, published_only=True)
+
+
+@router.get("/{doctor_id}/contracts")
+async def get_doctor_contracts(
+    doctor_id: uuid.UUID,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """Retrieves service contracts for a specific doctor strictly for owning approved doctor or admin."""
+    doc_svc = DoctorService(pool)
+    try:
+        contracts = await doc_svc.list_doctor_contracts(
+            doctor_id=doctor_id, actor_user_id=current_user["id"]
+        )
+        return {"success": True, "contracts": contracts}
+    except DoctorAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DoctorNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DoctorError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+

@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 import asyncpg
 
 from src.auth.rbac import RbacAccessDeniedError, RbacEngine
+from src.common.pii import mask_national_code
 
 
 class DoctorError(Exception):
@@ -481,3 +482,154 @@ class DoctorService:
                 """, doctor_id
             )
             return dict(row) if row else None
+
+    async def list_doctor_contracts(
+        self,
+        doctor_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Lists service contracts for a doctor strictly for owning approved doctor or admin."""
+        if actor_user_id is None:
+            raise DoctorAuthorizationError("Authenticated actor_user_id is required.")
+
+        async with self.pool.acquire() as conn:
+            try:
+                actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+            except RbacAccessDeniedError as exc:
+                raise DoctorAuthorizationError(str(exc)) from exc
+
+            is_admin = bool(actor_roles & {"ADMIN", "SUPER_ADMIN"})
+            doc = await conn.fetchrow(
+                "SELECT id, user_id, verification_status FROM doctors WHERE id = $1",
+                doctor_id,
+            )
+            if not doc:
+                raise DoctorNotFoundError(f"Doctor {doctor_id} not found.")
+
+            is_owner = (
+                "DOCTOR" in actor_roles
+                and doc["user_id"] == actor_user_id
+                and doc["verification_status"] == "APPROVED"
+            )
+
+            if not (is_admin or is_owner):
+                raise DoctorAuthorizationError(
+                    "Access denied: You are not authorized to view contracts for this doctor."
+                )
+
+            rows = await conn.fetch(
+                """
+                SELECT id, doctor_id, contract_number, start_date, end_date,
+                       agreed_discount_percent, status, approved_by, created_at, updated_at
+                FROM service_contracts
+                WHERE doctor_id = $1
+                ORDER BY created_at DESC
+                """,
+                doctor_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_doctor_portal_summary(
+        self,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieves doctor portal dashboard summary strictly for authenticated APPROVED doctors.
+        Returns profile, active contracts, key financial/visit metrics, and recent visits.
+        """
+        if actor_user_id is None:
+            raise DoctorAuthorizationError("Authenticated actor_user_id is required.")
+
+        async with self.pool.acquire() as conn:
+            try:
+                actor_roles = await self.rbac.get_user_roles(conn, actor_user_id)
+            except RbacAccessDeniedError as exc:
+                raise DoctorAuthorizationError(str(exc)) from exc
+
+            if "DOCTOR" not in actor_roles and not (actor_roles & {"ADMIN", "SUPER_ADMIN"}):
+                raise DoctorAuthorizationError("Access denied: Only DOCTOR role can access doctor portal.")
+
+            doc = await conn.fetchrow(
+                """
+                SELECT d.*, p.name as province_name, c.name as city_name,
+                       pr.first_name, pr.last_name
+                FROM doctors d
+                LEFT JOIN provinces p ON d.province_id = p.id
+                LEFT JOIN cities c ON d.city_id = c.id
+                LEFT JOIN profiles pr ON d.user_id = pr.user_id
+                WHERE d.user_id = $1
+                """,
+                actor_user_id,
+            )
+            if not doc:
+                raise DoctorAuthorizationError("Doctor profile not found for authenticated user.")
+
+            if doc["verification_status"] != "APPROVED":
+                raise DoctorAuthorizationError(
+                    f"Doctor account is '{doc['verification_status']}'; portal access requires APPROVED status."
+                )
+
+            doctor_id = doc["id"]
+
+            # Active contracts
+            contracts = await conn.fetch(
+                """
+                SELECT id, contract_number, start_date, end_date, agreed_discount_percent, status, created_at
+                FROM service_contracts
+                WHERE doctor_id = $1 AND status = 'ACTIVE'
+                  AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE
+                ORDER BY created_at DESC
+                """,
+                doctor_id,
+            )
+
+            # Aggregate visit metrics
+            metrics = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total_visits_count,
+                    COUNT(*) FILTER (WHERE visit_date::date = CURRENT_DATE) AS today_visits_count,
+                    COALESCE(SUM(discount_amount_toman), 0) AS total_discount_toman,
+                    COALESCE(SUM(patient_paid_amount_toman), 0) AS total_patient_paid_toman,
+                    COALESCE(SUM(total_amount_toman), 0) AS total_amount_toman
+                FROM visits
+                WHERE doctor_id = $1 AND status = 'COMPLETED'
+                """,
+                doctor_id,
+            )
+
+            # Recent visits (last 10) with masked national code
+            recent_rows = await conn.fetch(
+                """
+                SELECT v.id, v.service_title, v.total_amount_toman, v.discount_amount_toman,
+                       v.patient_paid_amount_toman, v.discount_percent, v.status, v.visit_date,
+                       ph.first_name AS patient_first_name, ph.last_name AS patient_last_name,
+                       ph.national_code AS patient_national_code
+                FROM visits v
+                JOIN plan_holders ph ON v.holder_id = ph.id
+                WHERE v.doctor_id = $1
+                ORDER BY v.visit_date DESC
+                LIMIT 10
+                """,
+                doctor_id,
+            )
+
+            recent_visits = []
+            for r in recent_rows:
+                v_dict = dict(r)
+                v_dict["patient_national_code"] = mask_national_code(v_dict.get("patient_national_code"))
+                recent_visits.append(v_dict)
+
+            doctor_profile = dict(doc)
+            return {
+                "doctor": doctor_profile,
+                "contracts": [dict(c) for c in contracts],
+                "metrics": dict(metrics) if metrics else {
+                    "total_visits_count": 0,
+                    "today_visits_count": 0,
+                    "total_discount_toman": 0,
+                    "total_patient_paid_toman": 0,
+                    "total_amount_toman": 0,
+                },
+                "recent_visits": recent_visits,
+            }

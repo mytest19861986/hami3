@@ -14,12 +14,14 @@ import uuid
 from typing import Any, Dict
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from src.api.deps import get_current_user, get_db_pool, require_permission
 from src.core.policy import PolicyNotApprovedError
+from src.doctors.service import DoctorService
 from src.visits.service import (
+    DuplicateVisitError,
     MembershipInactiveError,
     QuotaExhaustedError,
     VisitAuthorizationError,
@@ -44,23 +46,62 @@ class RecordVisitSchema(BaseModel):
         example=30.0,
     )
     private_notes: str | None = Field(None, example="معاینه و نوار قلب انجام شد")
+    idempotency_key: str | None = Field(None, example="idem-uuid-98765")
+
+
+class InquirePatientSchema(BaseModel):
+    membership_id: uuid.UUID | None = Field(None, example="3fa85f64-5717-4562-b3fc-2c963f66afa6")
+    national_code: str | None = Field(None, example="0012345678")
+    card_number: str | None = Field(None, example="HAMI-1405-00012345")
 
 
 class CancelVisitSchema(BaseModel):
     reason: str = Field(..., min_length=3, max_length=500, example="ثبت اشتباه خدمات توسط منشی")
 
 
+@router.post("/inquire")
+async def inquire_patient(
+    payload: InquirePatientSchema,
+    current_user: Dict[str, Any] = Depends(require_permission("visits:record")),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Inquires patient eligibility, remaining quota, and effective discount rate for an approved doctor.
+    Masks patient national code to enforce clinical privacy.
+    """
+    visit_svc = VisitService(pool)
+    try:
+        result = await visit_svc.inquire_patient_eligibility(
+            actor_user_id=current_user["id"],
+            membership_id=payload.membership_id,
+            national_code=payload.national_code,
+            card_number=payload.card_number,
+        )
+        return {"success": True, "eligibility": result}
+    except PolicyNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except VisitNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 @router.post("/record")
 async def record_visit(
     payload: RecordVisitSchema,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     current_user: Dict[str, Any] = Depends(require_permission("visits:record")),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ):
     """
     Records a medical visit for the authenticated APPROVED doctor (or authorized ADMIN override)
     and atomically decrements remaining membership visits (AC-07).
+    Guarantees duplicate prevention / idempotency defense.
     """
     visit_svc = VisitService(pool)
+    resolved_key = idempotency_key or payload.idempotency_key
     try:
         result = await visit_svc.record_visit(
             holder_id=payload.holder_id,
@@ -71,12 +112,15 @@ async def record_visit(
             actor_user_id=current_user["id"],
             doctor_id=payload.doctor_id,
             private_notes=payload.private_notes,
+            idempotency_key=resolved_key,
         )
         return {"success": True, "visit": result}
     except PolicyNotApprovedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VisitAuthorizationError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except DuplicateVisitError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except QuotaExhaustedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except MembershipInactiveError as e:
@@ -112,6 +156,40 @@ async def cancel_visit(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VisitCancellationError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except VisitNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except VisitError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/my-visits")
+async def list_my_doctor_visits(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Retrieves visit records strictly for the authenticated APPROVED doctor.
+    Enforces server-side doctor identity derivation and PII masking.
+    """
+    visit_svc = VisitService(pool)
+    doc_svc = DoctorService(pool)
+    try:
+        doc = await doc_svc.get_doctor_by_user_id(current_user["id"])
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Doctor profile not found for authenticated user.",
+            )
+        return await visit_svc.list_doctor_visits(
+            doctor_id=doc["id"],
+            actor_user_id=current_user["id"],
+            limit=limit,
+            offset=offset,
+        )
+    except VisitAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except VisitNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except VisitError as e:
